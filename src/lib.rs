@@ -208,3 +208,5 @@ mod tests {
 }
 
 mod drawing_variables;
+
+mod hatch_origin;
