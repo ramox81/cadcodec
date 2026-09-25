@@ -2432,7 +2432,7 @@ impl<'a> DwgObjectWriter<'a> {
             registered += 1;
         }
         eprintln!(
-            "[acadrust raw-all] registered={registered} excluded={excluded} version-skipped={skipped} exclude={exclude:?}"
+            "[opencadcodec raw-all] registered={registered} excluded={excluded} version-skipped={skipped} exclude={exclude:?}"
         );
     }
 

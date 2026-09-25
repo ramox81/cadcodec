@@ -3201,7 +3201,7 @@ impl<'a> DwgObjectWriter<'a> {
     ///
     // ── Table (ACAD_TABLE) ──────────────────────────────────────────
     //
-    // Inverse of the table reader. Cell styles / borders acadrust does not
+    // Inverse of the table reader. Cell styles / borders opencadcodec does not
     // model are written as empty presence-flag stubs (the anonymous block
     // renders the visual), and the retained data — dimensions, cell contents
     // (text/number) — is written in full so it round-trips.
@@ -3945,7 +3945,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(e.x_scale);
         self.writer.write_bit_double(e.y_scale);
         self.writer.write_bit_double(e.z_scale);
-        self.writer.write_byte(e.flags.bits());
+        self.writer.write_byte(e.display_flags().bits());
         self.writer.write_byte(e.contrast);
         self.writer.write_byte(e.fade);
 

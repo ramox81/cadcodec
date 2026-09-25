@@ -1011,7 +1011,7 @@ impl DynamicDxfFields {
             .unwrap_or(Handle::NULL)
     }
 
-    /// Vector stored as 140/141/142 (AutoCAD) or 140/150/160 (older acadrust output).
+    /// Vector stored as 140/141/142 (AutoCAD) or 140/150/160 (older opencadcodec output).
     fn vector_140(&self, section: &str) -> Vector3 {
         let pick = |a: i32, b: i32| if self.values(section, a).is_empty() { self.f64(section, b) } else { self.f64(section, a) };
         Vector3::new(self.f64(section, 140), pick(141, 150), pick(142, 160))
@@ -1035,7 +1035,7 @@ fn dynamic_dxf_eval(fields: &DynamicDxfFields) -> BlockEvalExpression {
         // No 70 group means "no value" (-9999).
         .unwrap_or(-9999);
     let value = match value_code {
-        // AutoCAD writes a real value as 140; older acadrust output used 40.
+        // AutoCAD writes a real value as 140; older opencadcodec output used 40.
         40 if !fields.values(section, 140).is_empty() => BlockEvalValue::Real(fields.f64(section, 140)),
         40 => BlockEvalValue::Real(fields.f64(section, 40)),
         10 | 11 => BlockEvalValue::Point([
@@ -4797,7 +4797,7 @@ impl<'a> SectionReader<'a> {
             "ACDB_MTEXTOBJECTCONTEXTDATA_CLASS" => {
                 // AutoCAD: no subclass marker, fields follow the annotation
                 // scale groups, 10 = x-axis direction, 11 = insertion point.
-                // Older acadrust output: an AcDbMTextObjectContextData marker
+                // Older opencadcodec output: an AcDbMTextObjectContextData marker
                 // with the two points the other way round.
                 let legacy = fields.has("AcDbMTextObjectContextData", 70);
                 let section = if legacy {
@@ -19986,6 +19986,7 @@ impl<'a> SectionReader<'a> {
     ) -> Result<Option<crate::objects::UnderlayDefinition>> {
         let mut def = crate::objects::UnderlayDefinition::new(utype);
         let mut in_reactors = false;
+        let mut xdata_app = String::new();
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -20010,6 +20011,12 @@ impl<'a> SectionReader<'a> {
                 }
                 1 => def.file_path = pair.value_string.clone(),
                 2 => def.page_name = pair.value_string.clone(),
+                1001 => xdata_app = pair.value_string.clone(),
+                1000 if xdata_app.eq_ignore_ascii_case("ACAD")
+                    && pair.value_string.eq_ignore_ascii_case("NOLOAD") =>
+                {
+                    def.unloaded = true;
+                }
                 _ => {}
             }
         }

@@ -669,6 +669,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_header_variable("$TDUPDATE", |w| w.write_double(40, hdr.update_date_julian))?;
         self.write_header_variable("$TDINDWG", |w| w.write_double(40, hdr.total_editing_time))?;
 
+        // === Identity === (R2000+, as in the DWG header; empty ones are
+        // omitted rather than written blank)
+        if self.dxf_version >= DxfVersion::AC1015 {
+            if !hdr.fingerprint_guid.is_empty() {
+                self.write_header_variable("$FINGERPRINTGUID", |w| {
+                    w.write_string(2, &hdr.fingerprint_guid)
+                })?;
+            }
+            if !hdr.version_guid.is_empty() {
+                self.write_header_variable("$VERSIONGUID", |w| w.write_string(2, &hdr.version_guid))?;
+            }
+        }
+
         // === UCS ===
         self.write_header_variable("$UCSORG", |w| {
             let v = &hdr.model_space_ucs_origin;
@@ -5291,7 +5304,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 ObjectType::Material(obj) => self.write_material(obj)?,
                 ObjectType::ImageDefinitionReactor(obj) => self.write_imagedef_reactor(obj)?,
                 ObjectType::GeoData(obj) => self.write_geodata(obj)?,
-                ObjectType::SpatialFilter(obj) => self.write_spatial_filter(obj)?,
+                ObjectType::SpatialFilter(obj) => self.write_spatial_filter(obj, document)?,
                 ObjectType::RasterVariables(obj) => self.write_raster_variables(obj)?,
                 ObjectType::BookColor(obj) => self.write_bookcolor(obj)?,
                 ObjectType::PlaceHolder(obj) => {
@@ -7127,6 +7140,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_subclass("AcDbUnderlayDefinition")?;
         self.writer.write_string(1, &def.file_path)?;
         self.writer.write_string(2, &def.page_name)?;
+        if def.unloaded {
+            self.writer.write_string(1001, "ACAD")?;
+            self.writer.write_string(1000, "NOLOAD")?;
+        }
         Ok(())
     }
 
@@ -8599,9 +8616,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     /// Inverse of [`read_spatial_filter`]. The two 4×3 transforms are emitted
     /// as 12 code-40 doubles each, in column-major order, after the front/back
     /// clip flags and distances.
-    fn write_spatial_filter(&mut self, obj: &SpatialFilter) -> Result<()> {
+    fn write_spatial_filter(&mut self, obj: &SpatialFilter, document: &CadDocument) -> Result<()> {
         self.writer.write_string(0, "SPATIAL_FILTER")?;
         self.writer.write_handle(5, obj.handle)?;
+        // An inverted clip keeps its drawn boundary in the filter's extension
+        // dictionary; without the link that dictionary is left unreferenced.
+        self.write_table_entry_xdictionary(obj.handle, document)?;
         self.writer.write_handle(330, obj.owner)?;
         self.writer.write_subclass("AcDbFilter")?;
         self.writer.write_subclass("AcDbSpatialFilter")?;
@@ -11066,7 +11086,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_double(230, underlay.normal.z)?;
 
         // Flags
-        self.writer.write_byte(280, underlay.flags.bits())?;
+        self.writer.write_byte(280, underlay.display_flags().bits())?;
 
         // Contrast
         self.writer.write_byte(281, underlay.contrast)?;
