@@ -86,7 +86,12 @@ impl DwgWriter {
             if owned.has_null_table_entries() {
                 owned.assign_table_entry_handles();
             }
-            if owned.version < DxfVersion::AC1027 {
+            // Native records contain class numbers. Compacting a source DWG's
+            // class table would reinterpret untouched entities and opaque objects
+            // as unrelated types when their original records are copied below.
+            if owned.version < DxfVersion::AC1027
+                && owned.dwg_source_version != Some(owned.version)
+            {
                 let required: Vec<_> = owned
                     .entities()
                     .filter_map(|entity| {
@@ -108,6 +113,8 @@ impl DwgWriter {
                         owned.classes.add_or_update(class);
                     }
                 }
+            }
+            if owned.version < DxfVersion::AC1027 {
                 prepare_legacy_document(&mut owned);
             }
             &owned
@@ -2048,6 +2055,56 @@ mod tests {
     use crate::document::CadDocument;
     use crate::types::{DxfVersion, Handle};
 
+    #[test]
+    fn unchanged_history_keeps_source_bytes_without_hiding_edits() {
+        use crate::objects::{
+            DynamicBlockData, DynamicBlockObject, ObjectType, SolidHistoryOperation,
+            SolidHistorySweep,
+        };
+        use crate::{
+            entities::{EntityType, Line},
+            types::Vector3,
+            DwgReader,
+        };
+        use std::io::Cursor;
+        let mut doc = CadDocument::new();
+        let mut history = DynamicBlockObject::new("ACSH_EXTRUSION_CLASS", "AcDbShExtrusion");
+        history.handle = doc.allocate_handle();
+        let handle = history.handle;
+        history.data = DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Extrusion(
+            SolidHistorySweep {
+                direction: Vector3::UNIT_Z,
+                ..Default::default()
+            },
+        ));
+        doc.objects.insert(handle, ObjectType::DynamicBlock(history));
+        let mut source = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&doc).unwrap()))
+            .read()
+            .unwrap();
+        let original = source.raw_records[&handle.value()].1.data.clone();
+        source
+            .add_entity(EntityType::Line(Line::from_points(Vector3::ZERO, Vector3::UNIT_X)))
+            .unwrap();
+        let saved = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&source).unwrap()))
+            .read()
+            .unwrap();
+        assert_eq!(saved.raw_records[&handle.value()].1.data, original);
+        assert_eq!(saved.model_space_entities().count(), 1);
+        let ObjectType::DynamicBlock(history) = source.objects.get_mut(&handle).unwrap() else {
+            panic!("History missing")
+        };
+        let DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Extrusion(history)) =
+            &mut history.data
+        else {
+            panic!("Extrusion missing")
+        };
+        history.direction = Vector3::new(0.0, 0.0, 12.0);
+        let edited = DwgReader::from_stream(Cursor::new(DwgWriter::write_to_vec(&source).unwrap()))
+            .read()
+            .unwrap();
+        assert_ne!(edited.raw_records[&handle.value()].1.data, original);
+        assert_eq!(edited.objects[&handle], source.objects[&handle]);
+    }
     #[test]
     fn acds_record_table_indexes_each_length_prefixed_blob() {
         for count in [1, 2, 7, 8, 16] {

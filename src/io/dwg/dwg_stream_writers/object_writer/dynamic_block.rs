@@ -93,8 +93,8 @@ impl<'a> DwgObjectWriter<'a> {
             self.writer
                 .write_handle(DwgReferenceType::SoftPointer, handle.value());
         }
-        self.writer.write_bit_long(value.action_ids.len() as i32);
-        for id in &value.action_ids {
+        self.writer.write_bit_long(value.parameter_ids.len() as i32);
+        for id in &value.parameter_ids {
             self.writer.write_bit_long(*id);
         }
     }
@@ -136,9 +136,9 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_dynamic_offsets(&mut self, value: &BlockActionOffsets) {
-        self.writer.write_bit_double(value.offset_x);
-        self.writer.write_bit_double(value.offset_y);
+        self.writer.write_bit_double(value.distance_multiplier);
         self.writer.write_bit_double(value.angle_offset);
+        self.writer.write_byte(value.flags);
     }
 
     pub(super) fn write_dynamic_angular_constraint_entity(
@@ -466,7 +466,6 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_bit_long(value.index);
                 self.writer.write_variable_text(&value.lookup_name);
                 self.writer.write_variable_text(&value.lookup_description);
-                self.writer.write_variable_text(&value.unknown_text);
             }
             DynamicBlockData::PointParameter(value) => {
                 self.write_dynamic_one_point(&value.parameter);
@@ -476,13 +475,13 @@ impl<'a> DwgObjectWriter<'a> {
             }
             DynamicBlockData::PolarParameter(value) => {
                 self.write_dynamic_two_point(&value.parameter);
-                self.writer.write_variable_text(&value.angle_name);
-                self.writer.write_variable_text(&value.angle_description);
                 self.writer.write_variable_text(&value.distance_name);
                 self.writer.write_variable_text(&value.distance_description);
+                self.writer.write_variable_text(&value.angle_name);
+                self.writer.write_variable_text(&value.angle_description);
                 self.writer.write_bit_double(value.offset);
-                self.write_dynamic_value_set(&value.angle_value_set);
                 self.write_dynamic_value_set(&value.distance_value_set);
+                self.write_dynamic_value_set(&value.angle_value_set);
             }
             DynamicBlockData::RotationParameter(value) => {
                 self.write_dynamic_two_point(&value.parameter);
@@ -508,10 +507,10 @@ impl<'a> DwgObjectWriter<'a> {
             DynamicBlockData::VisibilityParameter(_) => return,
             DynamicBlockData::XYParameter(value) => {
                 self.write_dynamic_two_point(&value.parameter);
-                self.writer.write_variable_text(&value.x_label);
-                self.writer.write_variable_text(&value.x_label_description);
                 self.writer.write_variable_text(&value.y_label);
+                self.writer.write_variable_text(&value.x_label);
                 self.writer.write_variable_text(&value.y_label_description);
+                self.writer.write_variable_text(&value.x_label_description);
                 self.writer.write_bit_double(value.x_value);
                 self.writer.write_bit_double(value.y_value);
                 self.write_dynamic_value_set(&value.x_value_set);
@@ -573,8 +572,8 @@ impl<'a> DwgObjectWriter<'a> {
                 for connection in &value.connections {
                     self.write_dynamic_connection(connection);
                 }
-                self.writer.write_bit_double(value.column_offset);
                 self.writer.write_bit_double(value.row_offset);
+                self.writer.write_bit_double(value.column_offset);
             }
             DynamicBlockData::LookupAction(value) => {
                 self.write_dynamic_action(&value.action);
@@ -583,12 +582,14 @@ impl<'a> DwgObjectWriter<'a> {
                 for expression in &value.expressions {
                     self.writer.write_variable_text(expression);
                 }
-                for row in &value.rows {
-                    for connection in &row.connections {
-                        self.write_dynamic_connection(connection);
-                    }
-                    self.writer.write_bit(row.flag_282);
-                    self.writer.write_bit(row.flag_281);
+                for column in &value.columns {
+                    self.writer.write_bit_long(column.node_id);
+                    self.writer.write_bit_long(column.value_type);
+                    self.writer.write_bit_long(column.property_type);
+                    self.writer.write_bit(column.lookup_property);
+                    self.writer.write_variable_text(&column.unmatched_name);
+                    self.writer.write_bit(column.writable);
+                    self.writer.write_variable_text(&column.connection_name);
                 }
                 self.writer.write_bit(value.flag_280);
             }
@@ -634,15 +635,30 @@ impl<'a> DwgObjectWriter<'a> {
                     self.writer
                         .write_handle(DwgReferenceType::SoftPointer, handle.value());
                 }
-                for flag in &value.handle_flags {
-                    self.writer.write_bit_short(*flag);
+                self.writer.write_bit_long(value.bindings.len() as i32);
+                for item in &value.bindings {
+                    self.writer
+                        .write_handle(DwgReferenceType::SoftPointer, item.handle.value());
+                    self.writer.write_bit_long(item.indexes.len() as i32);
+                    for index in &item.indexes {
+                        self.writer.write_bit_long(*index);
+                    }
                 }
                 self.writer.write_bit_long(value.codes.len() as i32);
-                for code in &value.codes {
-                    self.writer.write_bit_long(*code);
+                for item in &value.codes {
+                    self.writer.write_bit_long(item.code);
+                    self.writer.write_bit_long(item.indexes.len() as i32);
+                    for index in &item.indexes {
+                        self.writer.write_bit_long(*index);
+                    }
+                }
+                self.writer.write_bit_double(value.distance_multiplier);
+                self.writer.write_bit_double(value.angle_offset);
+                self.writer.write_bit_long(value.extra.len() as i32);
+                for value in &value.extra {
+                    self.writer.write_bit_long(*value);
                 }
             }
-            DynamicBlockData::PropertiesTable => {}
             DynamicBlockData::EvaluationGraph(value) => {
                 self.writer.write_bit_long(value.first_node_id);
                 self.writer.write_bit_long(value.first_node_id_copy);
@@ -652,7 +668,7 @@ impl<'a> DwgObjectWriter<'a> {
                     self.writer.write_bit_long(node.edge_flags);
                     self.writer.write_bit_long(node.next_id);
                     self.writer
-                        .write_handle(DwgReferenceType::HardPointer, node.expression.value());
+                        .write_handle(DwgReferenceType::HardOwnership, node.expression.value());
                     for item in node.node_data {
                         self.writer.write_bit_long(item);
                     }
@@ -701,5 +717,35 @@ impl<'a> DwgObjectWriter<'a> {
             }
         }
         self.register_object(object.handle);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::{CadDocument, objects::{BlockEvaluationGraph, BlockEvaluationNode}, types::{DxfVersion, Handle}};
+    use crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
+
+    #[test]
+    fn evaluation_graph_owns_its_expression_in_the_handle_stream() {
+        let doc = CadDocument::with_version(DxfVersion::AC1032);
+        let mut object = DynamicBlockObject::new("ACAD_EVALUATION_GRAPH", "AcDbEvalGraph");
+        object.handle = Handle::new(0x100);
+        object.owner = Handle::new(0x50);
+        object.data = DynamicBlockData::EvaluationGraph(BlockEvaluationGraph {
+            nodes: vec![BlockEvaluationNode { expression: Handle::new(0x1234), ..Default::default() }],
+            ..Default::default()
+        });
+        let mut writer = DwgObjectWriter::new(&doc).unwrap();
+        writer.write_dynamic_block(&object);
+        let offset = writer.handle_map.iter().find(|(h,_)| *h == 0x100).unwrap().1 as usize;
+        let mut reader = DwgBitReader::new(writer.output[offset..].to_vec(), writer.version, writer.dxf_version);
+        let bytes = reader.read_modular_short() as i64;
+        let handle_bits = reader.read_modular_char() as i64;
+        reader.set_position_in_bits(reader.position_in_bits() + bytes * 8 - handle_bits);
+        let mut kind = DwgReferenceType::Undefined;
+        assert_eq!(reader.read_handle_reference(0x100, &mut kind), 0x50);
+        assert_eq!(reader.read_handle_reference(0x100, &mut kind), 0x1234);
+        assert_eq!(kind, DwgReferenceType::HardOwnership);
     }
 }

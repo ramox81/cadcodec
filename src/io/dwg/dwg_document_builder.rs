@@ -253,7 +253,7 @@ struct Pass2Chunk {
     pending: PendingPolylines,
     pending_attributes: HashMap<u64, Vec<AttributeEntity>>,
     failures: Vec<RecordFailure>,
-    /// (handle, type code, merged bytes, handle bits) — only with ACADRUST_RAW_ALL.
+    /// Source records retained for guarded passthrough or debug bisection.
     raw_records: Vec<(u64, i16, Vec<u8>, i64)>,
 }
 
@@ -1694,7 +1694,11 @@ impl DwgDocumentBuilder {
                             continue;
                         }
                     };
-                    if capture_raw {
+                    if capture_raw
+                        || class_names.dxf.get(&raw_type_code).is_some_and(|name| {
+                            matches!(name.as_str(), "ACSH_EXTRUSION_CLASS" | "DIMASSOC")
+                        })
+                    {
                         chunk.raw_records.push((
                             handle,
                             raw_type_code,
@@ -3054,6 +3058,13 @@ impl DwgDocumentBuilder {
         // are assembled.
         Self::hydrate_block_markers(document);
 
+        document.original_objects = document
+            .objects
+            .iter()
+            .filter(|(handle, _)| document.raw_records.contains_key(&handle.value()))
+            .map(|(handle, object)| (*handle, object.clone()))
+            .collect();
+
         if perf {
             eprintln!(
                 "[perf] dwg-build repair={:.1}ms",
@@ -3427,11 +3438,19 @@ impl DwgDocumentBuilder {
                 // ── Moderate entities ──────────────────────────────
                 OBJ_INSERT => {
                     let data = entities::read_insert(&mut reader, self.obj_reader.version());
+                    // Both subclasses follow the block handle with the viewport
+                    // they are drawn in. Inventor's model-space view blocks overlap,
+                    // so the link is what keeps each view inside its own viewport;
+                    // its sheet-level references carry a null handle.
                     let view_rep_handle = class_names
                         .dxf
                         .get(&raw_type_code)
-                        .filter(|name| name.eq_ignore_ascii_case("ACDBVIEWREPBLOCKREFERENCE"))
-                        .map(|_| Handle::from(reader.read_handle()));
+                        .filter(|name| {
+                            name.eq_ignore_ascii_case("ACDBVIEWREPBLOCKREFERENCE")
+                                || name.eq_ignore_ascii_case("ACIDBLOCKREFERENCE")
+                        })
+                        .map(|_| Handle::from(reader.read_handle()))
+                        .filter(|handle| !handle.is_null());
                     let block_name = maps.block_name(data.block_handle);
                     let mut e = Insert::new(block_name, data.insert_point);
                     e.common = entity_common;

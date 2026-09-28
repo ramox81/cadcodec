@@ -30,6 +30,10 @@ use crate::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+#[path = "document/evaluated_block_tests.rs"]
+mod evaluated_block_tests;
+
 fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture> {
     if !entries.iter().any(|entry| {
         entry.code == 301
@@ -1239,13 +1243,14 @@ pub struct CadDocument {
     /// Shared so document snapshots do not duplicate large modeler data.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) raw_acds_data: Option<Arc<Vec<u8>>>,
-    /// Debug aid: every record of the source DWG, verbatim, keyed by handle
-    /// (type code, bytes). Only filled when `ACADRUST_RAW_ALL` is set in the
-    /// environment; the writer then re-emits these instead of re-serialising
-    /// so that a writer defect can be bisected by object type
-    /// (`ACADRUST_RAW_EXCLUDE`).
+    /// Original extrusion history and dimension-association records, keyed by
+    /// handle (type code, bytes). Their semantic snapshots guard passthrough.
+    /// `ACADRUST_RAW_ALL` additionally captures every record for debug bisection.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) raw_records: HashMap<u64, (i16, Arc<crate::entities::RawRecord>)>,
+    /// Semantic snapshots guarding same-version passthrough of retained objects.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) original_objects: HashMap<Handle, ObjectType>,
     /// Child record -> compound entity handle, captured with `raw_records`.
     /// Exclusions must serialize each compound entity and its children together.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -1433,6 +1438,7 @@ impl CadDocument {
             acis_sab_handles: Vec::new(),
             raw_acds_data: None,
             raw_records: HashMap::new(),
+            original_objects: HashMap::new(),
             raw_record_owners: HashMap::new(),
             raw_acds_fingerprint: Vec::new(),
             dwg_data_store_handles: HashSet::new(),
@@ -3743,6 +3749,35 @@ impl CadDocument {
         self.block_records
             .get(&insert.block_name)
             .map(|record| record.handle)
+    }
+
+    /// Copy the native source-definition tag of an evaluated anonymous block.
+    /// Nonempty extension dictionaries need a full object-graph clone and are
+    /// deliberately rejected here rather than shared between block records.
+    pub fn copy_evaluated_block_metadata(&mut self, source: Handle, target: Handle) -> Result<()> {
+        for handle in [source, target] {
+            if !self.block_records.iter().any(|b| b.handle == handle && b.name.starts_with("*U")) {
+                return Err("Expected an evaluated anonymous block record".into());
+            }
+        }
+        let dictionary = if let Some(handle) = self.extension_dictionary_handle(source) {
+            match self.objects.get(&handle) {
+                Some(ObjectType::Dictionary(d)) if d.entries.is_empty() && d.xdictionary_handle.is_none() => Some(d.clone()),
+                _ => return Err("Evaluated block has additional object relationships".into()),
+            }
+        } else { None };
+        if let Some(data) = self.eed_by_handle.get(&source).cloned() {
+            self.eed_by_handle.insert(target, data);
+        }
+        if let Some(mut dictionary) = dictionary {
+            let handle = self.allocate_handle();
+            dictionary.handle = handle;
+            dictionary.owner = target;
+            dictionary.reactors.clear();
+            self.objects.insert(handle, ObjectType::Dictionary(dictionary));
+            self.xdic_by_handle.insert(target, handle);
+        }
+        Ok(())
     }
 
     /// Resolve handle references after reading a DXF file.
