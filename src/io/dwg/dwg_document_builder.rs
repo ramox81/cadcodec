@@ -1654,7 +1654,8 @@ impl DwgDocumentBuilder {
                     .is_some_and(|value| value.trim() == "2")
         });
         document.reserve_loaded_entities(pass2_records.len());
-        document.objects.reserve(pass2_records.len().min(16_384));
+        // Pass 2 also contains graphical entities. Reserve non-entity storage
+        // from decoded object batches below, rather than from all record handles.
 
         let source_version = document.version;
         let model_space_block_handle = document.header.model_space_block_handle;
@@ -5937,8 +5938,8 @@ impl DwgDocumentBuilder {
                     obj.front_clip = data.front_clip;
                     obj.back_clip = data.back_clip;
                     obj.inverse_block_transform =
-                        matrix_from_row_major(&data.inverse_block_transform);
-                    obj.clip_bound_transform = matrix_from_row_major(&data.clip_bound_transform);
+                        matrix_from_column_major(&data.inverse_block_transform);
+                    obj.clip_bound_transform = matrix_from_column_major(&data.clip_bound_transform);
                     document.objects.insert(
                         Handle::from(handle),
                         crate::objects::ObjectType::SpatialFilter(obj),
@@ -7093,6 +7094,27 @@ mod tests {
             "IRD_OBJ_RECORD"
         );
     }
+
+    /// DWG spatial-filter transforms share DXF's column-major 4×3 layout.
+    #[test]
+    fn spatial_filter_matrix_is_column_major() {
+        let v = [
+            1.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 1.0, //
+            -500.0, 0.0, 0.0,
+        ];
+        let m = matrix_from_column_major(&v);
+        assert_eq!(
+            m.m,
+            [
+                [1.0, 0.0, 0.0, -500.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        );
+    }
 }
 
 fn read_registered_payload(
@@ -7283,8 +7305,6 @@ fn decode_section_view_style(
     })
 }
 
-/// DWG stores the spatial-filter transforms row-major (unlike DXF code 40,
-/// which is column-major).
 /// Unique block record names for `Table<BlockRecord>`, which compares names
 /// case-insensitively.
 ///
@@ -7436,12 +7456,14 @@ mod dedupe_block_names_tests {
     }
 }
 
-fn matrix_from_row_major(v: &[f64; 12]) -> crate::types::Matrix4 {
+/// DWG stores the spatial-filter transforms in the same column-major 4×3
+/// layout as DXF code 40 (X axis, Y axis, Z axis, translation).
+fn matrix_from_column_major(v: &[f64; 12]) -> crate::types::Matrix4 {
     crate::types::Matrix4 {
         m: [
-            [v[0], v[1], v[2], v[3]],
-            [v[4], v[5], v[6], v[7]],
-            [v[8], v[9], v[10], v[11]],
+            [v[0], v[3], v[6], v[9]],
+            [v[1], v[4], v[7], v[10]],
+            [v[2], v[5], v[8], v[11]],
             [0.0, 0.0, 0.0, 1.0],
         ],
     }

@@ -624,6 +624,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_header_variable("$SPLFRAME", |w| {
             w.write_i16(70, if hdr.spline_frame { 1 } else { 0 })
         })?;
+        if self.dxf_version >= DxfVersion::AC1015 {
+            self.write_header_variable("$XCLIPFRAME", |w| {
+                w.write_byte(280, hdr.xclip_frame.clamp(0, 2) as u8)
+            })?;
+        }
+        if self.dxf_version >= DxfVersion::AC1021 {
+            self.write_header_variable("$DWFFRAME", |w| {
+                w.write_byte(280, hdr.dwf_frame.clamp(0, 2) as u8)
+            })?;
+            self.write_header_variable("$DGNFRAME", |w| {
+                w.write_byte(280, hdr.dgn_frame.clamp(0, 2) as u8)
+            })?;
+        }
         if self.dxf_version >= DxfVersion::AC1021 {
             self.write_header_variable("$SOLIDHIST", |w| {
                 w.write_byte(280, u8::from(hdr.record_solid_history))
@@ -8663,18 +8676,16 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if let Some(d) = obj.back_clip {
             self.writer.write_double(41, d)?;
         }
-        self.write_matrix_row_major(&obj.inverse_block_transform)?;
-        self.write_matrix_row_major(&obj.clip_bound_transform)?;
+        self.write_matrix_column_major(&obj.inverse_block_transform)?;
+        self.write_matrix_column_major(&obj.clip_bound_transform)?;
         Ok(())
     }
 
     /// Write a 4×3 transform as 12 code-40 doubles in DXF column-major order
     /// (4 columns of 3 rows; the bottom matrix row is implied).
-    /// Emit a SPATIAL_FILTER transform row-major (12 code-40 values) — the
-    /// on-disk convention shared with DWG and the DXF reader.
-    fn write_matrix_row_major(&mut self, m: &crate::types::Matrix4) -> Result<()> {
-        for row in 0..3 {
-            for col in 0..4 {
+    fn write_matrix_column_major(&mut self, m: &crate::types::Matrix4) -> Result<()> {
+        for col in 0..4 {
+            for row in 0..3 {
                 self.writer.write_double(40, m.m[row][col])?;
             }
         }
