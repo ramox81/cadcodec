@@ -1944,7 +1944,8 @@ impl<'a> DwgObjectWriter<'a> {
         let type_code = self.class_type_code("MPOLYGON", common::OBJ_MPOLYGON);
         let common = self.hatch_common_for_write(e);
         self.entity_preamble(type_code, &common);
-        self.writer.write_bit_short(e.style as i16);
+        // Object version: 1 in every file read so far.
+        self.writer.write_bit_short(1);
 
         if self.version.r2004_plus() {
             self.writer
@@ -1971,13 +1972,9 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit_double(e.elevation);
         self.writer.write_3bit_double(e.normal);
         self.writer.write_variable_text(&e.pattern.name);
+        // MPOLYGON has no associative flag and no hatch style.
         self.writer.write_bit(e.is_solid);
-        self.writer.write_bit(e.is_associative);
-        self.writer.write_bit_long(e.paths.len() as i32);
-        for path in &e.paths {
-            self.write_hatch_boundary_path(path);
-        }
-        self.writer.write_bit_short(e.style as i16);
+        self.write_mpolygon_loops(&e.paths, false);
         self.writer.write_bit_short(e.pattern_type as i16);
         if !e.is_solid {
             self.writer.write_bit_double(e.pattern_angle);
@@ -1996,14 +1993,39 @@ impl<'a> DwgObjectWriter<'a> {
         }
         self.writer.write_cm_color(&e.mpolygon_hatch_color);
         self.writer.write_2raw_double(e.mpolygon_x_direction);
-        self.writer.write_bit_long(e.mpolygon_boundary_handle_count);
-        for path in &e.paths {
-            for handle in &path.boundary_handles {
-                self.writer
-                    .write_handle(DwgReferenceType::SoftPointer, handle.value());
+        self.write_mpolygon_loops(&e.mpolygon_invalid_loops, true);
+        self.register_object(e.common.handle);
+    }
+
+    /// Writes a count followed by MPOLYGON loops: closed polylines without
+    /// flags, typed edges or boundary handles. Paths that are not a single
+    /// polyline edge cannot be expressed in this format and are skipped.
+    fn write_mpolygon_loops(&mut self, paths: &[BoundaryPath], invalid: bool) {
+        let loops: Vec<&PolylineEdge> = paths
+            .iter()
+            .filter_map(|path| match path.edges.as_slice() {
+                [BoundaryEdge::Polyline(polyline)] => Some(polyline),
+                _ => None,
+            })
+            .collect();
+        self.writer.write_bit_long(loops.len() as i32);
+        for polyline in loops {
+            // Per-loop flag of unconfirmed meaning.
+            self.writer.write_bit(false);
+            if invalid {
+                // Unknown flag carried by invalid loops only.
+                self.writer.write_bit(false);
+            }
+            let has_bulge = polyline.vertices.iter().any(|v| v.z != 0.0);
+            self.writer.write_bit(has_bulge);
+            self.writer.write_bit_long(polyline.vertices.len() as i32);
+            for v in &polyline.vertices {
+                self.writer.write_2raw_double(Vector2::new(v.x, v.y));
+                if has_bulge {
+                    self.writer.write_bit_double(v.z);
+                }
             }
         }
-        self.register_object(e.common.handle);
     }
 
     fn write_hatch_boundary_path(&mut self, path: &BoundaryPath) {
@@ -5028,7 +5050,7 @@ impl<'a> DwgObjectWriter<'a> {
         let tail_written = if acds {
             // AC1027+: ACIS data is stored in the AcDsPrototype_1b section.
             // Entity stream writes acis_empty=true with no inline data.
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5067,7 +5089,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5103,7 +5125,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5189,7 +5211,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         let acds = self.needs_acds_section();
         let tail_written = if acds {
-            self.write_acis_empty(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes);
+            self.write_acis_empty(&e.acis_data);
             self.queue_sab_entry(&e.acis_data, e.common.handle);
             false
         } else {
@@ -5388,28 +5410,31 @@ impl<'a> DwgObjectWriter<'a> {
     ///
     /// For R2013 and later, ACIS data lives in the AcDsPrototype_1b section.
     /// The entity stream indicates that modeler geometry is not inline, but its
-    /// native COMMON_3DSOLID wireframe cache still remains in the entity.
-    fn write_acis_empty(
-        &mut self,
-        point: Vector3,
-        acis: &AcisData,
-        wires: &[Wire],
-        silhouettes: &[Silhouette],
-    ) {
+    /// native COMMON_3DSOLID wireframe cache header still remains in the entity.
+    fn write_acis_empty(&mut self, acis: &AcisData) {
         // R2013+ AcDs-backed records no longer carry the legacy leading
         // `acis_empty` bit.  Their first modeler-geometry bit is the
         // wireframe-presence flag.
         //
-        // A derived reference point alone is not a display cache. Only emit
-        // this section when the caller supplies actual wire/silhouette data.
-        if wires.is_empty() && silhouettes.is_empty() {
-            self.writer.write_bit(false);
-        } else if self.write_acis_wireframe(point, acis, wires, silhouettes) {
-            // COMMON_3DSOLID has an extra-modeler-data gate only when the
-            // AcDs-backed entity contains a wireframe section.
-            self.writer.write_bit(acis.extra_acis_data.is_none());
-            self.write_extra_acis_data(acis);
+        // Only the cache header is kept: no reference point, wires or
+        // silhouettes. An application-built point or wire list here makes
+        // the reference application's console engine reject the whole
+        // drawing, and the display cache is rebuilt from the body anyway.
+        self.writer.write_bit(acis.wireframe_data_present);
+        if !acis.wireframe_data_present {
+            return;
         }
+        self.writer.write_bit(false); // point_present
+        self.writer.write_bit_long(acis.wireframe_isolines);
+        self.writer.write_bit(acis.wireframe_isoline_present);
+        if acis.wireframe_isoline_present {
+            self.writer.write_bit_long(0); // wires
+        }
+        self.writer.write_bit_long(0); // silhouettes
+        // COMMON_3DSOLID has an extra-modeler-data gate only when the
+        // AcDs-backed entity contains a wireframe section.
+        self.writer.write_bit(acis.extra_acis_data.is_none());
+        self.write_extra_acis_data(acis);
     }
 
     /// Write the R2013+ modeler-geometry revision block (`COMMON_3DSOLID`).
@@ -5491,7 +5516,7 @@ impl<'a> DwgObjectWriter<'a> {
         if acis.is_binary && !acis.sab_data.is_empty() {
             // Already have SAB binary data
             self.sab_entries
-                .push((entity_handle, acis.sab_data.clone()));
+                .push((entity_handle, acis.sab_for_save().into_owned()));
         } else if !acis.sat_data.is_empty() {
             // Convert SAT text → SAB binary via SatDocument
             if let Ok(mut sat_doc) = crate::entities::acis::SatDocument::parse(&acis.sat_data) {
@@ -5543,7 +5568,7 @@ impl<'a> DwgObjectWriter<'a> {
             if acis.is_binary && !acis.sab_data.is_empty() {
                 // SAB binary (version 2) — write raw bytes directly.
                 self.writer.write_bit_short(2_i16);
-                self.writer.write_bytes(&acis.sab_data);
+                self.writer.write_bytes(&acis.sab_for_save());
                 if self.version.r2007_plus() {
                     let wireframe_present =
                         self.write_acis_wireframe(point, acis, wires, silhouettes);
