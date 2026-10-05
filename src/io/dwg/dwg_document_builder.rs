@@ -2741,6 +2741,35 @@ impl DwgDocumentBuilder {
                         }
                     }
                 });
+                // Objects keep their EED in `eed_by_handle`; decode it the
+                // same way so the DXF writer can write it after the object.
+                let mut object_xdata = HashMap::new();
+                for (handle, blocks) in &document.eed_by_handle {
+                    match document.objects.get(handle) {
+                        // FIELD decodes its XDATA onto `Field::xdata` itself.
+                        None | Some(crate::objects::ObjectType::Field(_)) => continue,
+                        Some(_) => {}
+                    }
+                    let mut xdata = crate::xdata::ExtendedData::default();
+                    for (app_handle, bytes) in blocks {
+                        let Some(name) = app_name_by_handle.get(app_handle) else {
+                            continue;
+                        };
+                        if let Some(values) =
+                            crate::io::dwg::eed_codec::decode_values(bytes, wide, |h| {
+                                layer_name_by_handle.get(&h).cloned()
+                            })
+                        {
+                            let mut record = crate::xdata::ExtendedDataRecord::new(name.clone());
+                            record.values = values;
+                            xdata.add_record(record);
+                        }
+                    }
+                    if !xdata.is_empty() {
+                        object_xdata.insert(*handle, xdata);
+                    }
+                }
+                document.object_xdata = object_xdata;
             }
         }
         if perf {

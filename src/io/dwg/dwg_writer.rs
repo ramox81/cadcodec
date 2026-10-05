@@ -92,7 +92,13 @@ impl DwgWriter {
             if owned.version < DxfVersion::AC1027
                 && owned.dwg_source_version != Some(owned.version)
             {
-                let required: Vec<_> = owned
+                // FIELD / FIELDLIST objects exist from R2004 on.
+                let field_classes: &[&str] = if owned.version >= DxfVersion::AC1018 {
+                    &["FIELD", "FIELDLIST"]
+                } else {
+                    &[]
+                };
+                let mut required: Vec<_> = owned
                     .entities()
                     .filter_map(|entity| {
                         let name = match entity {
@@ -105,7 +111,22 @@ impl DwgWriter {
                         };
                         owned.classes.get_by_name(name).cloned()
                     })
+                    .chain(
+                        field_classes
+                            .iter()
+                            .filter_map(|name| owned.classes.get_by_name(name).cloned()),
+                    )
+                    // Objects whose type code is their class number lose it
+                    // when the class is pruned and would be written under an
+                    // unrelated class.
+                    .chain(owned.objects.values().filter_map(|object| {
+                        object_class_names(object)
+                            .into_iter()
+                            .find_map(|name| owned.classes.get_by_name(&name).cloned())
+                    }))
                     .collect();
+                // Keep the source class order so the output is deterministic.
+                required.sort_by_key(|class| class.class_number);
                 owned.classes.retain_legacy_dwg_classes();
                 for mut class in required {
                     if !owned.classes.contains(&class.dxf_name) {
@@ -517,6 +538,30 @@ pub(crate) fn prepare_table_keys(document: &mut std::borrow::Cow<'_, CadDocument
         return;
     }
     document.to_mut().resync_table_keys();
+}
+
+/// Class names an object writer resolves its type code from, for objects
+/// whose class is not one of the fixed legacy classes.
+fn object_class_names(object: &crate::objects::ObjectType) -> Vec<String> {
+    use crate::objects::ObjectType;
+    match object {
+        ObjectType::DynamicBlock(value) => vec![value.dxf_name.clone()],
+        ObjectType::Associative(value) => vec![
+            value.dxf_name.clone(),
+            format!(
+                "ACDB{}",
+                crate::objects::associative_canonical_name(&value.dxf_name)
+            ),
+        ],
+        ObjectType::ClassObject(value) => vec![value.dxf_name().to_string()],
+        ObjectType::DataObject(value) => vec![value.dxf_name().to_string()],
+        ObjectType::RegisteredClass(value) => vec![value.dxf_name.clone()],
+        ObjectType::DgnLineStyle(value) => vec![value.dxf_name().to_string()],
+        ObjectType::ObjectContextData(value) => vec![value.class_name().to_string()],
+        ObjectType::BlockVisibilityParameter(_) => vec!["BLOCKVISIBILITYPARAMETER".to_string()],
+        ObjectType::Unknown { type_name, .. } => vec![type_name.clone()],
+        _ => Vec::new(),
+    }
 }
 
 /// Remove style dictionaries only before the versions introducing their

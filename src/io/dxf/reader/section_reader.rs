@@ -307,7 +307,8 @@ fn read_field_cell_value_dxf(
     let type_code = type_text.parse::<u32>().unwrap_or(0);
     value.raw_type_code = type_code as i32;
     value.value_type = CellValueType::from(type_code);
-    if version < DxfVersion::AC1021 || (value.flags & 3) == 0 {
+    // R2007+: flag bit 0 suppresses the value body (as in DWG).
+    if version < DxfVersion::AC1021 || (value.flags & 1) == 0 {
         match type_code {
             0 | 1 => {
                 value.numeric_value = field_next_code(entries, cursor, 91)
@@ -334,12 +335,16 @@ fn read_field_cell_value_dxf(
                 }
             }
             0x10 | 0x20 => {
-                value.data_size = field_next_code(entries, cursor, 92)
-                    .and_then(|item| item.parse().ok())
-                    .unwrap_or(0);
-                value.point_value.x = field_next_code(entries, cursor, 11)
-                    .and_then(|item| item.parse().ok())
-                    .unwrap_or(0.0);
+                // Field values written by the reference application carry no
+                // size before the point.
+                if entries.get(*cursor).map(|entry| entry.0) == Some(92) {
+                    value.data_size = entries[*cursor].1.trim().parse().unwrap_or(0);
+                    *cursor += 1;
+                }
+                if entries.get(*cursor).map(|entry| entry.0) == Some(11) {
+                    value.point_value.x = entries[*cursor].1.parse().unwrap_or(0.0);
+                    *cursor += 1;
+                }
                 if entries.get(*cursor).map(|entry| entry.0) == Some(21) {
                     value.point_value.y = entries[*cursor].1.parse().unwrap_or(0.0);
                     *cursor += 1;
@@ -370,6 +375,9 @@ fn read_field_cell_value_dxf(
         {
             value.formatted_value = entries[*cursor].1.clone();
             *cursor += 1;
+        }
+        if entries.get(*cursor).map(|entry| entry.0) == Some(304) {
+            *cursor += 1; // ACVALUE_END
         }
     }
     value
@@ -1077,7 +1085,7 @@ fn dynamic_dxf_eval(fields: &DynamicDxfFields) -> BlockEvalExpression {
         _ => BlockEvalValue::None,
     };
     BlockEvalExpression {
-        parent_id: 0,
+        parent_id: BlockEvalExpression::NO_PARENT,
         major: fields.i32(section, 98),
         minor: fields.i32(section, 99),
         value_code,
@@ -1276,8 +1284,9 @@ fn dynamic_dxf_linear_constraint(fields: &DynamicDxfFields) -> BlockLinearConstr
 
 fn dynamic_dxf_history_base(fields: &DynamicDxfFields) -> SolidHistoryNodeBase {
     let section = "AcDbShHistoryNode";
-    // The matrix is written as groups 40..55, one per element. Older codec
-    // output repeated group 40 sixteen times; accept that form as well.
+    // The matrix is written as groups 40..55, one per element. Groups 50..55
+    // are angle codes, so those six elements are stored in degrees. Older
+    // codec output repeated group 40 sixteen times; accept that form as well.
     let mut transform = [0.0; 16];
     if fields.values(section, 41).is_empty() {
         for (target, source) in transform.iter_mut().zip(fields.values(section, 40)) {
@@ -1286,6 +1295,9 @@ fn dynamic_dxf_history_base(fields: &DynamicDxfFields) -> SolidHistoryNodeBase {
     } else {
         for (index, target) in transform.iter_mut().enumerate() {
             *target = fields.f64(section, 40 + index as i32);
+            if index >= 10 {
+                *target = target.to_radians();
+            }
         }
     }
     let color = if fields.values(section, 420).is_empty() {
@@ -1299,7 +1311,7 @@ fn dynamic_dxf_history_base(fields: &DynamicDxfFields) -> SolidHistoryNodeBase {
         eval: dynamic_dxf_eval(fields),
         major: fields.i32(section, 90),
         minor: fields.i32(section, 91),
-        transform,
+        transform: crate::entities::surface::transpose_matrix(transform),
         color,
         step_id: fields.i32(section, 92),
         material: fields.handle(section, 347),
@@ -1380,11 +1392,11 @@ fn dynamic_dxf_history_sweep(
         draft_angle: fields.f64(section, 42),
         start_draft_distance: fields.f64(section, 43),
         end_draft_distance: fields.f64(section, 44),
-        scale_factor: fields.f64(section, 45),
-        twist_angle: fields.f64(section, 48),
+        twist_angle: fields.f64(section, 45),
+        scale_factor: fields.f64(section, 48),
         align_angle: fields.f64(section, 49),
-        sweep_entity_transform,
-        path_entity_transform,
+        sweep_entity_transform: crate::entities::surface::transpose_matrix(sweep_entity_transform),
+        path_entity_transform: crate::entities::surface::transpose_matrix(path_entity_transform),
         align_option: fields.i16(section, 70).clamp(0, 255) as u8,
         miter_option: fields.i16(section, 71).clamp(0, 255) as u8,
         has_align_start: fields.bool(section, 290),
@@ -1396,6 +1408,7 @@ fn dynamic_dxf_history_sweep(
             fields.bool(section, 296),
         ],
         reference_point: fields.point(section, 11),
+        ..SolidHistorySweep::default()
     }
 }
 
@@ -2862,8 +2875,12 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 "$TDUCREATE" => {
-                    self.reader.read_pair()?;
-                } // UTC variant: skip (no field)
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.universal_create_date_julian = v;
+                        }
+                    }
+                }
                 "$TDUPDATE" => {
                     if let Some(p) = self.reader.read_pair()? {
                         if let Some(v) = p.as_double() {
@@ -2872,7 +2889,11 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 "$TDUUPDATE" => {
-                    self.reader.read_pair()?;
+                    if let Some(p) = self.reader.read_pair()? {
+                        if let Some(v) = p.as_double() {
+                            hdr.universal_update_date_julian = v;
+                        }
+                    }
                 }
                 "$TDINDWG" => {
                     if let Some(p) = self.reader.read_pair()? {
@@ -3917,7 +3938,13 @@ impl<'a> SectionReader<'a> {
                 ))
             }
             "ACSH_CONE_CLASS" => {
-                let section = "AcDbShCone";
+                // Cone fields belong to the AcDbShCylinder subclass; codec
+                // output before this fix wrote them under AcDbShCone.
+                let section = if fields.values("AcDbShCone", 40).is_empty() {
+                    "AcDbShCylinder"
+                } else {
+                    "AcDbShCone"
+                };
                 DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Cone(SolidHistoryCone {
                     base: dynamic_dxf_history_base(&fields),
                     operation_major: fields.i32(section, 90),
@@ -3997,22 +4024,22 @@ impl<'a> SectionReader<'a> {
                         edges: fields
                             .values(section, 94)
                             .into_iter()
-                            .filter_map(|value| value.parse().ok())
+                            .filter_map(|value| value.trim().parse().ok())
                             .collect(),
                         radii: fields
                             .values(section, 41)
                             .into_iter()
-                            .filter_map(|value| value.parse().ok())
+                            .filter_map(|value| value.trim().parse().ok())
                             .collect(),
                         start_setbacks: fields
                             .values(section, 42)
                             .into_iter()
-                            .filter_map(|value| value.parse().ok())
+                            .filter_map(|value| value.trim().parse().ok())
                             .collect(),
                         end_setbacks: fields
                             .values(section, 43)
                             .into_iter()
-                            .filter_map(|value| value.parse().ok())
+                            .filter_map(|value| value.trim().parse().ok())
                             .collect(),
                     },
                 ))
@@ -4020,7 +4047,13 @@ impl<'a> SectionReader<'a> {
             "ACSH_BREP_CLASS" => {
                 let section = "AcDbShBrep";
                 let mut acis_data = AcisData::new();
-                let modeler = "AcDbModelerGeometry";
+                // Modeler data follows in AcDbShBrep; codec output before
+                // this fix put it in an AcDbModelerGeometry subclass.
+                let modeler = if fields.sections.contains_key("AcDbModelerGeometry") {
+                    "AcDbModelerGeometry"
+                } else {
+                    section
+                };
                 let mut text = String::new();
                 for value in fields.values(modeler, 1) {
                     text.push_str(value);
@@ -4049,51 +4082,54 @@ impl<'a> SectionReader<'a> {
             ),
             "ACSH_LOFT_CLASS" => {
                 let section = "AcDbShLoft";
-                let mut binary = Vec::new();
-                for value in fields.values(section, 310) {
-                    append_hex_bytes(&mut binary, value);
-                }
                 let dwg_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
                     .unwrap_or(crate::io::dwg::DwgVersion::AC24);
-                let mut offset = 0usize;
-                let mut decode_list = |type_code: i32, bit_length: usize| {
-                    let byte_length = bit_length.div_ceil(8);
-                    let end = offset.saturating_add(byte_length).min(binary.len());
-                    let bytes = binary[offset..end].to_vec();
-                    offset = end;
-                    crate::io::dwg::embedded_entity::decode_embedded_entity(
+                // Each body is its type (93 section, 96 guide, 98 path), its
+                // bit size (94/97/99) and its own 310 chunks. The chunks may
+                // carry a trailing byte beyond the bit size, so bodies cannot
+                // be cut out of the concatenated binary data.
+                let mut bodies: Vec<(i32, i32, usize, Vec<u8>)> = Vec::new();
+                for (code, value) in fields.sections.get(section).into_iter().flatten() {
+                    match *code {
+                        93 | 96 | 98 => bodies.push((
+                            *code,
+                            value.trim().parse().unwrap_or(0),
+                            0,
+                            Vec::new(),
+                        )),
+                        94 | 97 | 99 => {
+                            if let Some(body) = bodies.last_mut() {
+                                body.2 = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        310 => {
+                            if let Some(body) = bodies.last_mut() {
+                                append_hex_bytes(&mut body.3, value);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut cross_sections = Vec::new();
+                let mut guides = Vec::new();
+                let mut path_entity = None;
+                for (kind, type_code, bit_length, bytes) in bodies {
+                    let entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
                         type_code,
                         bit_length,
                         bytes,
                         dwg_version,
                         dxf_version,
-                    )
-                };
-                let cross_types = fields.values(section, 93);
-                let cross_sizes = fields.values(section, 94);
-                let mut cross_sections = Vec::with_capacity(cross_types.len());
-                for (index, type_value) in cross_types.iter().enumerate() {
-                    let entity_type = type_value.trim().parse().unwrap_or(0);
-                    let bit_length = cross_sizes
-                        .get(index)
-                        .and_then(|value| value.trim().parse().ok())
-                        .unwrap_or(0);
-                    if let Some(entity) = decode_list(entity_type, bit_length) {
-                        cross_sections.push(entity);
+                    );
+                    match kind {
+                        93 => cross_sections.extend(entity),
+                        96 => guides.extend(entity),
+                        _ => path_entity = entity,
                     }
                 }
-                let guide_types = fields.values(section, 96);
-                let guide_sizes = fields.values(section, 97);
-                let mut guides = Vec::with_capacity(guide_types.len());
-                for (index, type_value) in guide_types.iter().enumerate() {
-                    let entity_type = type_value.trim().parse().unwrap_or(0);
-                    let bit_length = guide_sizes
-                        .get(index)
-                        .and_then(|value| value.trim().parse().ok())
-                        .unwrap_or(0);
-                    if let Some(entity) = decode_list(entity_type, bit_length) {
-                        guides.push(entity);
-                    }
+                let mut flags = [false; 8];
+                for (index, flag) in flags.iter_mut().enumerate() {
+                    *flag = fields.bool(section, 290 + index as i32);
                 }
                 DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Loft(SolidHistoryLoft {
                     base: dynamic_dxf_history_base(&fields),
@@ -4101,19 +4137,32 @@ impl<'a> SectionReader<'a> {
                     operation_minor: fields.i32(section, 91),
                     cross_sections,
                     guides,
+                    path_entity,
+                    // Older codec output had no native options.
+                    options: if fields.values(section, 41).is_empty() {
+                        Default::default()
+                    } else {
+                        crate::objects::SolidHistoryLoftOptions {
+                            surface_option: fields.i32(section, 70),
+                            start_draft_angle: fields.f64(section, 41),
+                            end_draft_angle: fields.f64(section, 42),
+                            start_magnitude: fields.f64(section, 43),
+                            end_magnitude: fields.f64(section, 44),
+                            flags,
+                        }
+                    },
                     ..Default::default()
                 }))
             }
             "ACSH_REVOLVE_CLASS" => {
                 let section = "AcDbShRevolve";
+                // 90 holds the operation version and, after the entity type
+                // (92), the entity's bit size.
                 let values_90 = fields.values(section, 90);
-                let entity_type = values_90
-                    .get(1)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
+                let entity_type = fields.i32(section, 92);
                 let bit_length = values_90
-                    .get(2)
-                    .and_then(|value| value.parse::<usize>().ok())
+                    .get(1)
+                    .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 let mut binary = Vec::new();
                 for value in fields.values(section, 310) {
@@ -4131,7 +4180,10 @@ impl<'a> SectionReader<'a> {
                 DynamicBlockData::SolidHistoryNode(SolidHistoryOperation::Revolve(
                     SolidHistoryRevolve {
                         base: dynamic_dxf_history_base(&fields),
-                        operation_major: fields.i32(section, 90),
+                        operation_major: values_90
+                            .first()
+                            .and_then(|value| value.trim().parse().ok())
+                            .unwrap_or(0),
                         operation_minor: fields.i32(section, 91),
                         axis_point: fields.point(section, 10),
                         direction: fields.point(section, 11),
@@ -4712,12 +4764,12 @@ impl<'a> SectionReader<'a> {
                             .iter_mut()
                             .zip(entries[index + 4..index + 8].iter())
                         {
-                            *target = item.1.parse().unwrap_or(0);
+                            *target = item.1.trim().parse().unwrap_or(0);
                         }
                         nodes.push(BlockEvaluationNode {
-                            id: entries[index].1.parse().unwrap_or(0),
-                            edge_flags: entries[index + 1].1.parse().unwrap_or(0),
-                            next_id: entries[index + 2].1.parse().unwrap_or(0),
+                            id: entries[index].1.trim().parse().unwrap_or(0),
+                            edge_flags: entries[index + 1].1.trim().parse().unwrap_or(0),
+                            next_id: entries[index + 2].1.trim().parse().unwrap_or(0),
                             expression: parse_dxf_handle(&entries[index + 3].1),
                             node_data,
                             active_cycles: None,
@@ -4735,14 +4787,14 @@ impl<'a> SectionReader<'a> {
                             .iter_mut()
                             .zip(entries[index + 5..index + 10].iter())
                         {
-                            *target = item.1.parse().unwrap_or(0);
+                            *target = item.1.trim().parse().unwrap_or(0);
                         }
                         edges.push(BlockEvaluationEdge {
-                            id: entries[index].1.parse().unwrap_or(0),
-                            next_id: entries[index + 1].1.parse().unwrap_or(0),
-                            incoming_edge: entries[index + 2].1.parse().unwrap_or(0),
-                            source_node: entries[index + 3].1.parse().unwrap_or(0),
-                            destination_node: entries[index + 4].1.parse().unwrap_or(0),
+                            id: entries[index].1.trim().parse().unwrap_or(0),
+                            next_id: entries[index + 1].1.trim().parse().unwrap_or(0),
+                            incoming_edge: entries[index + 2].1.trim().parse().unwrap_or(0),
+                            source_node: entries[index + 3].1.trim().parse().unwrap_or(0),
+                            destination_node: entries[index + 4].1.trim().parse().unwrap_or(0),
                             outgoing_edges,
                         });
                         index += 10;
@@ -6309,6 +6361,7 @@ impl<'a> SectionReader<'a> {
 
             if pair.code == 0 {
                 let before = document.objects.len();
+                self.reader.record_xdata(true);
                 match pair.value_string.as_str() {
                     "DICTIONARY" => {
                         if let Some(obj) = self.read_dictionary()? {
@@ -6642,6 +6695,7 @@ impl<'a> SectionReader<'a> {
                 self.decoded_records = self
                     .decoded_records
                     .saturating_add(document.objects.len().saturating_sub(before));
+                self.read_object_xdata(document)?;
             }
         }
 
@@ -7022,6 +7076,8 @@ impl<'a> SectionReader<'a> {
 
         if !plot_settings_codes.is_empty() {
             for &(code, ref val) in &plot_settings_codes {
+                // Integer values arrive right-aligned ("     1").
+                let t = val.trim();
                 match code {
                     1 => layout.plot_page_name = val.clone(),
                     2 => layout.plot_printer_name = val.clone(),
@@ -7029,132 +7085,132 @@ impl<'a> SectionReader<'a> {
                     6 => layout.plot_view_name = val.clone(),
                     7 => layout.plot_style_sheet = val.clone(),
                     40 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_margin_left = v;
                         }
                     }
                     41 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_margin_bottom = v;
                         }
                     }
                     42 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_margin_right = v;
                         }
                     }
                     43 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_margin_top = v;
                         }
                     }
                     44 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.paper_width = v;
                         }
                     }
                     45 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.paper_height = v;
                         }
                     }
                     46 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_origin_x = v;
                         }
                     }
                     47 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_origin_y = v;
                         }
                     }
                     48 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_window_min_x = v;
                         }
                     }
                     49 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_window_min_y = v;
                         }
                     }
                     70 => {
-                        if let Ok(v) = val.parse::<i32>() {
+                        if let Ok(v) = t.parse::<i32>() {
                             layout.plot_flags = crate::objects::PlotFlags::from_bits(v);
                         }
                     }
                     72 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.plot_paper_units = v;
                         }
                     }
                     73 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.plot_rotation = v;
                         }
                     }
                     74 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.plot_type = v;
                         }
                     }
                     75 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.plot_scale_type = v;
                         }
                     }
                     76 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.shade_plot_mode = v;
                         }
                     }
                     77 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.shade_plot_resolution = v;
                         }
                     }
                     78 => {
-                        if let Ok(v) = val.parse::<i16>() {
+                        if let Ok(v) = t.parse::<i16>() {
                             layout.shade_plot_dpi = v;
                         }
                     }
                     140 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_window_max_x = v;
                         }
                     }
                     141 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_window_max_y = v;
                         }
                     }
                     142 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_scale_numerator = v;
                         }
                     }
                     143 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_scale_denominator = v;
                         }
                     }
                     147 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.plot_scale_factor = v;
                         }
                     }
                     148 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.paper_image_origin_x = v;
                         }
                     }
                     149 => {
-                        if let Ok(v) = val.parse::<f64>() {
+                        if let Ok(v) = t.parse::<f64>() {
                             layout.paper_image_origin_y = v;
                         }
                     }
                     333 => {
-                        if let Ok(v) = u64::from_str_radix(val, 16) {
+                        if let Ok(v) = u64::from_str_radix(t, 16) {
                             layout.visual_style_handle = Handle::new(v);
                         }
                     }
@@ -8838,7 +8894,19 @@ impl<'a> SectionReader<'a> {
                 5 => value.handle = parse_dxf_handle(&pair.value_string),
                 330 if value.owner.is_null() => value.owner = parse_dxf_handle(&pair.value_string),
                 100 => {}
-                _ => entries.push((pair.code, pair.value_string.clone())),
+                // XDATA (a hyperlink field's PE_URL record).
+                1001 => {
+                    self.reader.push_back(pair);
+                    let (xdata, next_pair) = self.read_extended_data()?;
+                    value.xdata = xdata;
+                    if let Some(next_pair) = next_pair {
+                        self.reader.push_back(next_pair);
+                    }
+                }
+                // Numeric values are right-aligned ("        1"); keep string
+                // codes verbatim.
+                1..=9 | 300..=309 => entries.push((pair.code, pair.value_string.clone())),
+                _ => entries.push((pair.code, pair.value_string.trim().to_string())),
             }
         }
 
@@ -8878,6 +8946,11 @@ impl<'a> SectionReader<'a> {
                 .push(parse_dxf_handle(&entries[cursor].1));
             cursor += 1;
         }
+        // Pre-R2007 format string sits after the object list.
+        if version < DxfVersion::AC1021 && entries.get(cursor).map(|entry| entry.0) == Some(4) {
+            value.format = entries[cursor].1.clone();
+            cursor += 1;
+        }
         value.evaluation_option = field_next_code(&entries, &mut cursor, 91)
             .and_then(|item| item.parse().ok())
             .unwrap_or(0);
@@ -8896,7 +8969,19 @@ impl<'a> SectionReader<'a> {
         value.evaluation_error_message = field_next_code(&entries, &mut cursor, 300)
             .unwrap_or("")
             .to_string();
-        value.value = read_field_cell_value_dxf(&entries, &mut cursor, version);
+        // The reference application writes the child-value list (93 count,
+        // `6` key + value each) and then the field's own value behind a `7`
+        // key. Files from older writers of this library put the field value
+        // inline right here instead (R2007+: 93 flags + 90 type; earlier: 90).
+        let code_at = |i: usize| entries.get(i).map(|entry| entry.0);
+        let inline_value = if version >= DxfVersion::AC1021 {
+            code_at(cursor) == Some(93) && code_at(cursor + 1) == Some(90)
+        } else {
+            code_at(cursor) == Some(90)
+        };
+        if inline_value {
+            value.value = read_field_cell_value_dxf(&entries, &mut cursor, version);
+        }
         let child_value_count = if entries.get(cursor).map(|entry| entry.0) == Some(93) {
             let count = entries[cursor].1.parse::<usize>().unwrap_or(0).min(20_000);
             cursor += 1;
@@ -8912,6 +8997,10 @@ impl<'a> SectionReader<'a> {
                 key,
                 value: read_field_cell_value_dxf(&entries, &mut cursor, version),
             });
+        }
+        if !inline_value && entries.get(cursor).map(|entry| entry.0) == Some(7) {
+            cursor += 1; // ACFD_FIELD_VALUE
+            value.value = read_field_cell_value_dxf(&entries, &mut cursor, version);
         }
         if entries.get(cursor).map(|entry| entry.0) == Some(301) {
             value.value_string = entries[cursor].1.clone();
@@ -8934,8 +9023,8 @@ impl<'a> SectionReader<'a> {
             match pair.code {
                 5 => value.handle = parse_dxf_handle(&pair.value_string),
                 330 if value.owner.is_null() => value.owner = parse_dxf_handle(&pair.value_string),
-                90 => count = pair.value_string.parse::<usize>().unwrap_or(0).min(20_000),
-                290 => value.unknown = pair.value_string.parse::<i32>().unwrap_or(0) != 0,
+                90 => count = pair.value_string.trim().parse::<usize>().unwrap_or(0).min(20_000),
+                290 => value.unknown = pair.value_string.trim().parse::<i32>().unwrap_or(0) != 0,
                 330 => {
                     if value.fields.len() < count {
                         value.fields.push(parse_dxf_handle(&pair.value_string));
@@ -16927,6 +17016,11 @@ impl<'a> SectionReader<'a> {
     /// Read a LEADER entity
     fn read_leader(&mut self) -> Result<Option<Leader>> {
         let mut leader = Leader::new();
+        // A missing 73 group means the documented default: no annotation.
+        // Keeping the "with text" constructor default leaves a text leader
+        // without text, which the reference application reports as a bad
+        // annotation id.
+        leader.creation_type = crate::entities::leader::LeaderCreationType::NoAnnotation;
         let mut normal = PointReader::new();
         let mut horiz_dir = PointReader::new();
         let mut block_offset = PointReader::new();
@@ -17059,6 +17153,10 @@ impl<'a> SectionReader<'a> {
         }
         if let Some(pt) = annotation_offset.get_point() {
             leader.annotation_offset = pt;
+        }
+        // DXF has no origin group; DWG stores the first vertex there.
+        if let Some(first) = leader.vertices.first() {
+            leader.origin = *first;
         }
 
         Ok(Some(leader))
@@ -18596,7 +18694,7 @@ impl<'a> SectionReader<'a> {
         let mut sweep_data = Vec::new();
         let mut path_data = Vec::new();
         let mut swept_binary_target = 0u8;
-        let mut swept_class_version_seen = false;
+        let mut swept_lead: Vec<i32> = Vec::new();
         let mut sweep_entity_type = 0i32;
         let mut sweep_entity_bits = 0usize;
         let mut path_entity_type = 0i32;
@@ -18604,13 +18702,23 @@ impl<'a> SectionReader<'a> {
         // Native loft input records use 90/91/92 for section/guide/path
         // entity types, then 90 for bit length and 310 for body chunks.
         let mut loft_entities: Vec<(i32, i32, usize, Vec<u8>)> = Vec::new();
+        // A polyline profile is kept as a modeler body: after its type come
+        // the SAT version (70) and the encrypted SAT text (1/3) instead of a
+        // bit length and chunks.
+        let mut loft_sat: Vec<String> = Vec::new();
+        let mut loft_body = false;
+        let mut sweep_sat = String::new();
+        let mut path_sat = String::new();
+        let add_sat = |text: &mut String, code: i32, value: &str| {
+            if code == 1 && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(value);
+        };
         let mut loft_expecting_length = false;
         let mut loft_options_seen = false;
         let mut proxy_graphics_size = 0usize;
         let mut proxy_graphics = Vec::new();
-        let swept_has_class_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
-            .map(|version| version.r2007_plus())
-            .unwrap_or(true);
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -18679,6 +18787,10 @@ impl<'a> SectionReader<'a> {
                         sweep_entity_type = pair.as_i32().unwrap_or(0);
                         swept_binary_target = 1;
                     }
+                    70 if swept_binary_target == 1 => swept_binary_target = 5,
+                    1 | 3 if swept_binary_target == 5 => {
+                        add_sat(&mut sweep_sat, pair.code, &pair.value_string)
+                    }
                     90 => {
                         sweep_entity_bits = pair.as_i32().unwrap_or(0).max(0) as usize;
                         swept_binary_target = 2;
@@ -18739,9 +18851,20 @@ impl<'a> SectionReader<'a> {
                         }
                         loft_expecting_length = false;
                     }
+                    70 if loft_expecting_length => {
+                        loft_expecting_length = false;
+                        loft_body = true;
+                    }
+                    1 | 3 if loft_body => {
+                        if let Some(text) = loft_sat.last_mut() {
+                            add_sat(text, pair.code, &pair.value_string);
+                        }
+                    }
                     90..=92 if !loft_options_seen => {
                         loft_entities.push((pair.code, pair.as_i32().unwrap_or(0), 0, Vec::new()));
+                        loft_sat.push(String::new());
                         loft_expecting_length = true;
+                        loft_body = false;
                     }
                     310 if !loft_options_seen => {
                         if let Some((_, _, _, bytes)) = loft_entities.last_mut() {
@@ -18750,6 +18873,7 @@ impl<'a> SectionReader<'a> {
                     }
                     70 => {
                         loft_options_seen = true;
+                        loft_body = false;
                         *plane_normal_lofting_type = pair.as_i32().unwrap_or(0)
                     }
                     41 => *start_draft_angle = pair.as_double().unwrap_or(0.0),
@@ -18800,6 +18924,10 @@ impl<'a> SectionReader<'a> {
                         sweep_entity_type = pair.as_i32().unwrap_or(0);
                         swept_binary_target = 1;
                     }
+                    70 if swept_binary_target == 1 => swept_binary_target = 5,
+                    1 | 3 if swept_binary_target == 5 => {
+                        add_sat(&mut sweep_sat, pair.code, &pair.value_string)
+                    }
                     90 => {
                         sweep_entity_bits = pair.as_i32().unwrap_or(0).max(0) as usize;
                         swept_binary_target = 2;
@@ -18832,17 +18960,46 @@ impl<'a> SectionReader<'a> {
                     path_transform: _,
                     options,
                 } => match pair.code {
-                    90 if swept_has_class_version && !swept_class_version_seen => {
-                        *class_version = pair.as_i32().unwrap_or(0);
-                        swept_class_version_seen = true;
+                    // The reference application starts the subclass with the
+                    // profile type and bit length; older output of this crate
+                    // put a class version before them. Collect the leading
+                    // 90 groups and tell the forms apart by their count when
+                    // the first body chunk or the path type arrives.
+                    90 if swept_binary_target == 0 && swept_lead.len() < 3 => {
+                        swept_lead.push(pair.as_i32().unwrap_or(0));
                     }
-                    90 if swept_binary_target == 0 => {
-                        sweep_entity_type = pair.as_i32().unwrap_or(0);
-                        swept_binary_target = 1;
+                    70 if swept_binary_target == 0 && !swept_lead.is_empty() => {
+                        sweep_entity_type = swept_lead.pop().unwrap_or(0);
+                        if let Some(version) = swept_lead.first() {
+                            *class_version = *version;
+                        }
+                        swept_lead.clear();
+                        swept_binary_target = 5;
                     }
-                    90 if swept_binary_target == 1 => {
-                        sweep_entity_bits = pair.as_i32().unwrap_or(0).max(0) as usize;
-                        swept_binary_target = 2;
+                    70 if swept_binary_target == 3 => swept_binary_target = 6,
+                    1 | 3 if swept_binary_target == 5 => {
+                        add_sat(&mut sweep_sat, pair.code, &pair.value_string)
+                    }
+                    1 | 3 if swept_binary_target == 6 => {
+                        add_sat(&mut path_sat, pair.code, &pair.value_string)
+                    }
+                    310 | 91 if swept_binary_target == 0 => {
+                        let lead = std::mem::take(&mut swept_lead);
+                        let lead = if lead.len() == 3 {
+                            *class_version = lead[0];
+                            &lead[1..]
+                        } else {
+                            &lead[..]
+                        };
+                        sweep_entity_type = lead.first().copied().unwrap_or(0);
+                        sweep_entity_bits = lead.get(1).copied().unwrap_or(0).max(0) as usize;
+                        if pair.code == 310 {
+                            swept_binary_target = 2;
+                            append_hex_bytes(&mut sweep_data, &pair.value_string);
+                        } else {
+                            path_entity_type = pair.as_i32().unwrap_or(0);
+                            swept_binary_target = 3;
+                        }
                     }
                     90 if swept_binary_target == 2 => {
                         path_entity_type = pair.as_i32().unwrap_or(0);
@@ -18923,10 +19080,17 @@ impl<'a> SectionReader<'a> {
             AcisVersion::Version1
         };
 
+        let body_profile = |type_code: i32, sat: &str| {
+            (!sat.is_empty()).then(|| EmbeddedEntity::Body {
+                type_code,
+                acis_data: AcisData::from_sat(&AcisData::decode_sat_binary(sat)),
+            })
+        };
         let fill_matrix = |target: &mut [f64; 16], values: &[f64]| {
             for (to, from) in target.iter_mut().zip(values.iter()) {
                 *to = *from;
             }
+            *target = crate::entities::surface::transpose_matrix(*target);
         };
         match &mut surface.surface_data {
             SurfaceData::Extruded {
@@ -18937,13 +19101,15 @@ impl<'a> SectionReader<'a> {
             } => {
                 let dwg_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
                     .unwrap_or(crate::io::dwg::DwgVersion::AC24);
-                *sweep_entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
-                    sweep_entity_type,
-                    sweep_entity_bits,
-                    sweep_data,
-                    dwg_version,
-                    dxf_version,
-                );
+                *sweep_entity = body_profile(sweep_entity_type, &sweep_sat).or_else(|| {
+                    crate::io::dwg::embedded_entity::decode_embedded_entity(
+                        sweep_entity_type,
+                        sweep_entity_bits,
+                        sweep_data,
+                        dwg_version,
+                        dxf_version,
+                    )
+                });
                 *sweep_vector = point_10.get_point().unwrap_or(Vector3::ZERO);
                 options.reference_vector = point_11.get_point().unwrap_or(Vector3::UNIT_Z);
                 fill_matrix(sweep_transform, &matrix);
@@ -18963,17 +19129,22 @@ impl<'a> SectionReader<'a> {
                 fill_matrix(loft_transform, &matrix);
                 let dwg_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
                     .unwrap_or(crate::io::dwg::DwgVersion::AC24);
-                for (group, entity_type, bit_length, bytes) in loft_entities {
-                    if bytes.len() < bit_length.div_ceil(8) {
+                for ((group, entity_type, bit_length, bytes), sat) in
+                    loft_entities.into_iter().zip(loft_sat)
+                {
+                    let body = body_profile(entity_type, &sat);
+                    if body.is_none() && bytes.len() < bit_length.div_ceil(8) {
                         continue;
                     }
-                    if let Some(entity) = crate::io::dwg::embedded_entity::decode_embedded_entity(
-                        entity_type,
-                        bit_length,
-                        bytes,
-                        dwg_version,
-                        dxf_version,
-                    ) {
+                    if let Some(entity) = body.or_else(|| {
+                        crate::io::dwg::embedded_entity::decode_embedded_entity(
+                            entity_type,
+                            bit_length,
+                            bytes,
+                            dwg_version,
+                            dxf_version,
+                        )
+                    }) {
                         match group {
                             90 => cross_section_entities.push(entity),
                             91 => guide_entities.push(entity),
@@ -18999,7 +19170,9 @@ impl<'a> SectionReader<'a> {
                 entity_transform,
                 ..
             } => {
-                if sweep_data.is_empty() {
+                if let Some(body) = body_profile(sweep_entity_type, &sweep_sat) {
+                    *revolve_entity = Some(body);
+                } else if sweep_data.is_empty() {
                     *class_version = sweep_entity_type;
                     *entity_id = sweep_entity_bits as i32;
                 } else {
@@ -19027,20 +19200,24 @@ impl<'a> SectionReader<'a> {
             } => {
                 let dwg_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
                     .unwrap_or(crate::io::dwg::DwgVersion::AC24);
-                *sweep_entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
-                    sweep_entity_type,
-                    sweep_entity_bits,
-                    sweep_data,
-                    dwg_version,
-                    dxf_version,
-                );
-                *path_entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
-                    path_entity_type,
-                    path_entity_bits,
-                    path_data,
-                    dwg_version,
-                    dxf_version,
-                );
+                *sweep_entity = body_profile(sweep_entity_type, &sweep_sat).or_else(|| {
+                    crate::io::dwg::embedded_entity::decode_embedded_entity(
+                        sweep_entity_type,
+                        sweep_entity_bits,
+                        sweep_data,
+                        dwg_version,
+                        dxf_version,
+                    )
+                });
+                *path_entity = body_profile(path_entity_type, &path_sat).or_else(|| {
+                    crate::io::dwg::embedded_entity::decode_embedded_entity(
+                        path_entity_type,
+                        path_entity_bits,
+                        path_data,
+                        dwg_version,
+                        dxf_version,
+                    )
+                });
                 fill_matrix(sweep_transform, &matrix);
                 fill_matrix(path_transform, &path_matrix);
                 options.reference_vector = point_11.get_point().unwrap_or(Vector3::UNIT_Z);
@@ -19226,7 +19403,7 @@ impl<'a> SectionReader<'a> {
                     if let (Some(c), Some(v)) = (cur.as_mut(), pair.as_double()) {
                         ensure_content(c);
                         let value = &mut c.contents.last_mut().unwrap().value;
-                        if (value.flags & 3) == 0 {
+                        if (value.flags & 1) == 0 {
                             match pair.code {
                                 11 => value.point_value.x = v,
                                 21 => value.point_value.y = v,
@@ -19399,7 +19576,7 @@ impl<'a> SectionReader<'a> {
                         let content = c.contents.last_mut().unwrap();
                         content.content_type = TableCellContentType::Value;
                         let value = &mut content.value;
-                        if !in_value || (value.flags & 3) == 0 {
+                        if !in_value || (value.flags & 1) == 0 {
                             value.text.push_str(&pair.value_string);
                             if value.value_type == CellValueType::Unknown {
                                 value.value_type = CellValueType::String;
@@ -19419,7 +19596,7 @@ impl<'a> SectionReader<'a> {
                     if let (Some(c), Some(v)) = (cur.as_mut(), pair.as_double()) {
                         ensure_content(c);
                         let cv = &mut c.contents.last_mut().unwrap().value;
-                        if (cv.flags & 3) == 0 {
+                        if (cv.flags & 1) == 0 {
                             cv.numeric_value = v;
                         }
                     }
@@ -19443,7 +19620,7 @@ impl<'a> SectionReader<'a> {
                     if let (Some(c), Some(v)) = (cur.as_mut(), pair.as_i32()) {
                         ensure_content(c);
                         let value = &mut c.contents.last_mut().unwrap().value;
-                        if (value.flags & 3) == 0 {
+                        if (value.flags & 1) == 0 {
                             value.numeric_value = v as f64;
                         }
                     }
@@ -19471,12 +19648,15 @@ impl<'a> SectionReader<'a> {
                     pending_attribute_index = None;
                 }
                 // CELL_VALUE block start: the cell has an actual value → mark
-                // its content as Value.
+                // its content as Value, unless the cell holds a field (344),
+                // whose cached value this block is.
                 301 => {
                     if let Some(c) = cur.as_mut() {
                         ensure_content(c);
                         let content = c.contents.last_mut().unwrap();
-                        content.content_type = TableCellContentType::Value;
+                        if content.field_handle.is_none() {
+                            content.content_type = TableCellContentType::Value;
+                        }
                         content.value = crate::entities::table::CellValue::new();
                         in_value = true;
                     }
@@ -19514,7 +19694,7 @@ impl<'a> SectionReader<'a> {
                     if let Some(c) = cur.as_mut() {
                         ensure_content(c);
                         let value = &mut c.contents.last_mut().unwrap().value;
-                        if (value.flags & 3) == 0 {
+                        if (value.flags & 1) == 0 {
                             append_hex_bytes(&mut value.binary_value, &pair.value_string);
                         }
                     }
@@ -20759,6 +20939,40 @@ impl<'a> SectionReader<'a> {
         Ok(Some(scale))
     }
 
+    /// Store the XDATA recorded while an object was read in
+    /// `object_xdata`, unless the object keeps it in its own form.
+    fn read_object_xdata(&mut self, document: &mut CadDocument) -> Result<()> {
+        let (handle, pairs) = self.reader.take_recorded_xdata();
+        self.reader.record_xdata(false);
+        let Some(handle) = handle
+            .and_then(|value| u64::from_str_radix(&value, 16).ok())
+            .map(Handle::new)
+        else {
+            return Ok(());
+        };
+        if pairs.is_empty()
+            || document
+                .objects
+                .get(&handle)
+                .is_none_or(crate::io::dxf::object_has_own_dxf_xdata)
+        {
+            return Ok(());
+        }
+        // Replay the pairs through the XDATA parser; it stops at the pair
+        // after them, which goes back to the stream.
+        for pair in pairs.into_iter().rev() {
+            self.reader.push_back(pair);
+        }
+        let (xdata, next) = self.read_extended_data()?;
+        if let Some(next) = next {
+            self.reader.push_back(next);
+        }
+        if !xdata.is_empty() {
+            document.object_xdata.insert(handle, xdata);
+        }
+        Ok(())
+    }
+
     /// Read a SORTENTSTABLE object
     fn read_sort_entities_table(
         &mut self,
@@ -20767,6 +20981,8 @@ impl<'a> SectionReader<'a> {
         let mut set = SortEntitiesTable::new();
         let mut entity_handle: Option<Handle> = None;
         let mut raw_dxf_codes = Vec::new();
+        let mut in_group = false;
+        let mut in_table = false;
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -20775,6 +20991,15 @@ impl<'a> SectionReader<'a> {
             }
             raw_dxf_codes.push((pair.code, pair.value_string.clone()));
             match pair.code {
+                102 => in_group = pair.value_string.trim().starts_with('{'),
+                100 => in_table = pair.value_string.trim() == "AcDbSortentsTable",
+                // The owner dictionary precedes the subclass marker; the 330
+                // inside AcDbSortentsTable is the block record.
+                330 if !in_group && !in_table => {
+                    if let Ok(h) = u64::from_str_radix(pair.value_string.trim(), 16) {
+                        set.owner_handle = Handle::new(h);
+                    }
+                }
                 5 => {
                     if let Ok(h) = u64::from_str_radix(&pair.value_string, 16) {
                         if set.handle.is_null() {
@@ -20784,7 +21009,7 @@ impl<'a> SectionReader<'a> {
                         }
                     }
                 }
-                330 => {
+                330 if in_table => {
                     if let Ok(h) = u64::from_str_radix(&pair.value_string, 16) {
                         set.block_owner_handle = Handle::new(h);
                     }
