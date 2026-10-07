@@ -629,6 +629,9 @@ fn normalize_entity_common(common: &mut opencadcodec::entities::EntityCommon) {
     // roundtrip comparison fail before a single geometry field is examined.
     // It is not part of the drawing's data, so it is normalized away.
     common.raw_record = None;
+    // layer_handle is the source-file layer reference the DWG reader keeps
+    // (#113); a programmatic document has None. The layer name is compared.
+    common.layer_handle = None;
 }
 
 /// Comprehensive normalization for roundtrip comparison.
@@ -675,6 +678,12 @@ fn normalize_entity_for_comparison(entity: &mut EntityType) {
         // roundtrip equality.
         EntityType::MText(m) => {
             m.dwg_x_direction = None;
+        }
+        EntityType::Spline(s) => {
+            s.dwg_scenario = None;
+        }
+        EntityType::Helix(h) => {
+            h.spline.dwg_scenario = None;
         }
         // MultiLeader: many handle fields at multiple levels
         EntityType::MultiLeader(mld) => {
@@ -913,7 +922,9 @@ fn dxf_acis_preserves_tokens_and_splits_at_utf8_boundaries() {
     doc.add_entity(EntityType::Solid3D(solid)).unwrap();
 
     let output = String::from_utf8(DxfWriter::new(&doc).write_to_vec().unwrap()).unwrap();
-    let expected = format!("  1\r\n{first_chunk}\r\n  3\r\n{remainder}\r\n");
+    // The long line wraps at its first space; the 2050-byte head is then
+    // split before the two-byte `é`.
+    let expected = format!("  1\r\n{first_chunk}\r\n  3\r\né\r\n  1\r\n compact_bool F\r\n");
     assert!(output.contains(&expected));
 }
 

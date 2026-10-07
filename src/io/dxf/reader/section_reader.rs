@@ -1340,15 +1340,31 @@ fn dynamic_dxf_history_sweep(
     // Group 90 is reused for the operation version and both embedded body
     // sizes. Keep the profile/path boundaries explicit, including absent
     // entities, and accept the padded integer text emitted by DXF writers.
+    // A polyline the modeler keeps as a wire body writes its SAT version
+    // (group 70) and encrypted SAT text (groups 1/3) instead, as in surface
+    // records; group 70 after group 290 is the alignment option.
     let mut bodies = [(0, 0usize, Vec::new()), (0, 0usize, Vec::new())];
+    let mut sats = [String::new(), String::new()];
     let mut current_body = None;
     let mut operation_major = 0;
+    let mut align_option = 0;
+    let mut options_started = false;
     for (code, value) in fields.sections.get(section).into_iter().flatten() {
         match *code {
             92 | 93 => {
                 let index = usize::from(*code == 93);
                 bodies[index].0 = value.trim().parse().unwrap_or(0);
                 current_body = Some(index);
+            }
+            290 => options_started = true,
+            70 if options_started => align_option = value.trim().parse().unwrap_or(0),
+            1 | 3 => {
+                if let Some(index) = current_body {
+                    if *code == 1 && !sats[index].is_empty() {
+                        sats[index].push('\n');
+                    }
+                    sats[index].push_str(value);
+                }
             }
             90 => {
                 if let Some(index) = current_body {
@@ -1365,23 +1381,18 @@ fn dynamic_dxf_history_sweep(
             _ => {}
         }
     }
-    let [(profile_type, profile_bits, profile_bytes), (path_type, path_bits, path_bytes)] = bodies;
     let dwg_version = crate::io::dwg::DwgVersion::from_dxf_version(dxf_version)
         .unwrap_or(crate::io::dwg::DwgVersion::AC24);
-    let sweep_entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
-        profile_type,
-        profile_bits,
-        profile_bytes,
-        dwg_version,
-        dxf_version,
-    );
-    let path_entity = crate::io::dwg::embedded_entity::decode_embedded_entity(
-        path_type,
-        path_bits,
-        path_bytes,
-        dwg_version,
-        dxf_version,
-    );
+    let [sweep_entity, path_entity] = [0, 1].map(|index| {
+        let (type_code, bits, bytes) = std::mem::take(&mut bodies[index]);
+        if crate::io::dwg::embedded_entity::is_body_profile(type_code) {
+            return (!sats[index].is_empty()).then(|| crate::entities::EmbeddedEntity::Body {
+                type_code,
+                acis_data: AcisData::from_sat(&AcisData::decode_sat_binary(&sats[index])),
+            });
+        }
+        crate::io::dwg::embedded_entity::decode_embedded_entity(type_code, bits, bytes, dwg_version, dxf_version)
+    });
     SolidHistorySweep {
         base: dynamic_dxf_history_base(fields),
         operation_major,
@@ -1397,11 +1408,11 @@ fn dynamic_dxf_history_sweep(
         align_angle: fields.f64(section, 49),
         sweep_entity_transform: crate::entities::surface::transpose_matrix(sweep_entity_transform),
         path_entity_transform: crate::entities::surface::transpose_matrix(path_entity_transform),
-        align_option: fields.i16(section, 70).clamp(0, 255) as u8,
+        align_option: align_option.clamp(0, 255) as u8,
         miter_option: fields.i16(section, 71).clamp(0, 255) as u8,
         has_align_start: fields.bool(section, 290),
-        bank: fields.bool(section, 292),
-        check_intersections: fields.bool(section, 293),
+        align_start: fields.bool(section, 292),
+        bank: fields.bool(section, 293),
         flags_294_296: [
             fields.bool(section, 294),
             fields.bool(section, 295),
@@ -6782,6 +6793,18 @@ impl<'a> SectionReader<'a> {
                         dict.handle = Handle::new(h);
                     }
                 }
+                // The owner of a dictionary is also its reactor; dropping the
+                // reactor leaves the owner unnotified when the dictionary is
+                // erased (the reference application erases the decomposed
+                // AcDs data dictionary on load and reports the stale entry).
+                102 => match pair.value_string.trim() {
+                    "{ACAD_REACTORS" => dict.reactors = self.read_reactor_handles()?,
+                    "{ACAD_XDICTIONARY" => {
+                        dict.xdictionary_handle = self.read_xdictionary_handle()?
+                    }
+                    group if group.starts_with('{') => self.skip_defined_group()?,
+                    _ => {}
+                },
                 330 => {
                     // Owner handle
                     if let Ok(h) = u64::from_str_radix(&pair.value_string, 16) {
@@ -7231,7 +7254,14 @@ impl<'a> SectionReader<'a> {
         let mut extended_seen = false;
         let mut property_count = None;
         let mut pending_property = None;
-        let mut legacy_properties = Vec::new();
+        // Pre-R2010 properties in record order; each group code has one slot
+        // (the file interleaves them with the lighting/edge fields).
+        const LEGACY_CODES: [i32; 24] = [
+            40, 41, 63, 64, 65, 75, 42, 92, 66, 43, 76, 77, 78, 67, 79, 170, 171, 290, 174, 175,
+            93, 44, 173, 45,
+        ];
+        let mut legacy_properties: Vec<VisualStyleProperty> = VisualStyle::new().legacy_properties();
+        let mut legacy_color_slot: Option<usize> = None;
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
                 self.reader.push_back(pair);
@@ -7346,22 +7376,26 @@ impl<'a> SectionReader<'a> {
                     290 => Some(VisualStylePropertyValue::Bool(
                         pair.as_bool().unwrap_or(false),
                     )),
-                    420 => {
-                        if let Some(VisualStyleProperty {
-                            value: VisualStylePropertyValue::Color(value),
-                            ..
-                        }) = legacy_properties.last_mut()
-                        {
-                            *value = Color::from_true_color_value(
-                                pair.as_i32_bits().unwrap_or_default(),
-                            );
+                    // True color of the color just read (42n follows 6n).
+                    420..=427 => {
+                        if let Some(slot) = legacy_color_slot {
+                            legacy_properties[slot].value =
+                                VisualStylePropertyValue::Color(Color::from_true_color_value(
+                                    pair.as_i32_bits().unwrap_or_default(),
+                                ));
                         }
                         None
                     }
                     _ => None,
                 };
-                if let Some(value) = property {
-                    legacy_properties.push(VisualStyleProperty { value, enabled: 1 });
+                if let (Some(value), Some(slot)) = (
+                    property,
+                    LEGACY_CODES.iter().position(|code| *code == pair.code),
+                ) {
+                    if matches!(value, VisualStylePropertyValue::Color(_)) {
+                        legacy_color_slot = Some(slot);
+                    }
+                    legacy_properties[slot] = VisualStyleProperty { value, enabled: 1 };
                 }
             }
             match pair.code {
@@ -9450,8 +9484,32 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 1001 => {
-                    if pair.value_string == "AcadAnnotative" {
-                        style.annotative = self.read_annotative_xdata(pair)?;
+                    // Every XDATA block on the record: the annotative flag
+                    // and the TrueType typeface (`ACAD 1000 <face>`).
+                    use crate::xdata::XDataValue;
+                    self.reader.push_back(pair);
+                    let (xdata, next_pair) = self.read_extended_data()?;
+                    if let Some(p) = next_pair {
+                        self.reader.push_back(p);
+                    }
+                    if let Some(record) = xdata.get_record("AcadAnnotative") {
+                        style.annotative = record
+                            .values
+                            .iter()
+                            .filter_map(|v| match v {
+                                XDataValue::Integer16(n) => Some(*n),
+                                _ => None,
+                            })
+                            .last()
+                            .is_some_and(|n| n != 0);
+                    }
+                    if let Some(face) = xdata.get_record("ACAD").and_then(|record| {
+                        record.values.iter().find_map(|v| match v {
+                            XDataValue::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                    }) {
+                        style.true_type_font = face;
                     }
                 }
                 _ => {}
@@ -9482,7 +9540,12 @@ impl<'a> SectionReader<'a> {
                     document.header.block_control_handle = Handle::new(handle);
                 }
             } else if pair.code == 0 && pair.value_string == "BLOCK_RECORD" {
-                if let Some(block_record) = self.read_block_record_entry()? {
+                if let Some((block_record, reactors)) = self.read_block_record_entry()? {
+                    if !reactors.is_empty() && !block_record.handle.is_null() {
+                        document
+                            .reactors_by_handle
+                            .insert(block_record.handle, reactors);
+                    }
                     let name = block_record.name.clone();
                     if let Err(_) = document.block_records.add(block_record.clone()) {
                         // Entry already exists (from initialize_defaults),
@@ -9494,6 +9557,7 @@ impl<'a> SectionReader<'a> {
                             if !block_record.layout.is_null() {
                                 existing.layout = block_record.layout;
                             }
+                            existing.insert_handles = block_record.insert_handles.clone();
                             existing.units = block_record.units;
                             existing.flags = block_record.flags;
                         }
@@ -9535,9 +9599,16 @@ impl<'a> SectionReader<'a> {
         Ok(())
     }
 
-    /// Read a single BLOCK_RECORD entry
-    fn read_block_record_entry(&mut self) -> Result<Option<BlockRecord>> {
+    /// Read a single BLOCK_RECORD entry and its reactors
+    /// (`{ACAD_REACTORS`, e.g. the dependencies of an associative array).
+    fn read_block_record_entry(&mut self) -> Result<Option<(BlockRecord, Vec<Handle>)>> {
         let mut block_record = BlockRecord::new("*Model_Space");
+        let mut reactors = Vec::new();
+        let mut group = String::new();
+        // Pre-R2007 files carry the units as ACAD `DesignCenter Data`
+        // xdata `{ <version> <units> }` instead of group 70.
+        let mut units_seen = false;
+        let mut design_center: Option<Vec<i16>> = None;
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -9546,6 +9617,40 @@ impl<'a> SectionReader<'a> {
             }
 
             match pair.code {
+                1001 => design_center = None,
+                1000 if pair.value_string == "DesignCenter Data" => {
+                    design_center = Some(Vec::new())
+                }
+                1070 => {
+                    if let (Some(values), Some(value)) = (design_center.as_mut(), pair.as_i16()) {
+                        values.push(value);
+                        if values.len() == 2 && !units_seen {
+                            block_record.units = value;
+                        }
+                    }
+                }
+                70 => units_seen = true,
+                _ => {}
+            }
+
+            match pair.code {
+                102 => {
+                    group = if pair.value_string.starts_with('{') {
+                        pair.value_string.clone()
+                    } else {
+                        String::new()
+                    };
+                }
+                330 if group == "{ACAD_REACTORS" => {
+                    if let Ok(h) = u64::from_str_radix(pair.value_string.trim(), 16) {
+                        reactors.push(Handle::new(h));
+                    }
+                }
+                331 if group == "{BLKREFS" => {
+                    if let Ok(h) = u64::from_str_radix(pair.value_string.trim(), 16) {
+                        block_record.insert_handles.push(Handle::new(h));
+                    }
+                }
                 5 => {
                     if let Ok(h) = u64::from_str_radix(&pair.value_string, 16) {
                         block_record.handle = Handle::new(h);
@@ -9580,11 +9685,13 @@ impl<'a> SectionReader<'a> {
                         block_record.layout = Handle::new(h);
                     }
                 }
+                // Block preview image (BMP), split over several 310 groups.
+                310 => append_hex_bytes(&mut block_record.preview_data, &pair.value_string),
                 _ => {}
             }
         }
 
-        Ok(Some(block_record))
+        Ok(Some((block_record, reactors)))
     }
 
     /// Read DIMSTYLE table
@@ -16757,12 +16864,12 @@ impl<'a> SectionReader<'a> {
                 }
                 50 => {
                     if let Some(v) = pair.as_double() {
-                        vp.snap_angle = v;
+                        vp.snap_angle = v.to_radians();
                     }
                 }
                 51 => {
                     if let Some(v) = pair.as_double() {
-                        vp.twist_angle = v;
+                        vp.twist_angle = v.to_radians();
                     }
                 }
                 72 => {
@@ -16774,6 +16881,9 @@ impl<'a> SectionReader<'a> {
                     if let Ok(h) = u64::from_str_radix(&pair.value_string, 16) {
                         vp.frozen_layers.push(Handle::new(h));
                     }
+                }
+                340 => {
+                    vp.clip_boundary_handle = pair.as_handle().map(Handle::new).unwrap_or(Handle::NULL);
                 }
                 281 => {
                     if let Some(v) = pair.as_i16() {
@@ -16991,7 +17101,7 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 // Multiline attribute's embedded MTEXT (R2018+) — carries the
-                // real text; the entity's own code 1 is empty in that case.
+                // real text, whatever the entity's own code 1 holds.
                 101 => {
                     let mtext = self.read_attrib_embedded_mtext()?;
                     if !mtext.value.is_empty() {
@@ -18472,7 +18582,11 @@ impl<'a> SectionReader<'a> {
                         common.line_weight = LineWeight::from_value(v);
                     }
                 }
+                // A group 1 starts a SAT line; group 3 chunks continue it.
                 1 | 3 => {
+                    if pair.code == 3 && acis_data.ends_with('\n') {
+                        acis_data.pop();
+                    }
                     acis_data.push_str(&pair.value_string);
                     acis_data.push('\n');
                 }
@@ -19286,6 +19400,18 @@ impl<'a> SectionReader<'a> {
                 self.reader.push_back(pair);
                 break;
             }
+            // A cell's own style code records its override bit, so the cell
+            // writes back only what it overrides.
+            if let (Some(c), false) = (cur.as_mut(), in_value) {
+                if let Some(bit) = crate::entities::table::cell_override_bit(pair.code) {
+                    let style = c.style.get_or_insert_with(crate::entities::CellStyle::new);
+                    style.override_flags |= bit;
+                    style.legacy_override_bits = true;
+                    // The overridden properties, so the cell's own values win
+                    // over the row, column and table styles.
+                    style.property_flags |= crate::entities::table::legacy_override_properties(bit);
+                }
+            }
             match pair.code {
                 100 => section = pair.value_string.clone(),
                 8 => table.common.layer = pair.value_string.clone(),
@@ -19816,10 +19942,11 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 283 => {
-                    if let (Some(c), Some(value)) = (cur.as_mut(), pair.as_bool()) {
+                    let value = pair.as_bool().or_else(|| pair.as_i16().map(|v| v != 0));
+                    if let (Some(c), Some(value)) = (cur.as_mut(), value) {
                         c.style
                             .get_or_insert_with(crate::entities::CellStyle::new)
-                            .fill_enabled = value;
+                            .fill_enabled = !value; // 283: background colour none
                     }
                 }
                 284..=289 if cur.is_none() => {
@@ -20035,6 +20162,8 @@ impl<'a> SectionReader<'a> {
         let mut xr = XRecord::new();
         let mut group = String::new();
         let mut owner_seen = false;
+        // Only the first 280 is the cloning flag; later ones are record data.
+        let mut cloning_seen = false;
 
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
@@ -20066,7 +20195,8 @@ impl<'a> SectionReader<'a> {
                     xr.owner = parse_dxf_handle(&pair.value_string);
                     owner_seen = true;
                 }
-                280 => {
+                280 if !cloning_seen => {
+                    cloning_seen = true;
                     if let Some(v) = pair.as_i16() {
                         xr.cloning_flags = DictionaryCloningFlags::from_value(v);
                     }
@@ -20783,7 +20913,7 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 280 if saw_name => {
-                    if let Some(v) = pair.as_bool() {
+                    if let Some(v) = pair.as_i16().map(|v| v != 0) {
                         ts.title_suppressed = v;
                     }
                 }
@@ -20793,7 +20923,7 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 281 => {
-                    if let Some(v) = pair.as_bool() {
+                    if let Some(v) = pair.as_i16().map(|v| v != 0) {
                         ts.header_suppressed = v;
                     }
                 }
@@ -20823,7 +20953,7 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 283 => {
-                    if let (Some(row), Some(v)) = (rows.last_mut(), pair.as_bool()) {
+                    if let (Some(row), Some(v)) = (rows.last_mut(), pair.as_i16().map(|v| v != 0)) {
                         row.fill_enabled = v;
                     }
                 }
@@ -20849,7 +20979,7 @@ impl<'a> SectionReader<'a> {
                     }
                 }
                 284..=289 => {
-                    if let (Some(row), Some(v)) = (rows.last_mut(), pair.as_bool()) {
+                    if let (Some(row), Some(v)) = (rows.last_mut(), pair.as_i16().map(|v| v != 0)) {
                         border_mut(row, (pair.code - 284) as usize).is_invisible = !v;
                     }
                 }

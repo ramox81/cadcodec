@@ -134,6 +134,9 @@ pub struct DwgObjectWriter<'a> {
     pub(super) linetype_handles: std::collections::HashMap<String, Handle>,
     /// Cached fallback for owners without a direct extension-dictionary handle.
     pub(super) xdic_owner_index: std::sync::Arc<std::collections::HashMap<Handle, Handle>>,
+    /// The INSERTs and TABLEs that reference each block record, for the
+    /// record's insert list.
+    pub(super) block_users: std::sync::Arc<std::collections::HashMap<Handle, Vec<Handle>>>,
 }
 
 struct ParallelEntityBatch {
@@ -273,7 +276,49 @@ impl<'a> DwgObjectWriter<'a> {
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
             xdic_owner_index: std::sync::Arc::new(Self::build_xdic_owner_index(document)),
+            block_users: std::sync::Arc::new(Self::build_block_users(document)),
         })
+    }
+
+    /// Index the entities that reference each block record: INSERTs by block
+    /// name and TABLEs by their block (the reference application finds the
+    /// table of a cell text, and the fields in it, through this list).
+    fn build_block_users(document: &CadDocument) -> std::collections::HashMap<Handle, Vec<Handle>> {
+        let mut users: std::collections::HashMap<Handle, Vec<Handle>> = std::collections::HashMap::new();
+        for entity in document.entities() {
+            let record = match entity {
+                EntityType::Insert(insert) => document.block_records.get(&insert.block_name).map(|r| r.handle),
+                EntityType::Table(table) => table
+                    .block_record_handle
+                    .or_else(|| document.block_records.get(&table.block_name).map(|r| r.handle)),
+                _ => None,
+            };
+            if let Some(record) = record.filter(|h| !h.is_null()) {
+                users.entry(record).or_default().push(entity.common().handle);
+            }
+        }
+        for list in users.values_mut() {
+            list.sort();
+        }
+        users
+    }
+
+    /// A block record's insert list: the stored references that still exist,
+    /// then every INSERT or TABLE of the drawing that uses the block (a
+    /// drawing read from DXF or edited keeps no list of its own).
+    fn block_insert_handles(&self, record: &BlockRecord) -> Vec<Handle> {
+        let mut out: Vec<Handle> = record
+            .insert_handles
+            .iter()
+            .copied()
+            .filter(|h| self.document.get_entity(*h).is_some())
+            .collect();
+        for h in self.block_users.get(&record.handle).into_iter().flatten() {
+            if !out.contains(h) {
+                out.push(*h);
+            }
+        }
+        out
     }
 
     /// Index the fallback ownership lookup used by `extension_dictionary_handle`.
@@ -906,14 +951,28 @@ impl<'a> DwgObjectWriter<'a> {
     }
 
     fn write_text_style(&mut self, style: &crate::tables::TextStyle) {
-        let anno = self.annotative_eed_block(style.annotative);
+        let mut eed: Vec<(u64, Vec<u8>)> =
+            self.annotative_eed_block(style.annotative).into_iter().collect();
+        // The TrueType typeface goes in `ACAD` EED; the record has no field.
+        if !style.true_type_font.trim().is_empty() {
+            if let Some(app) = self.document.app_ids.get("ACAD") {
+                eed.push((
+                    app.handle.value(),
+                    crate::io::dwg::typeface_eed::encode(
+                        self.version.r2007_plus(),
+                        style.true_type_font.trim(),
+                        crate::io::dwg::typeface_eed::DEFAULT_FONT_FLAGS,
+                    ),
+                ));
+            }
+        }
         self.write_common_non_entity_data_eed(
             common::OBJ_STYLE,
             style.handle,
             self.document.text_styles.handle(),
             &[],
             &None,
-            anno.into_iter().collect(),
+            eed,
         );
 
         // Entry name
@@ -1912,7 +1971,7 @@ impl<'a> DwgObjectWriter<'a> {
                             i += 1;
                         }
                         let run = &handles[start..i];
-                        let mut unique = ahash::AHashSet::new();
+                        let mut unique = foldhash::HashSet::default();
                         let safe_to_batch = run.len() >= 1_024
                             && run.iter().all(|handle| {
                                 !self.registered_handles.contains(&handle.value())
@@ -2010,6 +2069,7 @@ impl<'a> DwgObjectWriter<'a> {
             registered_handles: HashSet::with_capacity(handles.len()),
             raw_excluded_handles: self.raw_excluded_handles.clone(),
             xdic_owner_index: self.xdic_owner_index.clone(),
+            block_users: self.block_users.clone(),
             owner_overrides: std::collections::HashMap::new(),
             linetype_handles: std::collections::HashMap::new(),
         };
@@ -2054,12 +2114,22 @@ impl<'a> DwgObjectWriter<'a> {
 
     /// Write a BLOCK_HEADER (block record) object with explicit entity handles.
     fn write_block_header_with_handles(&mut self, record: &BlockRecord, entity_handles: &[Handle]) {
-        self.write_common_non_entity_data(
+        // Before R2007 the block record has no insertion-units field; the
+        // units travel in the ACAD `DesignCenter Data` EED (version 1).
+        let extra = if self.version.r2007_plus() || record.units == 0 {
+            Vec::new()
+        } else {
+            let mut units = crate::xdata::ExtendedDataRecord::new("ACAD");
+            units.values = crate::tables::block_record::design_center_units_values(record.units);
+            self.encode_xdata_record(&units).into_iter().collect()
+        };
+        self.write_common_non_entity_data_eed(
             common::OBJ_BLOCK_HEADER,
             record.handle,
             self.document.block_records.handle(),
             &[],
             &None,
+            extra,
         );
 
         // Entry name (DWG uses bare names without numeric suffixes)
@@ -2117,8 +2187,10 @@ impl<'a> DwgObjectWriter<'a> {
 
         // R2000+: insert count bytes + block description + preview data
         if self.version.r2000_plus() {
-            // Insert count bytes (non-zero bytes followed by zero terminator)
-            for &b in &record.insert_count_bytes {
+            // Insert count bytes: one non-zero byte per insert handle written
+            // below, then a zero terminator.
+            for (i, _) in self.block_insert_handles(record).iter().enumerate() {
+                let b = record.insert_count_bytes.get(i).copied().filter(|b| *b != 0).unwrap_or(1);
                 self.writer.write_byte(b);
             }
             self.writer.write_byte(0);
@@ -2182,7 +2254,7 @@ impl<'a> DwgObjectWriter<'a> {
         // desyncs the handle stream for any block that is referenced by an
         // insert, making AutoCAD discard the block record (eWrongObjectType).
         if self.version.r2000_plus() {
-            for &ih in &record.insert_handles {
+            for ih in self.block_insert_handles(record) {
                 self.writer
                     .write_handle(DwgReferenceType::SoftPointer, ih.value());
             }

@@ -65,6 +65,15 @@ pub trait FieldContext {
     fn date_locale(&self) -> DateLocale {
         DateLocale::default()
     }
+    /// The open sheet sets, for `\AcSm` fields: call `f` on each in turn and
+    /// return its first answer. A host without sheet sets answers `None`
+    /// (sheet set fields then show `####`).
+    fn sheet_sets(
+        &self,
+        _f: &mut dyn FnMut(&crate::sheet_set::SheetSetDatabase) -> Option<String>,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// Names and regional pictures used by date-field formats.
@@ -198,6 +207,13 @@ fn eval_field(
         "AcExpr" => eval_acexpr(doc, field, host),
         // AcObjProp[.ver] — a property of a referenced object.
         e if e.starts_with("AcObjProp") => eval_acobjprop(doc, field, host),
+        // AcSm[.16.2] — a property of the drawing's sheet in its sheet set.
+        e if e.starts_with("AcSm") => {
+            let layout = host_layout(doc, host, ctx).map(|l| l.name.as_str());
+            crate::sheet_set::eval_acsm(doc, &field.code, ctx, layout, text_case)
+        }
+        // AcCount / AcCount2 — block counts (see `crate::count`).
+        "AcCount" | "AcCount2" => Some(crate::count::evaluate(doc, &field.code)),
         _ => None,
     }
 }
@@ -1312,6 +1328,8 @@ fn host_layout<'a>(
             _ => None,
         })
     };
+    // An attribute sits on its block reference's layout.
+    let host = attribute_insert(doc, host).unwrap_or(host);
     let owner = doc.get_entity(host).map(|e| e.common().owner_handle);
     let ctab = ctx.getvar("ctab");
     layouts()
@@ -1323,7 +1341,7 @@ fn host_layout<'a>(
 /// `PlotScale`: plain six decimals; `%sn` the name of the first entry of the
 /// drawing's scale list with the same ratio (six decimals when none); any
 /// other picture formats the ratio as a number.
-fn plot_scale_text(doc: &CadDocument, scale: f64, fmt: &str) -> String {
+pub(crate) fn plot_scale_text(doc: &CadDocument, scale: f64, fmt: &str) -> String {
     if fmt.is_empty() {
         return format!("{:.6}", scale);
     }
@@ -1379,8 +1397,8 @@ struct Picture {
     printf: Option<usize>,
     pre: String,
     suf: String,
-    /// `%ctN[factor]` conversions in order.
-    conv: Vec<(i64, Option<f64>)>,
+    /// The `%ctN[factor]` conversion (the last one in the picture applies).
+    conv: Option<(i64, Option<f64>)>,
 }
 
 impl Picture {
@@ -1429,7 +1447,7 @@ impl Picture {
                 "pt" => p.pt = Some(n),
                 "bl" => p.bl = Some(n),
                 "lw" => p.lw = Some(n),
-                "ct" => p.conv.push((n, arg.and_then(|a| a.trim().parse().ok()))),
+                "ct" => p.conv = Some((n, arg.and_then(|a| a.trim().parse().ok()))),
                 "ps" => {
                     let a = arg.unwrap_or("");
                     let (x, y) = a.split_once(',').unwrap_or((a, ""));
@@ -1457,22 +1475,22 @@ impl Picture {
         }
     }
 
-    /// The value after the `%ct` conversions: 1 and 5 and 7 reciprocal,
-    /// 2 × 12, 3 1 ÷ (12 × value), 4 ÷ 144, 6 none, 8 and 10 × factor,
-    /// 9 and 11 factor ÷ value (1 without a factor).
-    fn convert(&self, mut v: f64) -> f64 {
-        for &(n, f) in &self.conv {
-            v = match n {
-                1 | 5 | 7 => 1.0 / v,
-                2 => v * 12.0,
-                3 => 1.0 / (12.0 * v),
-                4 => v / 144.0,
-                8 | 10 => v * f.unwrap_or(1.0),
-                9 | 11 => f.unwrap_or(1.0) / v,
-                _ => v,
-            };
+    /// The value after the `%ct` conversion, a bit set: 1 reciprocal; 8 ×
+    /// factor (after the reciprocal; 1 without a factor); without 8, exactly
+    /// 2 × 12, 3 1 ÷ (12 × value) and 4 ÷ 144 — any other bit drops the
+    /// 12 / 144 conversion and keeps only the reciprocal.
+    fn convert(&self, v: f64) -> f64 {
+        let Some((n, f)) = self.conv else { return v };
+        let r = if n & 1 != 0 { 1.0 / v } else { v };
+        if n & 8 != 0 {
+            return r * f.unwrap_or(1.0);
         }
-        v
+        match n {
+            2 => v * 12.0,
+            3 => 1.0 / (12.0 * v),
+            4 => v / 144.0,
+            _ => r,
+        }
     }
 
     /// Place the formatted value into the literal text.
@@ -1555,13 +1573,13 @@ fn number_text(doc: &CadDocument, p: &Picture, v: f64) -> String {
     if let Some(au) = p.au {
         let mode = if au == 5 { doc.header.angular_unit_format as i64 } else { au };
         let prec = p.pr.unwrap_or(doc.header.angular_unit_precision.max(0) as usize);
-        return angle_text(v, mode, prec.min(16), z.trailing, true);
+        return angle_text(v, mode, prec.min(16), z, true);
     }
     let prec = p.pr.unwrap_or(doc.header.linear_unit_precision.max(0) as usize).min(16);
     // `%qf2` / `%qf4`: an angle in radians whose `%lu` number is the angle
     // mode, normalised to one turn with 2, as is with 4.
     if p.qf & 6 != 0 {
-        return angle_text(v, p.lu.unwrap_or(2), prec, z.trailing, p.qf & 2 != 0);
+        return angle_text(v, p.lu.unwrap_or(2), prec, z, p.qf & 2 != 0);
     }
     unit_text(v, p.linear_mode(doc), prec, z, p.ds.unwrap_or('.'), p.th)
 }
@@ -1620,15 +1638,24 @@ fn unit_text(v: f64, mode: i64, prec: usize, z: Zeros, ds: char, th: Option<char
     };
     match mode {
         1 => {
-            let s = format!("{:.*e}", prec, a);
-            let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
-            let e: i32 = e.parse().unwrap_or(0);
-            format!(
-                "{sign}{}E{}{:02}",
-                m.replace('.', &ds.to_string()),
-                if e < 0 { '-' } else { '+' },
-                e.abs()
-            )
+            // The mantissa rounds half away from zero (1234.5 → 1.235E+03 at
+            // three decimals), on the value scaled by an exact power of ten.
+            let mut e = if a > 0.0 { a.log10().floor() as i32 } else { 0 };
+            let scaled = |e: i32| {
+                let k = prec as i32 - e;
+                if k >= 0 { (a * 10f64.powi(k)).round() } else { (a / 10f64.powi(-k)).round() }
+            };
+            let mut n = scaled(e);
+            if n >= 10f64.powi(prec as i32 + 1) {
+                e += 1;
+                n = scaled(e);
+            }
+            let digits = format!("{:01$.0}", n, prec + 1);
+            let m = match prec {
+                0 => digits,
+                _ => format!("{}{ds}{}", &digits[..1], &digits[1..]),
+            };
+            format!("{sign}{m}E{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
         }
         3 => {
             let m = 10f64.powi(prec as i32);
@@ -1677,16 +1704,21 @@ fn unit_text(v: f64, mode: i64, prec: usize, z: Zeros, ds: char, th: Option<char
 /// degrees, 1–2 minutes, 3–4 seconds, more adds decimals to the seconds),
 /// 2 grads (`33g`), 3 radians (`1r`), 4 surveyor's bearing (`N 60d E`; an
 /// exact east / west bearing shows `E` / `W` when a precision is given).
-fn angle_text(rad: f64, mode: i64, prec: usize, trailing: bool, normalize: bool) -> String {
+/// Trailing and leading zero suppression apply to the decimal modes.
+fn angle_text(rad: f64, mode: i64, prec: usize, z: Zeros, normalize: bool) -> String {
     use std::f64::consts::TAU;
     let a = if normalize { rad.rem_euclid(TAU) } else { rad };
     let fixed = |x: f64| {
-        let s = format!("{x:.prec$}");
-        if trailing && s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s
+        let mut s = format!("{x:.prec$}");
+        if z.trailing && s.contains('.') {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_string();
         }
+        if z.leading {
+            if let Some(i) = s.find("0.").filter(|&i| s[..i].chars().all(|c| c == '-')) {
+                s.remove(i);
+            }
+        }
+        s
     };
     let dms = |deg: f64| match prec {
         0 => format!("{}d", deg.round()),
@@ -2023,7 +2055,7 @@ fn rtos(val: f64, prec: Option<usize>) -> String {
 
 /// `$(angtos,value[,mode,prec])` — `value` in radians, `mode` as AUNITS.
 fn angtos(val: f64, mode: i64, prec: Option<usize>) -> String {
-    angle_text(val, mode, prec.unwrap_or(0), false, true)
+    angle_text(val, mode, prec.unwrap_or(0), Zeros::default(), true)
 }
 
 /// Gregorian (Y, M, D, h, m, s) for an astronomical Julian date.
@@ -2050,7 +2082,7 @@ pub fn julian_parts(jd: f64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 /// Day of week for a Julian date: 0 = Sunday … 6 = Saturday.
-fn weekday(jd: f64) -> u32 {
+pub(crate) fn weekday(jd: f64) -> u32 {
     let secs = ((jd - 2_440_587.5) * 86_400.0).round() as i64;
     let days = secs.div_euclid(86_400);
     (days + 4).rem_euclid(7) as u32
@@ -2261,6 +2293,13 @@ impl NewField {
         value.flags = 4;
         value.format = code_format(&code).to_string();
         // The reference application leaves the Date field on demand only.
+        // A count is an integer value (`####` while its code is empty).
+        if evaluator.starts_with("AcCount") {
+            if let Ok(n) = display.parse::<i64>() {
+                value = CellValue::integer(n);
+                value.flags = 4;
+            }
+        }
         let evaluation_option = if evaluator == "AcVar" && code_word(&code, 1) == Some("Date") {
             32
         } else {
@@ -2409,108 +2448,430 @@ impl CadDocument {
         };
         let mut all = vec![container_field];
         for (child, handle) in children.into_iter().zip(&child_handles) {
-            let mut child_values = Vec::new();
-            if child.evaluator.starts_with("AcVar") {
-                if let Some(name) = code_word(&child.code, 1) {
-                    // A hyperlink (`\href`) names no variable.
-                    let name = if name.starts_with('\\') { "" } else { name };
-                    let mut v = CellValue::text(name);
-                    v.flags = 2;
-                    v.formatted_value.clear();
-                    child_values.push(FieldChildValue {
-                        key: "Variable".into(),
-                        value: v,
-                    });
-                }
-            }
-            if child.evaluator == "AcDiesel" {
-                let expr = child.code.trim().trim_start_matches("\\AcDiesel").trim();
-                let mut v = CellValue::text(expr);
-                v.flags = 2;
-                v.formatted_value.clear();
-                child_values.push(FieldChildValue {
-                    key: "DieselExpression".into(),
-                    value: v,
-                });
-            }
-            if child.evaluator.starts_with("AcObjProp") {
-                if let Some(&object) = child.objects.first() {
-                    let mut id = CellValue::new();
-                    id.value_type = CellValueType::Handle;
-                    id.raw_type_code = 0x40;
-                    id.handle_value = Some(object);
-                    id.flags = 2;
-                    child_values.push(FieldChildValue {
-                        key: "ObjectPropertyId".into(),
-                        value: id,
-                    });
-                }
-                if let Some(prop) = child
-                    .code
-                    .split(").")
-                    .nth(1)
-                    .and_then(|s| s.split([' ', '\\']).next())
-                {
-                    let mut v = CellValue::text(prop);
-                    v.flags = 2;
-                    v.formatted_value.clear();
-                    child_values.push(FieldChildValue {
-                        key: "ObjectPropertyName".into(),
-                        value: v,
-                    });
-                }
-                // `Object(<id>,1)`: the option, as a number and as text.
-                let object_arg = between(&child.code, "Object(", ").").unwrap_or("");
-                if let Some((_, option)) = object_arg.rsplit_once(',') {
-                    let option = option.trim();
-                    let mut n = CellValue::integer(option.parse().unwrap_or(0));
-                    n.flags = 2;
-                    n.formatted_value.clear();
-                    let mut s = CellValue::text(option);
-                    s.flags = 2;
-                    s.formatted_value.clear();
-                    child_values.push(FieldChildValue {
-                        key: "ObjectPropertyOption".into(),
-                        value: n,
-                    });
-                    child_values.push(FieldChildValue {
-                        key: "ObjectPropertyOptionString".into(),
-                        value: s,
-                    });
-                }
-                // A block placeholder names its object only on insertion.
-                if object_arg.starts_with("?BlockRefId") {
-                    let mut v = CellValue::text("?BlockRefId");
-                    v.flags = 2;
-                    v.formatted_value.clear();
-                    child_values.push(FieldChildValue {
-                        key: "ObjectPropertyUnresolvedId".into(),
-                        value: v,
-                    });
-                }
-            }
-            let shown = child.value.display().to_string();
-            let xdata = hyperlink_xdata(&child.code).unwrap_or_default();
-            all.push(Field {
-                handle: *handle,
-                owner: container,
-                // Pre-R2007 files keep the format on the field itself.
-                format: child.value.format.clone(),
-                evaluator_id: child.evaluator,
-                code: child.code,
-                referenced_objects: child.objects,
-                evaluation_option: child.evaluation_option,
-                state: 59,
-                evaluation_status: 2,
-                value: child.value,
-                value_string_length: shown.encode_utf16().count() as i32,
-                value_string: shown,
-                xdata,
-                child_values,
-                ..Field::default()
-            });
+            all.push(child_field(child, *handle, container));
         }
 
+        self.register_fields(all);
+
+        self.text_host(host, |common, text, _| {
+            common.xdictionary_handle = Some(xdict);
+            *text = display;
+        })?;
+        Some(container)
+    }
+
+    /// The entities a table's `*T` block holds, as the reference draws them:
+    /// one MTEXT per filled cell (row, column; a merged region as one cell)
+    /// placed by its alignment inside the cell margins, with the
+    /// row style's text height and alignment (named `_TITLE` / `_HEADER` /
+    /// `_DATA` cell styles first, the cell's own alignment when it overrides
+    /// it) and the column width less both horizontal margins; then the row
+    /// lines top to bottom, the column lines left to right (both broken where
+    /// they would cross a merged region) and a hidden point
+    /// on `Defpoints`. `extra` cells get an MTEXT even when empty (fields).
+    fn table_block_plan(
+        &self,
+        t: &Table,
+        extra: &[(usize, usize)],
+    ) -> (Vec<((usize, usize), crate::entities::MText)>, Vec<crate::entities::Line>, Vec<crate::entities::Solid>) {
+        use crate::entities::table::CellStylePropertyFlags as P;
+        use crate::entities::{Line, MText, Solid};
+        use crate::types::{Color, LineWeight, Transparency, Vector3};
+        let style = t.table_style_handle.and_then(|h| match self.objects.get(&h) {
+            Some(ObjectType::TableStyle(s)) => Some(s.clone()),
+            _ => None,
+        });
+        let margin = style.as_ref().map_or(0.06, |s| s.horizontal_margin);
+        let legacy = t.legacy_style_override.clone().unwrap_or_default();
+        let title = !legacy.title_suppressed.unwrap_or(false);
+        let header = !legacy.header_suppressed.unwrap_or(false);
+        // (text height, alignment) of a row by its kind: title, header, data.
+        let row_style = |r: usize| {
+            // Newer tables name each row's cell style (1 title, 2 header, 3 data).
+            let named_kind = t.rows.get(r).map(|row| row.style_id).filter(|id| (1..=3).contains(id));
+            let kind = if let Some(id) = named_kind {
+                (id - 1) as usize
+            } else if title && r == 0 {
+                0
+            } else if header && r == usize::from(title) {
+                1
+            } else {
+                2
+            };
+            style.as_ref().map_or((0.18, 5), |s| {
+                // Newer styles keep their rows as the named cell styles.
+                let named = s.modern_overrides.iter().find(|(_, n)| {
+                    n.name.eq_ignore_ascii_case(["_TITLE", "_HEADER", "_DATA"][kind])
+                });
+                match named {
+                    Some((_, n)) if n.cell_style.content_format.text_height > 0.0 => (
+                        n.cell_style.content_format.text_height,
+                        n.cell_style.content_format.cell_alignment as i32,
+                    ),
+                    _ => {
+                        let rs = [&s.title_row_style, &s.header_row_style, &s.data_row_style][kind];
+                        (rs.text_height, rs.alignment as i32)
+                    }
+                }
+            })
+        };
+        let by_block = |c: &mut EntityCommon| {
+            c.layer = "0".into();
+            c.color = Color::ByBlock;
+            c.transparency = Transparency::ByBlock;
+        };
+        let widths: Vec<f64> = t.columns.iter().map(|c| c.width).collect();
+        let heights: Vec<f64> = t.rows.iter().map(|r| r.height).collect();
+        let (nr, nc) = (heights.len(), widths.len());
+        let xs: Vec<f64> = std::iter::once(0.0).chain(widths.iter().scan(0.0, |a, w| { *a += w; Some(*a) })).collect();
+        let ys: Vec<f64> = std::iter::once(0.0).chain(heights.iter().scan(0.0, |a, h| { *a += h; Some(*a) })).collect();
+        // Merged regions: the top-left cell spans its merge width and height;
+        // `owner[r][c]` is the cell a grid square belongs to.
+        let mut owner: Vec<Vec<(usize, usize)>> = (0..nr).map(|r| (0..nc).map(|c| (r, c)).collect()).collect();
+        let mut span = vec![vec![(1usize, 1usize); nc]; nr];
+        // Merges come as the table's merged ranges (binary files) or as the
+        // origin cell's merge width and height (DXF).
+        let mut regions: Vec<(usize, usize, usize, usize)> = t
+            .merged_ranges
+            .iter()
+            .map(|m| (m.top_row, m.left_col, m.col_count(), m.row_count()))
+            .collect();
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate().take(nc) {
+                let (w, h) = (cell.merge_width.max(1) as usize, cell.merge_height.max(1) as usize);
+                if w > 1 || h > 1 {
+                    regions.push((r, c, w, h));
+                }
+            }
+        }
+        for (r, c, w, h) in regions {
+            if r >= nr || c >= nc || owner[r][c] != (r, c) || (w <= 1 && h <= 1) {
+                continue;
+            }
+            span[r][c] = (w.min(nc - c), h.min(nr - r));
+            for rr in r..(r + h).min(nr) {
+                for cc in c..(c + w).min(nc) {
+                    owner[rr][cc] = (r, c);
+                }
+            }
+        }
+        let vmargin = style.as_ref().map_or(0.06, |s| s.vertical_margin);
+        let mut texts = Vec::new();
+        let mut fills = Vec::new();
+        for (r, row) in t.rows.iter().enumerate() {
+            for c in 0..nc {
+                if owner[r][c] != (r, c) {
+                    continue;
+                }
+                let cell = row.cells.get(c);
+                // A cell's own override (text height, style, colour, alignment,
+                // background) wins over its row's style.
+                // (DXF and binary cells say it differently; the binary layout
+                // keeps text height, style and colour on the content.)
+                let laid = cell.map(|cell| cell.binary_layout());
+                let own = laid.as_deref().and_then(|cell| cell.style.as_ref());
+                let own_content = laid.as_deref().and_then(|cell| cell.contents.first());
+                let style_sets = |p: P| own.filter(|s| s.sets(p));
+                let content_sets = |p: P| own_content.filter(|c| c.sets(p));
+                if let Some(s) = style_sets(P::BACKGROUND_COLOR).filter(|s| s.fill_enabled) {
+                    let (w, h) = span[r][c];
+                    let (x0, x1, y0, y1) = (xs[c], xs[c + w], -ys[r], -ys[r + h]);
+                    let mut solid = Solid::new(
+                        Vector3::new(x0, y0, 0.0),
+                        Vector3::new(x1, y0, 0.0),
+                        Vector3::new(x0, y1, 0.0),
+                        Vector3::new(x1, y1, 0.0),
+                    );
+                    by_block(&mut solid.common);
+                    solid.common.color = s.background_color.clone();
+                    fills.push(solid);
+                }
+                let text = cell.and_then(|cell| cell.contents.first()).map(|ct| ct.value.text.clone()).unwrap_or_default();
+                let has_field = cell.and_then(|cell| cell.contents.first()).is_some_and(|ct| ct.field_handle.is_some());
+                if text.is_empty() && !has_field && !extra.contains(&(r, c)) {
+                    continue;
+                }
+                let (mut height, mut align) = row_style(r);
+                // A cell overriding its style brings its own alignment.
+                if let Some(s) = style_sets(P::ALIGNMENT).filter(|s| (1..=9).contains(&s.alignment)) {
+                    align = s.alignment;
+                }
+                if let Some(c) = content_sets(P::TEXT_HEIGHT).filter(|c| c.text_height > 0.0) {
+                    height = c.text_height;
+                }
+                let (w, h) = span[r][c];
+                let (x0, x1, y0, y1) = (xs[c], xs[c + w], ys[r], ys[r + h]);
+                // The text sits where its alignment puts it inside the margins.
+                let a = (align.clamp(1, 9) - 1) as usize;
+                let x = [x0 + margin, (x0 + x1) / 2.0, x1 - margin][a % 3];
+                let y = [-(y0 + vmargin), -(y0 + y1) / 2.0, -(y1 - vmargin)][a / 3];
+                let mut m = MText::new();
+                by_block(&mut m.common);
+                m.value = text;
+                m.height = height;
+                m.rectangle_width = (x1 - x0) - 2.0 * margin;
+                m.insertion_point = Vector3::new(x, y, 0.0);
+                m.attachment_point = attachment(align);
+                m.drawing_direction = crate::entities::DrawingDirection::ByStyle;
+                if let Some(c) = content_sets(P::CONTENT_COLOR) {
+                    m.common.color = c.color.clone();
+                }
+                if let Some(s) = content_sets(P::TEXT_STYLE) {
+                    let name = if s.text_style_name.is_empty() {
+                        s.text_style_handle
+                            .and_then(|h| self.text_styles.iter().find(|st| st.handle == h))
+                            .map(|st| st.name.clone())
+                            .unwrap_or_default()
+                    } else {
+                        s.text_style_name.clone()
+                    };
+                    if !name.is_empty() {
+                        m.style = name;
+                    }
+                }
+                texts.push(((r, c), m));
+            }
+        }
+        let line = |a: Vector3, b: Vector3| {
+            let mut l = Line::from_points(a, b);
+            by_block(&mut l.common);
+            l.common.linetype = "ByBlock".into();
+            l.common.line_weight = LineWeight::ByBlock;
+            l
+        };
+        // Grid lines, skipping the inside of merged regions: each row
+        // boundary top to bottom as runs left to right, then each column
+        // boundary left to right as runs top to bottom.
+        let mut lines = Vec::new();
+        for k in 0..=nr {
+            let open = |c: usize| k == 0 || k == nr || owner[k - 1][c] != owner[k][c];
+            let mut c = 0;
+            while c < nc {
+                if !open(c) {
+                    c += 1;
+                    continue;
+                }
+                let start = c;
+                while c < nc && open(c) {
+                    c += 1;
+                }
+                lines.push(line(Vector3::new(xs[start], -ys[k], 0.0), Vector3::new(xs[c], -ys[k], 0.0)));
+            }
+        }
+        for k in 0..=nc {
+            let open = |r: usize| k == 0 || k == nc || owner[r][k - 1] != owner[r][k];
+            let mut r = 0;
+            while r < nr {
+                if !open(r) {
+                    r += 1;
+                    continue;
+                }
+                let start = r;
+                while r < nr && open(r) {
+                    r += 1;
+                }
+                lines.push(line(Vector3::new(xs[k], -ys[start], 0.0), Vector3::new(xs[k], -ys[r], 0.0)));
+            }
+        }
+        let mut point = Line::from_points(Vector3::ZERO, Vector3::ZERO);
+        point.common.layer = "Defpoints".into();
+        point.common.color = Color::from_index(8);
+        point.common.invisible = true;
+        point.common.transparency = Transparency::ByBlock;
+        point.common.line_weight = LineWeight::from_value(0);
+        lines.push(point);
+        (texts, lines, fills)
+    }
+
+    /// Draw a table into its anonymous `*T` block the way the reference keeps
+    /// it (see `table_block_plan`). Each of `fields` (row, column, template,
+    /// children) puts a field into that cell: the cell's MTEXT holds it under
+    /// `ACAD_FIELD` and the cell's content refers to the same container.
+    /// Returns the containers in `fields` order.
+    pub fn build_table_block(
+        &mut self,
+        table: Handle,
+        fields: Vec<(usize, usize, String, Vec<NewField>)>,
+    ) -> Option<Vec<Option<Handle>>> {
+        let cells: Vec<(usize, usize)> = fields.iter().map(|f| (f.0, f.1)).collect();
+        let texts = self.redraw_table_block(table, &cells, true)?;
+        let mut out = Vec::new();
+        for (r, c, template, children) in fields {
+            let container = texts.get(&(r, c)).and_then(|h| self.set_text_field(*h, &template, children));
+            if let (Some(container), Some(EntityType::Table(t))) = (container, self.get_entity_mut(table)) {
+                if let Some(content) = t.rows.get_mut(r).and_then(|row| row.cells.get_mut(c)).and_then(|cell| cell.contents.first_mut()) {
+                    content.field_handle = Some(container);
+                }
+                t.field_handles.push(container);
+            }
+            out.push(container);
+        }
+        Some(out)
+    }
+
+    /// Bring a table's `*T` block up to date after the table changed (cells,
+    /// sizes, styles). Nothing happens when the block already shows the table;
+    /// the cells' fields stay with their texts. Returns whether it redrew.
+    pub fn refresh_table_block(&mut self, table: Handle) -> bool {
+        self.redraw_table_block(table, &[], false).is_some()
+    }
+
+    fn redraw_table_block(
+        &mut self,
+        table: Handle,
+        extra: &[(usize, usize)],
+        always: bool,
+    ) -> Option<std::collections::HashMap<(usize, usize), Handle>> {
+        let Some(EntityType::Table(t)) = self.get_entity(table) else {
+            return None;
+        };
+        let t = (**t).clone();
+        let (texts, lines, fills) = self.table_block_plan(&t, extra);
+        let record = t
+            .block_record_handle
+            .and_then(|h| self.block_records.iter().find(|r| r.handle == h))
+            .or_else(|| self.block_records.get(&t.block_name).filter(|_| !t.block_name.is_empty()))
+            .map(|r| (r.handle, r.name.clone(), r.entity_handles.clone()));
+        // A table that let go of its block (found by name) keeps drawing from
+        // its own data, which shows more than the block plan does (borders,
+        // block cells, row and table backgrounds); only the block is brought
+        // up to date for readers that draw it.
+
+        // What the block shows now, against what it should show.
+        let key = |e: &EntityType| -> Option<String> {
+            let r = |v: f64| format!("{:.9}", v + 0.0);
+            match e {
+                EntityType::MText(m) => Some(format!(
+                    "T {} {} {} {} {} {:?}",
+                    r(m.insertion_point.x),
+                    r(m.insertion_point.y),
+                    r(m.height),
+                    r(m.rectangle_width),
+                    m.attachment_point as i32,
+                    if m.common.xdictionary_handle.is_some() { "" } else { m.value.as_str() }
+                )),
+                EntityType::Line(l) => Some(format!("L {} {} {} {} {}", r(l.start.x), r(l.start.y), r(l.end.x), r(l.end.y), l.common.layer)),
+                EntityType::Solid(f) => Some(format!("S {} {} {} {} {:?}", r(f.first_corner.x), r(f.first_corner.y), r(f.fourth_corner.x), r(f.fourth_corner.y), f.common.color)),
+                _ => None,
+            }
+        };
+        let field_cells: Vec<(usize, usize)> = t
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| {
+                row.cells
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| cell.contents.first().is_some_and(|ct| ct.field_handle.is_some()))
+                    .map(move |(c, _)| (r, c))
+            })
+            .collect();
+        if let (false, Some((_, _, old))) = (always, record.as_ref()) {
+            let mut now: Vec<String> = old.iter().filter_map(|h| self.get_entity(*h)).filter_map(key).collect();
+            let mut want: Vec<String> = texts
+                .iter()
+                .map(|(cell, m)| {
+                    let mut m = m.clone();
+                    if field_cells.contains(cell) {
+                        m.common.xdictionary_handle = Some(Handle::NULL);
+                    }
+                    key(&EntityType::MText(m)).unwrap_or_default()
+                })
+                .chain(lines.iter().filter_map(|l| key(&EntityType::Line(l.clone()))))
+                .chain(fills.iter().filter_map(|f| key(&EntityType::Solid(f.clone()))))
+                .collect();
+            now.sort();
+            want.sort();
+            if now == want {
+                return None;
+            }
+        }
+
+        // Field cells keep their text's dictionary (the field) and value.
+        let mut carried: std::collections::HashMap<(usize, usize), (Handle, String)> = std::collections::HashMap::new();
+        for (cell, container) in t.rows.iter().enumerate().flat_map(|(r, row)| {
+            row.cells.iter().enumerate().filter_map(move |(c, cell)| cell.contents.first().and_then(|ct| ct.field_handle).map(|h| ((r, c), h)))
+        }) {
+            let owner_of = |h: Handle| match self.objects.get(&h) {
+                Some(ObjectType::Field(f)) => Some(f.owner),
+                Some(ObjectType::Dictionary(d)) => Some(d.owner),
+                _ => None,
+            };
+            // container › TEXT dictionary › extension dictionary › MTEXT
+            let xdict = owner_of(container).and_then(owner_of);
+            let host = xdict.and_then(owner_of);
+            if let (Some(xdict), Some(EntityType::MText(m))) = (xdict, host.and_then(|h| self.get_entity(h))) {
+                carried.insert(cell, (xdict, m.value.clone()));
+            }
+        }
+
+        let owner = match record {
+            Some((handle, _, old)) => {
+                for h in &old {
+                    self.remove_entity(*h);
+                }
+                if let Some(r) = self.block_records.iter_mut().find(|r| r.handle == handle) {
+                    r.entity_handles.clear();
+                }
+                handle
+            }
+            None => {
+                let mut index = 1;
+                while self.block_records.get(&format!("*T{index}")).is_some() {
+                    index += 1;
+                }
+                let mut record = crate::tables::BlockRecord::new(format!("*T{index}"));
+                record.handle = self.allocate_handle();
+                record.block_entity_handle = self.allocate_handle();
+                record.block_end_handle = self.allocate_handle();
+                record.flags.anonymous = true;
+                let handle = record.handle;
+                let name = record.name.clone();
+                self.block_records.add(record).ok()?;
+                if let Some(EntityType::Table(t)) = self.get_entity_mut(table) {
+                    t.block_name = name;
+                    t.block_record_handle = Some(handle);
+                }
+                handle
+            }
+        };
+        if !self.layers.contains("Defpoints") {
+            let mut layer = crate::tables::Layer::new("Defpoints");
+            layer.handle = self.allocate_handle();
+            layer.is_plottable = false;
+            self.layers.add_or_replace(layer);
+        }
+        let mut handles = std::collections::HashMap::new();
+        // Cell backgrounds first, under the texts and the grid.
+        for mut f in fills {
+            f.common.owner_handle = owner;
+            let _ = self.add_entity(EntityType::Solid(f));
+        }
+        for (cell, mut m) in texts {
+            m.common.owner_handle = owner;
+            if let Some((xdict, value)) = carried.get(&cell) {
+                m.common.xdictionary_handle = Some(*xdict);
+                m.value = value.clone();
+            }
+            if let Ok(h) = self.add_entity(EntityType::MText(m)) {
+                if let Some((xdict, _)) = carried.get(&cell) {
+                    if let Some(ObjectType::Dictionary(d)) = self.objects.get_mut(xdict) {
+                        d.owner = h;
+                    }
+                }
+                handles.insert(cell, h);
+            }
+        }
+        for mut l in lines {
+            l.common.owner_handle = owner;
+            let _ = self.add_entity(EntityType::Line(l));
+        }
+        Some(handles)
+    }
+
+    /// Add fields to the document and its FIELDLIST.
+    fn register_fields(&mut self, all: Vec<Field>) {
         let list = self.field_list_handle();
         if let Some(ObjectType::FieldList(l)) = self.objects.get_mut(&list) {
             l.fields.extend(all.iter().map(|f| f.handle));
@@ -2528,12 +2889,6 @@ impl CadDocument {
             );
             self.objects.insert(f.handle, ObjectType::Field(f));
         }
-
-        self.text_host(host, |common, text, _| {
-            common.xdictionary_handle = Some(xdict);
-            *text = display;
-        })?;
-        Some(container)
     }
 
     /// Detach the field from a text host, keeping its current text as plain
@@ -2591,6 +2946,18 @@ impl CadDocument {
         insert: Handle,
         ctx: &dyn FieldContext,
     ) -> Vec<Handle> {
+        self.attach_attribute_fields_mapped(insert, ctx, &|code: &str| code.to_string())
+    }
+
+    /// [`Self::attach_attribute_fields`] with each field code passed through
+    /// `map` first — a sheet set view label turns its `?View.` / `?Sheet.`
+    /// placeholders into the placed view's and sheet's navigation fields.
+    pub fn attach_attribute_fields_mapped(
+        &mut self,
+        insert: Handle,
+        ctx: &dyn FieldContext,
+        map: &dyn Fn(&str) -> String,
+    ) -> Vec<Handle> {
         // ATTRIBs need handles to host fields.
         let unset = match self.get_entity(insert) {
             Some(EntityType::Insert(i)) => i.attributes.iter().filter(|a| a.common.handle.is_null()).count(),
@@ -2631,7 +2998,7 @@ impl CadDocument {
                 .iter()
                 .map(|k| {
                     let placeholder = k.code.contains("?BlockRefId");
-                    let code = k.code.replace("?BlockRefId", "%<\\_ObjIdx 0>%");
+                    let code = map(&k.code.replace("?BlockRefId", "%<\\_ObjIdx 0>%"));
                     let objects = if placeholder { vec![insert] } else { k.objects.clone() };
                     let stored = match self.objects.get(&k.handle) {
                         Some(ObjectType::Field(f)) => Some(f),
@@ -2666,18 +3033,80 @@ impl CadDocument {
     /// host's ordinary context. Returns the hosts whose text changed.
     pub fn stamp_plot_fields(&mut self, ctx: &dyn FieldContext) -> Vec<Handle> {
         let plot = Plotting(ctx);
+        self.restamp_fields(&plot, ctx, &|_, f| f.evaluation_option & 4 != 0, None).0
+    }
+
+    /// What the reference application does to fields on an evaluation event:
+    /// `event` is an evaluation option bit — 1 open, 2 save, 16 regen, 32 an
+    /// explicit update (UPDATEFIELD) — and every field whose own evaluation
+    /// option holds it is re-evaluated, its value stored in the field object
+    /// and the host text. A `Date` field (option 32) keeps its value through
+    /// open, save and regen; `PlotDate` only changes when plotting. The caller
+    /// masks `event` with FIELDEVAL. `hosts` limits the update to those host
+    /// entities. Returns the hosts whose text changed and how many fields
+    /// the hosts hold.
+    pub fn update_fields(
+        &mut self,
+        ctx: &dyn FieldContext,
+        event: i32,
+        hosts: Option<&[Handle]>,
+    ) -> (Vec<Handle>, usize) {
+        self.restamp_fields(ctx, ctx, &|_, f| f.evaluation_option & event != 0, hosts)
+    }
+
+    /// Re-evaluate the formulas (`AcExpr`) in a table's cells, as the
+    /// reference recomputes them when the table changes, storing the values
+    /// in the field objects and the cell texts of the table's block. Returns
+    /// the texts that changed.
+    pub fn refresh_table_formulas(&mut self, ctx: &dyn FieldContext, table: Handle) -> Vec<Handle> {
+        let hosts = match self.get_entity(table) {
+            Some(EntityType::Table(t)) => t
+                .block_record_handle
+                .and_then(|h| self.block_records.iter().find(|r| r.handle == h))
+                .map(|r| r.entity_handles.clone()),
+            _ => None,
+        };
+        match hosts {
+            Some(hosts) => self.restamp_fields(ctx, ctx, &|kid, _| kid.evaluator == "AcExpr", Some(&hosts)).0,
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-evaluate the sheet set (`AcSm`) fields — after a sheet set changed —
+    /// storing their values in the field objects and host texts, as the
+    /// reference does when it updates fields. Returns the hosts whose text changed.
+    pub fn refresh_sheet_set_fields(&mut self, ctx: &dyn FieldContext) -> Vec<Handle> {
+        self.restamp_fields(ctx, ctx, &|kid, _| kid.evaluator.starts_with("AcSm"), None).0
+    }
+
+    /// Re-evaluate (with `eval_ctx`) the fields `pick` selects — of the
+    /// `only` hosts when given — and store the changed values. Returns the
+    /// hosts whose text changed and the number of fields the hosts hold.
+    fn restamp_fields(
+        &mut self,
+        eval_ctx: &dyn FieldContext,
+        ctx: &dyn FieldContext,
+        pick: &dyn Fn(&FieldDef, &Field) -> bool,
+        only: Option<&[Handle]>,
+    ) -> (Vec<Handle>, usize) {
+        let mut found = 0;
+        let plot = eval_ctx;
         let mut values: Vec<(Handle, CellValue)> = Vec::new();
         let mut hosts: Vec<(Handle, Handle, String)> = Vec::new();
         for container in self.fields.values().filter(|f| f.evaluator == "_text") {
             let Some(host) = host_of(self, container) else {
                 continue;
             };
+            if only.is_some_and(|only| !only.contains(&host)) {
+                continue;
+            }
             let mut kids: Vec<&FieldDef> = self
                 .fields
                 .values()
                 .filter(|f| f.owner == container.handle)
                 .collect();
             kids.sort_by_key(|f| u64::from(f.handle));
+            found += kids.len();
             let mut shown = Vec::new();
             let mut changed = false;
             for kid in kids {
@@ -2689,11 +3118,12 @@ impl CadDocument {
                     "" => stored.value_string.clone(),
                     shown => shown.to_string(),
                 };
-                let fresh = (stored.evaluation_option & 4 != 0)
-                    .then(|| eval_field(self, kid, &plot, host))
-                    .flatten();
+                let fresh = pick(kid, stored).then(|| eval_field(self, kid, plot, host)).flatten();
+                // A sheet set field with no set open to answer it keeps the
+                // value it was saved with rather than `####`.
+                let unanswered = |text: &str| kid.evaluator.starts_with("AcSm") && text == "####";
                 match fresh {
-                    Some(text) if text != cached => {
+                    Some(text) if text != cached && !unanswered(&text) => {
                         changed = true;
                         values.push((kid.handle, plot_value(kid, &text, ctx.now_julian())));
                         shown.push(text);
@@ -2728,7 +3158,7 @@ impl CadDocument {
                 changed.push(host);
             }
         }
-        changed
+        (changed, found)
     }
 
     /// Owner walk over objects *and* fields (`object_owner` does not know
@@ -2819,6 +3249,153 @@ impl CadDocument {
     }
 }
 
+/// A child FIELD of `owner` (a `_text` container) from its description.
+fn child_field(child: NewField, handle: Handle, owner: Handle) -> Field {
+    let mut child_values = Vec::new();
+    if child.evaluator.starts_with("AcVar") {
+        if let Some(name) = code_word(&child.code, 1) {
+            // A hyperlink (`\href`) names no variable.
+            let name = if name.starts_with('\\') { "" } else { name };
+            let mut v = CellValue::text(name);
+            v.flags = 2;
+            v.formatted_value.clear();
+            child_values.push(FieldChildValue {
+                key: "Variable".into(),
+                value: v,
+            });
+        }
+    }
+    if child.evaluator == "AcDiesel" {
+        let expr = child.code.trim().trim_start_matches("\\AcDiesel").trim();
+        let mut v = CellValue::text(expr);
+        v.flags = 2;
+        v.formatted_value.clear();
+        child_values.push(FieldChildValue {
+            key: "DieselExpression".into(),
+            value: v,
+        });
+    }
+    if child.evaluator.starts_with("AcObjProp") {
+        if let Some(&object) = child.objects.first() {
+            let mut id = CellValue::new();
+            id.value_type = CellValueType::Handle;
+            id.raw_type_code = 0x40;
+            id.handle_value = Some(object);
+            id.flags = 2;
+            child_values.push(FieldChildValue {
+                key: "ObjectPropertyId".into(),
+                value: id,
+            });
+        }
+        if let Some(prop) = child
+            .code
+            .split(").")
+            .nth(1)
+            .and_then(|s| s.split([' ', '\\']).next())
+        {
+            let mut v = CellValue::text(prop);
+            v.flags = 2;
+            v.formatted_value.clear();
+            child_values.push(FieldChildValue {
+                key: "ObjectPropertyName".into(),
+                value: v,
+            });
+        }
+        // `Object(<id>,1)`: the option, as a number and as text.
+        let object_arg = between(&child.code, "Object(", ").").unwrap_or("");
+        if let Some((_, option)) = object_arg.rsplit_once(',') {
+            let option = option.trim();
+            let mut n = CellValue::integer(option.parse().unwrap_or(0));
+            n.flags = 2;
+            n.formatted_value.clear();
+            let mut s = CellValue::text(option);
+            s.flags = 2;
+            s.formatted_value.clear();
+            child_values.push(FieldChildValue {
+                key: "ObjectPropertyOption".into(),
+                value: n,
+            });
+            child_values.push(FieldChildValue {
+                key: "ObjectPropertyOptionString".into(),
+                value: s,
+            });
+        }
+        // A block placeholder names its object only on insertion.
+        if object_arg.starts_with("?BlockRefId") {
+            let mut v = CellValue::text("?BlockRefId");
+            v.flags = 2;
+            v.formatted_value.clear();
+            child_values.push(FieldChildValue {
+                key: "ObjectPropertyUnresolvedId".into(),
+                value: v,
+            });
+        }
+    }
+    if child.evaluator.starts_with("AcCount") {
+        // The count's JSON query, kept beside the code.
+        let body = child.code.trim().trim_start_matches('\\');
+        let json = body.split_once(char::is_whitespace).map(|(_, j)| j.trim()).unwrap_or("");
+        if !json.is_empty() {
+            let mut v = CellValue::text(json);
+            v.flags = 2;
+            v.formatted_value.clear();
+            child_values.push(FieldChildValue {
+                key: "CountJsonString".into(),
+                value: v,
+            });
+        }
+    }
+    // A sheet set field names its component and property; in a drawing that
+    // is no sheet it is left unevaluated (`####`).
+    let mut unevaluated = false;
+    if child.evaluator.starts_with("AcSm") {
+        for (key, text) in crate::sheet_set::field_child_values(&child.code) {
+            let mut v = CellValue::text(&text);
+            v.flags = 2;
+            v.formatted_value.clear();
+            child_values.push(FieldChildValue { key: key.into(), value: v });
+        }
+        unevaluated = child.value.display() == "####";
+    }
+    let shown = child.value.display().to_string();
+    let xdata = hyperlink_xdata(&child.code).unwrap_or_default();
+    let value = if unevaluated {
+        let mut v = CellValue::new();
+        v.flags = 1;
+        v.format = child.value.format.clone();
+        v
+    } else if shown == "----" && child.evaluator.starts_with("AcSm") {
+        // A property without a value keeps an empty string; only the shown
+        // text is `----`.
+        let mut v = CellValue::text("");
+        v.format = child.value.format.clone();
+        v
+    } else {
+        child.value.clone()
+    };
+    let (state, evaluation_status, evaluation_error_code) =
+        if unevaluated { (43, 32, 22) } else { (59, 2, 0) };
+    Field {
+        handle,
+        owner,
+        // Pre-R2007 files keep the format on the field itself.
+        format: child.value.format.clone(),
+        evaluator_id: child.evaluator,
+        code: child.code,
+        referenced_objects: child.objects,
+        evaluation_option: child.evaluation_option,
+        state,
+        evaluation_status,
+        evaluation_error_code,
+        value,
+        value_string_length: shown.encode_utf16().count() as i32,
+        value_string: shown,
+        xdata,
+        child_values,
+        ..Field::default()
+    }
+}
+
 /// The host text for a container template: every `%<\_FldIdx n>%` replaced by
 /// `children[n]`'s display text (escaped for MTEXT). `None` when a marker has
 /// no child.
@@ -2843,6 +3420,80 @@ fn fill_template<S: AsRef<str>>(template: &str, shown: &[S], mtext: bool) -> Opt
     }
     out.push_str(rest);
     Some(out)
+}
+
+/// Byte ranges of each field's shown value in `text`, the stored text of
+/// `host` (its container template filled with the fields' cached values):
+/// where the host draws its field background. `None` when the host holds no
+/// field or `text` no longer matches the template.
+pub fn field_spans(
+    doc: &CadDocument,
+    host: Handle,
+    text: &str,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let container = container_for_host(doc, host)?;
+    let shown = cached_children(doc, container);
+    let mtext = matches!(doc.get_entity(host), Some(EntityType::MText(_)));
+    let mut out = String::new();
+    let mut spans = Vec::new();
+    let mut rest = container.code.as_str();
+    while let Some(p) = rest.find("%<\\_FldIdx ") {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 11..];
+        let end = after.find(">%")?;
+        let idx: usize = after[..end].trim().parse().ok()?;
+        let value = shown.get(idx)?;
+        let start = out.len();
+        out.push_str(&if mtext { mtext_escape(value) } else { value.clone() });
+        spans.push(start..out.len());
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    (out == text).then_some(spans)
+}
+
+/// A field's stored value, as last evaluated (the value, else its string).
+fn cached_value(doc: &CadDocument, field: Handle) -> String {
+    match doc.objects.get(&field) {
+        Some(ObjectType::Field(stored)) => match stored.value.display() {
+            "" => stored.value_string.clone(),
+            shown => shown.to_string(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// The stored values of a container's child fields, in `_FldIdx` order.
+fn cached_children(doc: &CadDocument, container: &FieldDef) -> Vec<String> {
+    let mut kids: Vec<&FieldDef> =
+        doc.fields.values().filter(|f| f.owner == container.handle).collect();
+    kids.sort_by_key(|f| u64::from(f.handle));
+    kids.iter().map(|kid| cached_value(doc, kid.handle)).collect()
+}
+
+/// The text a table cell shows for its field `field`: a formula (`AcExpr`,
+/// which reads other cells) is evaluated live, as the reference recomputes
+/// it when the table changes; any other field shows its stored value, which
+/// only an evaluation event ([`CadDocument::update_fields`]) changes.
+pub fn cell_field_text(
+    doc: &CadDocument,
+    field: Handle,
+    table: Handle,
+    ctx: &dyn FieldContext,
+) -> Option<String> {
+    let def = doc.fields.get(&field)?;
+    if def.evaluator != "_text" {
+        return if def.evaluator == "AcExpr" {
+            resolve_handle(doc, field, table, ctx)
+        } else {
+            Some(cached_value(doc, field))
+        };
+    }
+    let formula = doc.fields.values().any(|f| f.owner == def.handle && f.evaluator == "AcExpr");
+    if formula {
+        return resolve_handle(doc, field, table, ctx);
+    }
+    fill_template(&def.code, &cached_children(doc, def), false)
 }
 
 /// A host context that is plotting.
@@ -2872,6 +3523,12 @@ impl FieldContext for Plotting<'_> {
     }
     fn date_locale(&self) -> DateLocale {
         self.0.date_locale()
+    }
+    fn sheet_sets(
+        &self,
+        f: &mut dyn FnMut(&crate::sheet_set::SheetSetDatabase) -> Option<String>,
+    ) -> Option<String> {
+        self.0.sheet_sets(f)
     }
 }
 
@@ -3024,5 +3681,21 @@ mod tests {
         );
         assert_eq!(num_str(5.0), "5");
         assert_eq!(rtos(3.14159, Some(2)), "3.14");
+    }
+}
+
+/// The MTEXT attachment for a table cell alignment (1 top left … 9 bottom right).
+fn attachment(align: i32) -> crate::entities::AttachmentPoint {
+    use crate::entities::AttachmentPoint as A;
+    match align {
+        1 => A::TopLeft,
+        2 => A::TopCenter,
+        3 => A::TopRight,
+        4 => A::MiddleLeft,
+        6 => A::MiddleRight,
+        7 => A::BottomLeft,
+        8 => A::BottomCenter,
+        9 => A::BottomRight,
+        _ => A::MiddleCenter,
     }
 }

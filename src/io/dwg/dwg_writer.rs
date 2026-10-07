@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Seek, Write};
 use std::path::Path;
 
-use crate::document::{CadDocument, HeaderVariables};
+use crate::document::{CadDocument, HeaderVariables, SummaryInfo};
 use crate::error::{DxfError, Result};
 use crate::types::{DxfVersion, Handle};
 
@@ -65,6 +65,7 @@ impl DwgWriter {
         prepare_surface_classes(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
+        prepare_roundtrip_records(&mut prepared);
         let document = prepared.as_ref();
         let perf = std::env::var_os("PERF").is_some();
         let started = web_time::Instant::now();
@@ -86,57 +87,18 @@ impl DwgWriter {
             if owned.has_null_table_entries() {
                 owned.assign_table_entry_handles();
             }
-            // Native records contain class numbers. Compacting a source DWG's
-            // class table would reinterpret untouched entities and opaque objects
-            // as unrelated types when their original records are copied below.
-            if owned.version < DxfVersion::AC1027
-                && owned.dwg_source_version != Some(owned.version)
-            {
-                // FIELD / FIELDLIST objects exist from R2004 on.
-                let field_classes: &[&str] = if owned.version >= DxfVersion::AC1018 {
-                    &["FIELD", "FIELDLIST"]
-                } else {
-                    &[]
-                };
-                let mut required: Vec<_> = owned
-                    .entities()
-                    .filter_map(|entity| {
-                        let name = match entity {
-                            crate::entities::EntityType::Surface(surface) => {
-                                surface.kind.dxf_name()
-                            }
-                            crate::entities::EntityType::Extended(entity) => entity.class_name(),
-                            crate::entities::EntityType::Underlay(entity) => entity.entity_name(),
-                            _ => entity.as_entity().entity_type(),
-                        };
-                        owned.classes.get_by_name(name).cloned()
-                    })
-                    .chain(
-                        field_classes
-                            .iter()
-                            .filter_map(|name| owned.classes.get_by_name(name).cloned()),
-                    )
-                    // Objects whose type code is their class number lose it
-                    // when the class is pruned and would be written under an
-                    // unrelated class.
-                    .chain(owned.objects.values().filter_map(|object| {
-                        object_class_names(object)
-                            .into_iter()
-                            .find_map(|name| owned.classes.get_by_name(&name).cloned())
-                    }))
-                    .collect();
-                // Keep the source class order so the output is deterministic.
-                required.sort_by_key(|class| class.class_number);
-                owned.classes.retain_legacy_dwg_classes();
-                for mut class in required {
-                    if !owned.classes.contains(&class.dxf_name) {
-                        class.class_number = 0;
-                        owned.classes.add_or_update(class);
-                    }
+            if owned.version < DxfVersion::AC1027 {
+                // A table read from a file of this version is already valid
+                // for it, and the verbatim records copied from that file
+                // carry its class numbers: leave it as it is.
+                if owned.dwg_source_version != Some(owned.version) {
+                    prepare_legacy_classes(&mut owned);
                 }
             }
             if owned.version < DxfVersion::AC1027 {
                 prepare_legacy_document(&mut owned);
+                crate::objects::store_table_style_roundtrip(&mut owned);
+                crate::objects::store_visual_style_roundtrip(&mut owned);
             }
             &owned
         } else {
@@ -183,6 +145,7 @@ impl DwgWriter {
         prepare_surface_classes(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
+        prepare_roundtrip_records(&mut prepared);
         write_ac21_impl(&mut output, prepared.as_ref(), document.version, true)
     }
 
@@ -540,27 +503,136 @@ pub(crate) fn prepare_table_keys(document: &mut std::borrow::Cow<'_, CadDocument
     document.to_mut().resync_table_keys();
 }
 
-/// Class names an object writer resolves its type code from, for objects
-/// whose class is not one of the fixed legacy classes.
-fn object_class_names(object: &crate::objects::ObjectType) -> Vec<String> {
-    use crate::objects::ObjectType;
-    match object {
-        ObjectType::DynamicBlock(value) => vec![value.dxf_name.clone()],
-        ObjectType::Associative(value) => vec![
-            value.dxf_name.clone(),
-            format!(
-                "ACDB{}",
-                crate::objects::associative_canonical_name(&value.dxf_name)
-            ),
-        ],
-        ObjectType::ClassObject(value) => vec![value.dxf_name().to_string()],
-        ObjectType::DataObject(value) => vec![value.dxf_name().to_string()],
-        ObjectType::RegisteredClass(value) => vec![value.dxf_name.clone()],
-        ObjectType::DgnLineStyle(value) => vec![value.dxf_name().to_string()],
-        ObjectType::ObjectContextData(value) => vec![value.class_name().to_string()],
-        ObjectType::BlockVisibilityParameter(_) => vec!["BLOCKVISIBILITYPARAMETER".to_string()],
-        ObjectType::Unknown { type_name, .. } => vec![type_name.clone()],
-        _ => Vec::new(),
+/// An R2010+ record carries the visual style and table style data that
+/// pre-R2010 files keep in round-trip extension records, so an R2010+ save
+/// drops those records: a visual style's `ACAD_XREC_ROUNDTRIP` (and its
+/// extension dictionary when nothing else is in it), and a table style's
+/// cell style map and data-type group (its extension dictionary stays).
+fn prepare_roundtrip_records(document: &mut std::borrow::Cow<'_, CadDocument>) {
+    use crate::objects::{ObjectType, XRecordValue};
+    if document.version < DxfVersion::AC1024 {
+        return;
+    }
+    let key_of = |value: &XRecordValue| value.as_string().map(str::to_string);
+    let mut drops: Vec<(Handle, Handle, String, bool)> = Vec::new();
+    for (handle, object) in &document.objects {
+        let roundtrip_owner = match object {
+            ObjectType::VisualStyle(style) => style.properties.len() >= 58,
+            ObjectType::TableStyle(style) => !style.modern_overrides.is_empty(),
+            _ => false,
+        };
+        if !roundtrip_owner {
+            continue;
+        }
+        let Some(dictionary) = document.extension_dictionary_handle(*handle) else {
+            continue;
+        };
+        let Some(ObjectType::Dictionary(entries)) = document.objects.get(&dictionary) else {
+            continue;
+        };
+        let is_visual_style = matches!(object, ObjectType::VisualStyle(_));
+        for (name, child) in &entries.entries {
+            let drop = match (name.as_str(), document.objects.get(child)) {
+                ("ACAD_ROUNDTRIP_2008_TABLESTYLE_CELLSTYLEMAP", Some(ObjectType::DataObject(_))) => {
+                    !is_visual_style
+                }
+                ("ACAD_XREC_ROUNDTRIP", Some(ObjectType::XRecord(record))) => {
+                    let prefix = if is_visual_style {
+                        "RTVS"
+                    } else {
+                        "ACAD_ROUNDTRIP_PRE2007_TABLESTYLE"
+                    };
+                    record
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.code == 102)
+                        .filter_map(|entry| key_of(&entry.value))
+                        .all(|key| {
+                            key.starts_with(prefix)
+                                || (!is_visual_style && key.is_empty())
+                        })
+                        && record.entries.iter().any(|entry| entry.code == 102)
+                }
+                _ => false,
+            };
+            if drop {
+                drops.push((*handle, dictionary, name.clone(), is_visual_style));
+            }
+        }
+    }
+    if drops.is_empty() {
+        return;
+    }
+    let document = document.to_mut();
+    for (owner, dictionary, name, is_visual_style) in drops {
+        let mut now_empty = false;
+        if let Some(ObjectType::Dictionary(entries)) = document.objects.get_mut(&dictionary) {
+            if let Some(child) = entries.get(&name) {
+                entries.entries.retain(|(entry, _)| *entry != name);
+                entries.hard_owner_entries.retain(|entry| *entry != name);
+                now_empty = entries.entries.is_empty();
+                document.objects.remove(&child);
+            }
+        }
+        if is_visual_style && now_empty {
+            document.objects.remove(&dictionary);
+            document.xdic_by_handle.remove(&owner);
+            if let Some(ObjectType::VisualStyle(style)) = document.objects.get_mut(&owner) {
+                style.xdictionary_handle = None;
+            }
+        }
+    }
+}
+
+/// The DXF class name an entity is declared under in the CLASSES section.
+fn entity_class_name(entity: &crate::entities::EntityType) -> &str {
+    match entity {
+        crate::entities::EntityType::Surface(surface) => surface.kind.dxf_name(),
+        crate::entities::EntityType::Extended(entity) => entity.class_name(),
+        crate::entities::EntityType::Underlay(entity) => entity.entity_name(),
+        crate::entities::EntityType::Hatch(hatch) if hatch.is_mpolygon => "MPOLYGON",
+        crate::entities::EntityType::Insert(insert) if insert.view_rep_handle.is_some() => {
+            "ACDBVIEWREPBLOCKREFERENCE"
+        }
+        _ => entity.as_entity().entity_type(),
+    }
+}
+
+/// Shrink the class table to the pre-R2013 profile, keeping every class a
+/// record of the document is written under.
+///
+/// Classes are positional: the writer numbers them 500 + index, and each
+/// class-registered record takes its type code from that number. A class the
+/// profile would drop while an entity or object still uses it leaves the
+/// record without a valid type code, so it is kept, after the profile.
+fn prepare_legacy_classes(document: &mut CadDocument) {
+    let entity_classes = document.entities().map(entity_class_name);
+    let object_classes = document.objects.values().flat_map(
+        crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names,
+    );
+    // FIELD / FIELDLIST records exist from R2004 on and are written from the
+    // document's field table, not from `objects`.
+    let field_classes: &[&str] = if document.version >= DxfVersion::AC1018 {
+        &["FIELD", "FIELDLIST"]
+    } else {
+        &[]
+    };
+    let field_classes = field_classes.iter().map(|name| std::borrow::Cow::Owned(name.to_string()));
+    let mut seen = std::collections::HashSet::new();
+    let required: Vec<_> = entity_classes
+        .map(std::borrow::Cow::Borrowed)
+        .chain(object_classes)
+        .chain(field_classes)
+        .filter_map(|name| document.classes.get_by_name(&name).cloned())
+        .filter(|class| seen.insert(class.dxf_name.to_ascii_uppercase()))
+        .collect();
+
+    document.classes.retain_legacy_dwg_classes();
+    for mut class in required {
+        if !document.classes.contains(&class.dxf_name) {
+            class.class_number = 0;
+            document.classes.add_or_update(class);
+        }
     }
 }
 
@@ -603,14 +675,10 @@ fn prepare_legacy_document(document: &mut CadDocument) {
         }
     }
 
-    // A document read from an R2004 (AC1018) DWG that already carried
-    // ACAD_MLEADERSTYLE (AutoCAD writes it there when saving as 2004, with
-    // the MLEADERSTYLE class declared) must keep it: the reader parsed those
-    // records with the same pre-R2010 layout the writer emits, and dropping
-    // them silently loses every multileader style in the file.  Only a
-    // document that did not come from such a file gets the legacy cleanup.
-    let keep_mleader_style = document.dwg_source_version == Some(document.version)
-        && document.version >= DxfVersion::AC1018
+    // R2004 saves keep ACAD_MLEADERSTYLE (with the MLEADERSTYLE class
+    // declared), written in the pre-R2010 record layout, as the reference
+    // application does; only older versions drop it.
+    let keep_mleader_style = document.version >= DxfVersion::AC1018
         && document.classes.get_by_name("MLEADERSTYLE").is_some();
     let root_handle = document.header.named_objects_dict_handle;
     let mut obsolete = Vec::new();
@@ -1208,7 +1276,8 @@ fn write_ac18<W: Write + Seek>(
     )?;
 
     // ── Section: SummaryInfo ──
-    let summary_data = build_summary_info(version);
+    let summary_data =
+        build_summary_info(version, &document.summary_info, summary_encoding(document));
     fhw.add_section(
         output,
         section_names::SUMMARY_INFO,
@@ -1386,7 +1455,8 @@ fn write_ac21_impl<W: Write + Seek>(
     // from ac21_section_info, so no page_size or compressed flag needed.
 
     // SummaryInfo
-    let summary_data = build_summary_info(version);
+    let summary_data =
+        build_summary_info(version, &document.summary_info, summary_encoding(document));
     fhw.add_section(output, section_names::SUMMARY_INFO, &summary_data)?;
 
     // Preview
@@ -1531,33 +1601,68 @@ fn build_template(description: &[u8], measurement: i16) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Build SummaryInfo section data (AC18+ only).
+/// Code page of pre-R2007 SummaryInfo strings: the drawing's `$DWGCODEPAGE`.
+fn summary_encoding(document: &CadDocument) -> &'static encoding_rs::Encoding {
+    crate::io::dxf::code_page::encoding_from_dwg_code_page(
+        crate::io::dxf::code_page::dwg_code_page_index(&document.header.code_page),
+    )
+}
+
+/// Build SummaryInfo section data (AC18+ only): the drawing properties
+/// (DWGPROPS).
 ///
-/// Writes empty summary info fields (all empty strings).
+/// Writes the eight document strings (Title, Subject, Author, Keywords,
+/// Comments, LastSavedBy, RevisionNumber, HyperlinkBase) and the custom
+/// properties of `info`; the three timers stay zero. A custom property whose
+/// name and value are both empty is skipped, because readers treat such a
+/// pair as the end of the list.
 ///
-/// **AC1018 (R2004)**: Windows-1252 (ANSI) strings.
+/// **AC1018 (R2004)**: strings in the drawing code page.
 ///   Format: UInt16(byte_count_incl_null) + bytes + null.
 ///   Empty → UInt16(1) + 0x00 = 3 bytes.
 ///
 /// **AC1021 (R2007)**: UTF-16LE strings.
 ///   Format: UInt16(char_count_incl_null) + UTF-16LE chars.
 ///   Empty → UInt16(1) + 0x00 0x00 = 4 bytes.
-fn build_summary_info(version: DxfVersion) -> Vec<u8> {
+fn build_summary_info(
+    version: DxfVersion,
+    info: &SummaryInfo,
+    encoding: &'static encoding_rs::Encoding,
+) -> Vec<u8> {
     let mut data = Vec::with_capacity(128);
     let is_utf16 = version >= DxfVersion::AC1021;
 
-    // 8 × empty strings
-    // Title, Subject, Author, Keywords, Comments, LastSavedBy, RevisionNumber, HyperlinkBase
-    for _ in 0..8 {
-        data.extend_from_slice(&1u16.to_le_bytes()); // char/byte count including null
+    // The UInt16 count includes the terminating null; longer text is cut.
+    let push_text = |data: &mut Vec<u8>, text: &str| {
         if is_utf16 {
+            let units: Vec<u16> = text.encode_utf16().take(u16::MAX as usize - 1).collect();
+            data.extend_from_slice(&(units.len() as u16 + 1).to_le_bytes());
+            for unit in units {
+                data.extend_from_slice(&unit.to_le_bytes());
+            }
             // UTF-16LE null terminator: 2 bytes
-            data.push(0);
-            data.push(0);
+            data.extend_from_slice(&[0, 0]);
         } else {
+            let mut bytes = crate::io::dxf::code_page::encode_legacy_string(text, encoding);
+            bytes.truncate(u16::MAX as usize - 1);
+            data.extend_from_slice(&(bytes.len() as u16 + 1).to_le_bytes());
+            data.extend_from_slice(&bytes);
             // ANSI null terminator: 1 byte
             data.push(0);
         }
+    };
+
+    for text in [
+        &info.title,
+        &info.subject,
+        &info.author,
+        &info.keywords,
+        &info.comments,
+        &info.last_saved_by,
+        &info.revision_number,
+        &info.hyperlink_base,
+    ] {
+        push_text(&mut data, text);
     }
 
     // Total editing time: 2 × Int32 (zeros)
@@ -1572,8 +1677,18 @@ fn build_summary_info(version: DxfVersion) -> Vec<u8> {
     data.extend_from_slice(&0i32.to_le_bytes());
     data.extend_from_slice(&0i32.to_le_bytes());
 
-    // Property count: Int16 (0)
-    data.extend_from_slice(&0u16.to_le_bytes());
+    // Custom properties: Int16 count, then name/value string pairs
+    let properties: Vec<&(String, String)> = info
+        .custom_properties
+        .iter()
+        .filter(|(name, value)| !(name.is_empty() && value.is_empty()))
+        .take(u16::MAX as usize)
+        .collect();
+    data.extend_from_slice(&(properties.len() as u16).to_le_bytes());
+    for (name, value) in properties {
+        push_text(&mut data, name);
+        push_text(&mut data, value);
+    }
 
     // 2 × Int32 (trailing zeros)
     data.extend_from_slice(&0i32.to_le_bytes());
@@ -2190,6 +2305,118 @@ mod tests {
         }
     }
 
+    fn class_names(classes: &crate::classes::DxfClassCollection) -> Vec<String> {
+        classes
+            .iter()
+            .map(|class| class.dxf_name.to_ascii_uppercase())
+            .collect()
+    }
+
+    fn layer_filter_document() -> CadDocument {
+        use crate::objects::{ClassObject, ClassObjectData, LayerFilter, ObjectType};
+
+        let mut document = CadDocument::new();
+        let mut filter = ClassObject::new(ClassObjectData::LayerFilter(LayerFilter {
+            names: vec!["WALLS".into()],
+        }));
+        filter.handle = document.allocate_handle();
+        document
+            .objects
+            .insert(filter.handle, ObjectType::ClassObject(filter));
+        document
+    }
+
+    #[test]
+    fn legacy_class_table_keeps_the_classes_objects_are_written_under() {
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let mut legacy = document.classes.clone();
+        legacy.retain_legacy_dwg_classes();
+        assert!(!legacy.contains("LAYERFILTER"));
+
+        prepare_legacy_classes(&mut document);
+
+        // The legacy profile first, then the class the layer filter needs.
+        let mut expected = class_names(&legacy);
+        expected.push("LAYERFILTER".to_string());
+        assert_eq!(class_names(&document.classes), expected);
+    }
+
+    #[test]
+    fn legacy_write_keeps_class_registered_objects() {
+        use crate::objects::{ClassObjectData, ObjectType};
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        let filters: Vec<_> = decoded
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                ObjectType::ClassObject(object) => match &object.data {
+                    ClassObjectData::LayerFilter(filter) => Some(filter.names.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filters, [vec!["WALLS".to_string()]]);
+    }
+
+    #[test]
+    fn same_version_legacy_write_keeps_the_source_class_table() {
+        let mut document = CadDocument::new();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(class_names(&decoded.classes), class_names(&document.classes));
+        for class in document.classes.iter() {
+            assert_eq!(
+                decoded.classes.get_by_name(&class.dxf_name).map(|c| c.class_number),
+                Some(class.class_number),
+                "{} was renumbered",
+                class.dxf_name
+            );
+        }
+    }
+
+    #[test]
+    fn object_without_its_class_is_skipped_instead_of_written_as_class_500() {
+        use crate::objects::ObjectType;
+
+        let mut document = layer_filter_document();
+        document.version = DxfVersion::AC1024;
+        document.dwg_source_version = Some(DxfVersion::AC1024);
+        let mut classes = crate::classes::DxfClassCollection::new();
+        for class in document.classes.iter() {
+            if !class.dxf_name.eq_ignore_ascii_case("LAYERFILTER") {
+                classes.push_preserving(class.clone());
+            }
+        }
+        document.classes = classes;
+        let source_objects = document.objects.len() - 1;
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert_eq!(decoded.objects.len(), source_objects);
+        assert!(!decoded
+            .objects
+            .values()
+            .any(|object| matches!(object, ObjectType::ClassObject(_))));
+    }
+
     #[test]
     fn test_validate_version_r2007_ok() {
         assert!(validate_version(DxfVersion::AC1021).is_ok());
@@ -2369,7 +2596,11 @@ mod tests {
 
     #[test]
     fn test_build_summary_info_ac18() {
-        let d = build_summary_info(DxfVersion::AC1018);
+        let d = build_summary_info(
+            DxfVersion::AC1018,
+            &SummaryInfo::default(),
+            encoding_rs::WINDOWS_1252,
+        );
         // 8 × 3 bytes (u16(1) + ANSI null) + 8 + 16 + 2 + 8 = 58
         assert_eq!(d.len(), 58);
         assert_eq!(u16::from_le_bytes([d[0], d[1]]), 1);
@@ -2380,7 +2611,11 @@ mod tests {
 
     #[test]
     fn test_build_summary_info_ac21() {
-        let d = build_summary_info(DxfVersion::AC1021);
+        let d = build_summary_info(
+            DxfVersion::AC1021,
+            &SummaryInfo::default(),
+            encoding_rs::WINDOWS_1252,
+        );
         // 8 × 4 bytes (u16(1) + UTF-16LE null) + 8 + 16 + 2 + 8 = 66
         assert_eq!(d.len(), 66);
         // First string: u16(1) + 00 00
@@ -2389,6 +2624,31 @@ mod tests {
         assert_eq!(d[3], 0);
         // Next string starts at offset 4
         assert_eq!(u16::from_le_bytes([d[4], d[5]]), 1);
+    }
+
+    #[test]
+    fn test_build_summary_info_writes_properties() {
+        let info = SummaryInfo {
+            title: "Kanal S\u{fc}d".into(),
+            custom_properties: vec![
+                ("Plan".into(), "B-1".into()),
+                (String::new(), String::new()),
+            ],
+            ..SummaryInfo::default()
+        };
+        // R2004: drawing code page, one byte per character
+        let d = build_summary_info(DxfVersion::AC1018, &info, encoding_rs::WINDOWS_1252);
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 10);
+        assert_eq!(&d[2..12], b"Kanal S\xfcd\0");
+        // Seven empty strings, 24 bytes of timers, then one property (the empty pair is skipped)
+        let count_at = 12 + 7 * 3 + 24;
+        assert_eq!(u16::from_le_bytes([d[count_at], d[count_at + 1]]), 1);
+        assert_eq!(&d[count_at + 2..count_at + 9], b"\x05\0Plan\0");
+        assert_eq!(d.len(), count_at + 2 + 7 + 6 + 8);
+        // R2007+: UTF-16LE, count in code units
+        let d = build_summary_info(DxfVersion::AC1021, &info, encoding_rs::WINDOWS_1252);
+        assert_eq!(u16::from_le_bytes([d[0], d[1]]), 10);
+        assert_eq!(u16::from_le_bytes([d[16], d[17]]), 0xfc);
     }
 
     #[test]
