@@ -202,7 +202,9 @@ impl AssociativeData {
                     })
             }
             Self::Variable(value) => {
-                action_references(&value.action, target) || eval_references(&value.value, target)
+                action_references(&value.action, target)
+                    || eval_references(&value.value, target)
+                    || value.dependencies.iter().any(|item| item.dependency == target)
             }
             Self::CompoundActionParam(value)
             | Self::PointRefActionParam(value)
@@ -376,6 +378,9 @@ impl AssociativeData {
             Self::Variable(value) => {
                 visit_action(&mut value.action, visit);
                 visit_eval(&mut value.value, visit);
+                for item in &mut value.dependencies {
+                    visit(&mut item.dependency);
+                }
             }
             Self::CompoundActionParam(value)
             | Self::PointRefActionParam(value)
@@ -1171,7 +1176,19 @@ pub struct AssocVariable {
     pub has_cached_value: bool,
     pub cached_value: String,
     pub flag: bool,
-    pub reserved: i32,
+    /// The value dependencies the variable owns, one per variable its
+    /// expression reads (an unnamed variable holding `k1*45` owns one on
+    /// `k1`).
+    pub dependencies: Vec<AssocVariableDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AssocVariableDependency {
+    /// The owned AcDbAssocValueDependency.
+    pub dependency: Handle,
+    /// The integer written after each dependency (0 in every file seen).
+    pub flags: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
