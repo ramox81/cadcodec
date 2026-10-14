@@ -5068,7 +5068,13 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i16(69, id)?;
 
         // Status
-        self.writer.write_i32(90, viewport.status.to_bits())?;
+        let grid_bits = if self.dxf_version >= DxfVersion::AC1021 {
+            i32::from(viewport.grid_flags.to_bits()) << 18
+        } else {
+            0
+        };
+        self.writer
+            .write_i32(90, viewport.status.to_bits() | grid_bits)?;
 
         // View center
         self.writer.write_double(12, viewport.view_center.x)?;
@@ -5158,6 +5164,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // Grid major
         if viewport.grid_major != 0 {
             self.writer.write_i16(61, viewport.grid_major)?;
+        }
+
+        // R2004+: per-viewport ShadePlot mode, independent of render mode.
+        if self.dxf_version >= DxfVersion::AC1018 {
+            self.writer.write_i16(170, viewport.shade_plot_mode)?;
         }
 
         Ok(())
@@ -8885,16 +8896,17 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if let Some(d) = obj.back_clip {
             self.writer.write_double(41, d)?;
         }
-        self.write_matrix_column_major(&obj.inverse_block_transform)?;
-        self.write_matrix_column_major(&obj.clip_bound_transform)?;
+        self.write_matrix_4x3(&obj.inverse_block_transform)?;
+        self.write_matrix_4x3(&obj.clip_bound_transform)?;
         Ok(())
     }
 
-    /// Write a 4×3 transform as 12 code-40 doubles in DXF column-major order
-    /// (4 columns of 3 rows; the bottom matrix row is implied).
-    fn write_matrix_column_major(&mut self, m: &crate::types::Matrix4) -> Result<()> {
-        for col in 0..4 {
-            for row in 0..3 {
+    /// Write a `SPATIAL_FILTER` transform as 12 code-40 doubles the way
+    /// AutoCAD does: one matrix row per group of four, translation last
+    /// (the bottom row is implied). See `matrix_from_dxf_4x3` in the reader.
+    fn write_matrix_4x3(&mut self, m: &crate::types::Matrix4) -> Result<()> {
+        for row in 0..3 {
+            for col in 0..4 {
                 self.writer.write_double(40, m.m[row][col])?;
             }
         }

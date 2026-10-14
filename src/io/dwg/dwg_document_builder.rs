@@ -2914,6 +2914,7 @@ impl DwgDocumentBuilder {
             let mut source_ucss = HashSet::new();
             let mut source_vports = HashSet::new();
             let mut source_app_ids = HashSet::new();
+            let mut source_app_id_names = std::collections::HashMap::new();
             for entry in &parsed_entries {
                 match entry {
                     ParsedEntry::View(handle, _) => {
@@ -2925,8 +2926,9 @@ impl DwgDocumentBuilder {
                     ParsedEntry::VPort(handle, _) => {
                         source_vports.insert(*handle);
                     }
-                    ParsedEntry::AppId(handle, _) => {
+                    ParsedEntry::AppId(handle, data) => {
                         source_app_ids.insert(*handle);
+                        source_app_id_names.insert(*handle, data.name.to_uppercase());
                     }
                     _ => {}
                 }
@@ -3071,18 +3073,25 @@ impl DwgDocumentBuilder {
                 }
             }
 
-            let app_id_collisions: Vec<Handle> = document
+            // A retained default (e.g. AcadAnnotative, absent from older files)
+            // can sit on the handle of a different source application id (e.g.
+            // ACAD). Same table, so `collides` exempts it; compare names and move
+            // only the default.
+            let app_id_collisions: Vec<String> = document
                 .app_ids
                 .iter()
-                .filter(|entry| collides(entry.handle, &source_app_ids))
-                .map(|entry| entry.handle)
+                .filter(|entry| {
+                    collides(entry.handle, &source_app_ids)
+                        || source_app_id_names
+                            .get(&entry.handle.value())
+                            .is_some_and(|name| *name != entry.name.to_uppercase())
+                })
+                .map(|entry| entry.name.clone())
                 .collect();
-            for old in app_id_collisions {
+            for name in app_id_collisions {
                 let new = document.allocate_handle();
-                for entry in document.app_ids.iter_mut() {
-                    if entry.handle == old {
-                        entry.handle = new;
-                    }
+                if let Some(entry) = document.app_ids.get_mut(&name) {
+                    entry.handle = new;
                 }
             }
         }
@@ -4015,6 +4024,10 @@ impl DwgDocumentBuilder {
                         e.grid_major = data.grid_major;
                     }
                     e.status = ViewportStatusFlags::from_bits(data.status_flags);
+                    // VIEWPORT grid behavior uses status bits 18..21.
+                    e.grid_flags = crate::entities::GridFlags::from_bits(
+                        ((data.status_flags >> 18) & 0xf) as i16,
+                    );
                     e.style_sheet = data.style_sheet;
                     e.render_mode = ViewportRenderMode::from_value(data.render_mode as i16);
                     e.ucs_at_origin = data.ucs_at_origin;
@@ -6127,8 +6140,8 @@ impl DwgDocumentBuilder {
                     obj.front_clip = data.front_clip;
                     obj.back_clip = data.back_clip;
                     obj.inverse_block_transform =
-                        matrix_from_column_major(&data.inverse_block_transform);
-                    obj.clip_bound_transform = matrix_from_column_major(&data.clip_bound_transform);
+                        matrix_from_dxf_4x3(&data.inverse_block_transform);
+                    obj.clip_bound_transform = matrix_from_dxf_4x3(&data.clip_bound_transform);
                     document.objects.insert(
                         Handle::from(handle),
                         crate::objects::ObjectType::SpatialFilter(obj),
@@ -7291,16 +7304,15 @@ mod tests {
         );
     }
 
-    /// DWG spatial-filter transforms share DXF's column-major 4×3 layout.
+    /// DWG spatial-filter transforms share DXF's 12-value layout.
     #[test]
-    fn spatial_filter_matrix_is_column_major() {
+    fn spatial_filter_matrix_reads_autocad_order() {
         let v = [
-            1.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, //
-            0.0, 0.0, 1.0, //
-            -500.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, -500.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
         ];
-        let m = matrix_from_column_major(&v);
+        let m = matrix_from_dxf_4x3(&v);
         assert_eq!(
             m.m,
             [
@@ -7652,14 +7664,14 @@ mod dedupe_block_names_tests {
     }
 }
 
-/// DWG stores the spatial-filter transforms in the same column-major 4×3
-/// layout as DXF code 40 (X axis, Y axis, Z axis, translation).
-fn matrix_from_column_major(v: &[f64; 12]) -> crate::types::Matrix4 {
+/// DWG stores the spatial-filter transforms in the same 12-value layout as
+/// DXF code 40: one matrix row per group of four, translation last.
+fn matrix_from_dxf_4x3(v: &[f64; 12]) -> crate::types::Matrix4 {
     crate::types::Matrix4 {
         m: [
-            [v[0], v[3], v[6], v[9]],
-            [v[1], v[4], v[7], v[10]],
-            [v[2], v[5], v[8], v[11]],
+            [v[0], v[1], v[2], v[3]],
+            [v[4], v[5], v[6], v[7]],
+            [v[8], v[9], v[10], v[11]],
             [0.0, 0.0, 0.0, 1.0],
         ],
     }

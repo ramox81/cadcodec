@@ -1341,7 +1341,22 @@ dxf_entity_roundtrip!(
         "{\\Fgdt;p}%%v0.5"
     ))
 );
-dxf_entity_roundtrip!(dxf_rt_viewport, EntityType::Viewport(Viewport::new()));
+#[test]
+fn dxf_rt_viewport() {
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut viewport = Viewport::new();
+    viewport.id = 2;
+    doc.add_entity_to_layout(EntityType::Viewport(viewport), "Layout1")
+        .unwrap();
+    let restored = dxf_roundtrip(doc.clone());
+    assert_eq!(restored.entity_count(), doc.entity_count());
+    let report = compare_documents(&doc, &restored);
+    assert!(
+        report.is_empty(),
+        "DXF viewport roundtrip failed:\n{}",
+        report.summary()
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  DWG ROUNDTRIP TESTS
@@ -2978,4 +2993,44 @@ fn dwg_mline_cap_suppression_bits_roundtrip() {
             "{version:?}: closed MLINE lost its suppressed start cap"
         );
     }
+}
+
+/// An edge action parameter on an unbounded line (type 19) keeps its point
+/// and direction: associative rectangular arrays store their row axis this
+/// way, and dropping it loses the array's orientation on save.
+#[test]
+fn dwg_roundtrip_edge_action_param_line() {
+    use opencadcodec::objects::{
+        AssocCurveValue, AssocEdgeActionParam, AssocSubcurveKind, AssociativeData,
+        AssociativeObject, ObjectType,
+    };
+    let mut doc = CadDocument::new();
+    let handle = doc.allocate_handle();
+    let mut object =
+        AssociativeObject::new("ACDBASSOCEDGEACTIONPARAM", "AcDbAssocEdgeActionParam");
+    object.handle = handle;
+    object.owner = doc.header.named_objects_dict_handle;
+    let curve = vec![
+        AssocCurveValue::Point(Vector3::new(1.0, 2.0, 0.0)),
+        AssocCurveValue::Point(Vector3::new(0.6, 0.8, 0.0)),
+    ];
+    object.data = AssociativeData::EdgeActionParam(AssocEdgeActionParam {
+        has_action: true,
+        action_type: 19,
+        subcurve_kind: AssocSubcurveKind::Line,
+        curve: curve.clone(),
+        ..Default::default()
+    });
+    doc.objects.insert(handle, ObjectType::Associative(object));
+
+    let read = dwg_roundtrip(&doc);
+    let Some(ObjectType::Associative(AssociativeObject {
+        data: AssociativeData::EdgeActionParam(edge),
+        ..
+    })) = read.objects.get(&handle)
+    else {
+        panic!("edge action parameter lost");
+    };
+    assert_eq!(edge.action_type, 19);
+    assert_eq!(edge.curve, curve);
 }
