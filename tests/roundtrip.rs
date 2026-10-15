@@ -1358,6 +1358,63 @@ fn dxf_rt_viewport() {
     );
 }
 
+/// A DXF viewport's positive status (stacking rank, 1 = active) is kept
+/// apart from its ID through a round trip (#105).
+#[test]
+fn dxf_viewport_stacking_rank_is_not_its_id() {
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut ranked = Viewport::new();
+    ranked.id = 2;
+    ranked.stacking = 1;
+    let ranked = doc
+        .add_entity_to_layout(EntityType::Viewport(ranked), "Layout1")
+        .unwrap();
+    let mut unranked = Viewport::new();
+    unranked.id = 3;
+    let unranked = doc
+        .add_entity_to_layout(EntityType::Viewport(unranked), "Layout1")
+        .unwrap();
+    let restored = dxf_roundtrip(doc);
+    let read = |handle| match restored.get_entity(handle) {
+        Some(EntityType::Viewport(viewport)) => (viewport.id, viewport.stacking),
+        other => panic!("viewport expected, got {other:?}"),
+    };
+    assert_eq!(read(ranked), (2, 1));
+    // Without a known rank the writer ranks by ID; reading it back keeps 0.
+    assert_eq!(read(unranked), (3, 0));
+}
+
+/// A layout saved with a model viewport entered links that viewport as its
+/// last active one; the overall viewport must still read back as ID 1.
+#[test]
+fn dwg_overall_viewport_is_not_the_last_active_one() {
+    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
+    let mut sheet = Viewport::new();
+    sheet.width = 420.0;
+    sheet.height = 297.0;
+    let sheet = doc
+        .add_entity_to_layout(EntityType::Viewport(sheet), "Layout1")
+        .unwrap();
+    let model = doc
+        .add_entity_to_layout(EntityType::Viewport(Viewport::new()), "Layout1")
+        .unwrap();
+    for object in doc.objects.values_mut() {
+        if let opencadcodec::objects::ObjectType::Layout(layout) = object {
+            if layout.name == "Layout1" {
+                layout.viewports = vec![sheet, model];
+                layout.viewport = model;
+            }
+        }
+    }
+    let restored = dwg_roundtrip(&doc);
+    let id = |handle| match restored.get_entity(handle) {
+        Some(EntityType::Viewport(viewport)) => viewport.id,
+        other => panic!("viewport expected, got {other:?}"),
+    };
+    assert_eq!(id(sheet), 1);
+    assert_eq!(id(model), 2);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  DWG ROUNDTRIP TESTS
 // ═══════════════════════════════════════════════════════════════════════════

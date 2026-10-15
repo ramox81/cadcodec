@@ -543,8 +543,10 @@ impl DwgDocumentBuilder {
     /// DWG keeps no viewport IDs; a consumer telling the overall viewport from
     /// the authored ones needs them (#67). Other layouts keep 0.
     ///
-    /// The overall viewport is the one the layout links to, else the first of
-    /// the layout's viewport list — it need not come first in entity order.
+    /// The overall viewport heads the layout's viewport list; the layout's
+    /// own link only stands in without that list (pre-R2004), as it names the
+    /// LAST ACTIVE viewport — a model viewport when the drawing was saved with
+    /// one entered. It need not come first in entity order.
     fn number_active_viewports(document: &mut CadDocument) {
         let Some(paper) = document.block_records.get("*Paper_Space") else {
             return;
@@ -562,8 +564,12 @@ impl DwgDocumentBuilder {
         });
         let overall = layout
             .and_then(|layout| {
-                std::iter::once(layout.viewport)
-                    .chain(layout.viewports.first().copied())
+                layout
+                    .viewports
+                    .first()
+                    .copied()
+                    .into_iter()
+                    .chain(std::iter::once(layout.viewport))
                     .find(|handle| viewports.contains(handle))
             })
             .or_else(|| viewports.first().copied());
@@ -1221,7 +1227,7 @@ impl DwgDocumentBuilder {
                                 let raw =
                                     i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
                                 layer.transparency =
-                                    crate::types::Transparency::from_alpha_value(raw as u32);
+                                    crate::types::Transparency::from_layer_value(raw as u32);
                             }
                         }
                     }
@@ -2818,11 +2824,15 @@ impl DwgDocumentBuilder {
                 // Objects keep their EED in `eed_by_handle`; decode it the
                 // same way so the DXF writer can write it after the object.
                 let mut object_xdata = HashMap::new();
+                let block_records: HashSet<Handle> =
+                    document.block_records.iter().map(|record| record.handle).collect();
                 for (handle, blocks) in &document.eed_by_handle {
                     match document.objects.get(handle) {
                         // FIELD decodes its XDATA onto `Field::xdata` itself.
-                        None | Some(crate::objects::ObjectType::Field(_)) => continue,
-                        Some(_) => {}
+                        Some(crate::objects::ObjectType::Field(_)) => continue,
+                        // A block record keeps its dynamic-block tags here.
+                        None if !block_records.contains(handle) => continue,
+                        _ => {}
                     }
                     let mut xdata = crate::xdata::ExtendedData::default();
                     for (app_handle, bytes) in blocks {
