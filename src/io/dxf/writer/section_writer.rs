@@ -1234,7 +1234,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         } else {
             self.writer.write_i16(62, -color_index)?;
         }
+<<<<<<< HEAD
         // Preserve the exact RGB value alongside the nearest ACI fallback.
+=======
+        // True color (code 420) for an RGB layer — code 62 above carries only
+        // its nearest index, so without this the RGB is lost on save and the
+        // reader (which
+        // now honours 420) round-trips the layer to Index(7)/white. (#223)
+>>>>>>> origin/codex/aci-reference-palette
         if let Some(tc) = layer.color.to_true_color_value() {
             self.writer.write_i32(420, tc)?;
         }
