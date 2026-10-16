@@ -81,6 +81,8 @@ fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture>
 
 mod semantic_inventory;
 pub use semantic_inventory::*;
+mod block_graph;
+pub use block_graph::BlockGraph;
 
 #[cfg(feature = "serde")]
 fn default_sketch_tolerance() -> f64 {
@@ -1235,7 +1237,12 @@ pub struct CadDocument {
     pub(crate) entities: Vec<Arc<EntityType>>,
 
     /// Handle → index mapping for O(1) entity lookup by handle.
-    pub(crate) entity_index: foldhash::HashMap<Handle, usize>,
+    ///
+    /// The hasher must not depend on the process: plugins read a document the
+    /// host built through a shared reference across a dynamic-library
+    /// boundary, and foldhash's `RandomState` mixes in a per-process global
+    /// seed, so every lookup from the other binary missed.
+    pub(crate) entity_index: std::collections::HashMap<Handle, usize, foldhash::fast::FixedState>,
 
     /// All objects in the document (indexed by handle)
     pub objects: HashMap<Handle, ObjectType>,
@@ -1512,7 +1519,7 @@ impl CadDocument {
             classes: DxfClassCollection::new(),
             notifications: crate::notification::NotificationCollection::new(),
             entities: Vec::new(),
-            entity_index: foldhash::HashMap::default(),
+            entity_index: Default::default(),
             objects: HashMap::new(),
             block_visibility_params: HashMap::new(),
             context_scales: HashMap::new(),

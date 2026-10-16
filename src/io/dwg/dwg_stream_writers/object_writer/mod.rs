@@ -1067,7 +1067,8 @@ impl<'a> DwgObjectWriter<'a> {
         for seg in &ltype.elements {
             let c = seg.complex.as_ref();
             let flags = if let Some(ref cx) = c {
-                let mut f: i16 = 0;
+                let mut f: i16 = cx.source_flags as i16;
+                f &= !(0x01 | 0x02 | 0x04);
                 if cx.is_absolute_rotation() {
                     f |= 0x01;
                 }
@@ -1695,7 +1696,7 @@ impl<'a> DwgObjectWriter<'a> {
             self.writer.write_bit_double(ds.dimfxl);
             // DIMJOGANG BD 50 — clamp to valid range [5°..90°]
             self.writer
-                .write_bit_double(ds.dimjogang.clamp(0.0872665, 1.5708));
+                .write_bit_double(ds.dimjogang.clamp(0.0873, 1.5708));
             // DIMTFILL BS 69
             self.writer.write_bit_short(ds.dimtfill);
             // DIMTFILLCLR CMC 70

@@ -1113,7 +1113,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             // 75 = shape number. These used to be emitted swapped — AutoCAD
             // then read every element as complex (OCS#314).
             if let Some(c) = &element.complex {
-                let mut flags: i16 = 0;
+                let mut flags: i16 = c.source_flags as i16;
+                flags &= !(0x01 | 0x02 | 0x04);
                 if c.is_absolute_rotation() {
                     flags |= 0x01;
                 }
@@ -1214,16 +1215,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             Color::ByLayer => 7,
             Color::None => 7,
             Color::ByBlock => 0,
-            Color::Rgb { .. } => 7,
+            Color::Rgb { .. } => layer.color.approximate_index(),
         };
         if !layer.is_off() {
             self.writer.write_i16(62, color_index)?;
         } else {
             self.writer.write_i16(62, -color_index)?;
         }
-        // True color (code 420) for an RGB layer — code 62 above can only carry
-        // 7 for it, so without this the RGB is lost on save and the reader (which
-        // now honours 420) round-trips the layer to Index(7)/white. (#223)
+        // Preserve the exact RGB value alongside the nearest ACI fallback.
         if let Some(tc) = layer.color.to_true_color_value() {
             self.writer.write_i32(420, tc)?;
         }
@@ -1684,7 +1683,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if dimstyle.dimjogang != std::f64::consts::FRAC_PI_4 {
             // Clamp to valid range [5°..90°]
             self.writer
-                .write_double(50, dimstyle.dimjogang.clamp(0.0872665, 1.5708))?;
+                .write_double(50, dimstyle.dimjogang.to_degrees().clamp(5.0, 90.0))?;
         }
 
         // Floats 140-148
@@ -2048,7 +2047,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // - Active paper space (*Paper_Space) entities go to ENTITIES section (not here)
         // - Non-active paper spaces (*Paper_Space0, *Paper_Space1, ...) write entities here
         // - Other blocks (inserts etc.) also write entities here
-        if !block_record.is_model_space() && !block_record.name().eq_ignore_ascii_case("*Paper_Space") {
+        // - Xref blocks (see below) write no owned entities at all
+        //
+        // An xref block record references an external drawing: its contents
+        // live in that file, not here. Some hosts merge the resolved xref
+        // geometry into the block record for display; serializing those as
+        // owned entities would bind/explode the xref into the host file on
+        // the next open. Skip the entity loop entirely, leaving only the
+        // BLOCK/ENDBLK markers — matching the DWG writer (see
+        // `DwgObjectWriter::write_block_entities`).
+        let is_xref = block_record.flags.is_xref || block_record.flags.is_xref_overlay;
+        if !is_xref
+            && !block_record.is_model_space()
+            && !block_record.name().eq_ignore_ascii_case("*Paper_Space")
+        {
             // Set paper space flag so entities inside non-active paper
             // space blocks get code 67=1 (same as active paper space).
             let prev_ps = self.writing_paper_space;
@@ -3891,6 +3903,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         if polyline.end_width != 0.0 {
             self.writer.write_double(41, polyline.end_width)?;
         }
+        self.write_normal(polyline.normal)?;
 
         // XDATA precedes the child VERTEX/SEQEND records.
         self.write_xdata(&polyline.common.extended_data)?;
@@ -4056,7 +4069,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer.write_double(41, text.width_factor)?;
         }
         if text.oblique_angle != 0.0 {
-            self.writer.write_double(51, text.oblique_angle)?;
+            self.writer.write_double(51, text.oblique_angle.to_degrees())?;
         }
         self.writer.write_string(7, &text.style)?;
         if text.generation_flags != 0 {
@@ -4086,9 +4099,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_mtext_value(&mtext.value)?;
 
         self.writer.write_string(7, &mtext.style)?;
-        if mtext.rotation != 0.0 {
-            self.writer.write_double(50, mtext.rotation.to_degrees())?;
-        }
+        let x_direction = mtext
+            .dwg_x_direction
+            .unwrap_or_else(|| Vector3::new(mtext.rotation.cos(), mtext.rotation.sin(), 0.0));
+        self.writer.write_point3d(11, x_direction)?;
         // Laid-out text extents (output-only). Skipped when never computed so
         // files authored without layout info round-trip unchanged.
         if mtext.extents_width > 0.0 {
@@ -4314,63 +4328,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         type_flags: i16,
         owner: Handle,
     ) -> Result<()> {
-        self.writer.write_handle(5, base.common.handle)?;
-        self.writer.write_handle(330, owner)?;
-
-        // Write xdictionary group
-        if let Some(xdict) = base.common.xdictionary_handle {
-            if xdict != Handle::NULL
-                && (self.valid_handles.is_empty() || self.valid_handles.contains(&xdict))
-            {
-                self.writer.write_string(102, "{ACAD_XDICTIONARY")?;
-                self.writer.write_handle(360, xdict)?;
-                self.writer.write_string(102, "}")?;
-            }
-        }
-
-        // Write reactor group (filter out reactors pointing to non-existent objects)
-        if !base.common.reactors.is_empty() {
-            let valid_reactors: Vec<Handle> = if self.valid_handles.is_empty() {
-                base.common.reactors.clone()
-            } else {
-                base.common
-                    .reactors
-                    .iter()
-                    .copied()
-                    .filter(|r| self.valid_handles.contains(r))
-                    .collect()
-            };
-            if !valid_reactors.is_empty() {
-                self.writer.write_string(102, "{ACAD_REACTORS")?;
-                for reactor in &valid_reactors {
-                    self.writer.write_handle(330, *reactor)?;
-                }
-                self.writer.write_string(102, "}")?;
-            }
-        }
-
-        self.writer.write_subclass("AcDbEntity")?;
-        self.writer.write_string(8, &base.common.layer)?;
-
-        // Write color if not ByLayer
-        if base.common.color != Color::ByLayer {
-            self.writer.write_color(62, base.common.color)?;
-        }
-        // True color (code 420) — only for AC1018+
-        if self.dxf_version >= DxfVersion::AC1018 {
-            if let Some(tc) = base.common.color.to_true_color_value() {
-                self.writer.write_i32(420, tc)?;
-            }
-            if let Some(name) = &base.common.color_name {
-                self.writer.write_string(430, name)?;
-            }
-        }
-        // Transparency (code 440) — only for AC1018+ and non-opaque
-        if self.dxf_version >= DxfVersion::AC1018 && !base.common.transparency.is_by_layer() {
-            self.writer
-                .write_i32(440, base.common.transparency.to_dxf_value())?;
-        }
-
+        self.write_common_entity_data(&base.common, owner)?;
         self.writer.write_subclass("AcDbDimension")?;
         // Omit an absent geometry cache so the CAD host can regenerate it.
         // An explicit empty group 2 is an invalid block-table reference.
@@ -4379,6 +4337,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
         self.writer.write_point3d(10, definition_point)?;
         self.writer.write_point3d(11, base.text_middle_point)?;
+        if base.insertion_point != Vector3::ZERO {
+            self.writer.write_point3d(12, base.insertion_point)?;
+        }
         // Bit 0x80 marks text positioned at a user-defined location.
         let type_flags = if base.text_user_positioned {
             type_flags | 0x80
@@ -7856,8 +7817,37 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     fn write_table_style(&mut self, style: &TableStyle) -> Result<()> {
         self.writer.write_string(0, "TABLESTYLE")?;
         if let Some(raw_dxf_codes) = &style.raw_dxf_codes {
+            let has_flags = raw_dxf_codes.iter().any(|(code, _)| *code == 71);
+            let has_title_suppressed = raw_dxf_codes
+                .iter()
+                .skip_while(|(code, _)| *code != 3)
+                .any(|(code, _)| *code == 280);
+            let has_header_suppressed = raw_dxf_codes.iter().any(|(code, _)| *code == 281);
+            let mut saw_name = false;
             for (code, value) in raw_dxf_codes {
-                self.writer.write_string(*code, value)?;
+                match *code {
+                    3 => {
+                        self.writer.write_string(*code, value)?;
+                        if !saw_name {
+                            if !has_flags {
+                                self.writer.write_i16(71, style.effective_flags().bits())?;
+                            }
+                            if !has_title_suppressed {
+                                self.writer.write_byte(280, (!style.has_title_row()) as u8)?;
+                            }
+                            if !has_header_suppressed {
+                                self.writer.write_byte(281, (!style.has_header_row()) as u8)?;
+                            }
+                        }
+                        saw_name = true;
+                    }
+                    71 => self.writer.write_i16(71, style.effective_flags().bits())?,
+                    280 if saw_name => {
+                        self.writer.write_byte(280, (!style.has_title_row()) as u8)?;
+                    }
+                    281 => self.writer.write_byte(281, (!style.has_header_row()) as u8)?,
+                    _ => self.writer.write_string(*code, value)?,
+                }
             }
             return Ok(());
         }
@@ -7871,7 +7861,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i16(70, style.flow_direction as i16)?;
 
         // Flags
-        self.writer.write_i16(71, style.flags.bits())?;
+        self.writer.write_i16(71, style.effective_flags().bits())?;
 
         // Horizontal margin
         self.writer.write_double(40, style.horizontal_margin)?;
@@ -7880,10 +7870,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_double(41, style.vertical_margin)?;
 
         // Title suppressed
-        self.writer.write_byte(280, style.title_suppressed as u8)?;
+        self.writer.write_byte(280, (!style.has_title_row()) as u8)?;
 
         // Header suppressed
-        self.writer.write_byte(281, style.header_suppressed as u8)?;
+        self.writer.write_byte(281, (!style.has_header_row()) as u8)?;
 
         // Write cell style info for data row
         self.write_table_cell_style(&style.data_row_style)?;
@@ -8993,23 +8983,18 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_string(0, "BLOCKVISIBILITYPARAMETER")?;
         self.writer.write_handle(5, obj.handle)?;
         self.writer.write_handle(330, obj.owner)?;
-        self.writer.write_subclass("AcDbEvalExpr")?;
-        self.writer.write_i32(90, obj.eval_node_id)?;
-        self.writer.write_i32(98, obj.eval_major)?;
-        self.writer.write_i32(99, obj.eval_minor)?;
-        self.writer.write_i16(70, obj.eval_value_code)?;
-        match &obj.eval_value {
-            BlockEvalValue::Real(v) => self.writer.write_double(40, *v)?,
-            BlockEvalValue::Point(v) => {
-                self.writer.write_double(10, v[0])?;
-                self.writer.write_double(20, v[1])?;
-            }
-            BlockEvalValue::Text(v) => self.writer.write_string(1, v)?,
-            BlockEvalValue::Long(v) => self.writer.write_i32(90, *v)?,
-            BlockEvalValue::Handle(v) => self.writer.write_handle(91, *v)?,
-            BlockEvalValue::Short(v) => self.writer.write_i16(70, *v)?,
-            BlockEvalValue::None => {}
-        }
+        // Same AcDbEvalExpr layout as every other parameter: a -9999 "no
+        // value" sentinel emits nothing after 99 (a "70 -9999" pair makes
+        // AutoCAD reject the object), otherwise an empty expression string,
+        // the value type, then the value.
+        self.write_dynamic_eval_dxf(&crate::objects::BlockEvalExpression {
+            parent_id: crate::objects::BlockEvalExpression::NO_PARENT,
+            major: obj.eval_major,
+            minor: obj.eval_minor,
+            value_code: obj.eval_value_code,
+            value: obj.eval_value.clone(),
+            node_id: obj.eval_node_id,
+        })?;
         self.writer.write_subclass("AcDbBlockElement")?;
         self.writer.write_string(300, &obj.element_name)?;
         self.writer.write_i32(98, obj.element_major)?;
@@ -10945,9 +10930,16 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
 
         // Write cells
-        for row in &table.rows {
-            for cell in &row.cells {
-                self.write_table_cell(cell)?;
+        let merged_ranges = table.canonical_merged_ranges();
+        for (row_index, row) in table.rows.iter().enumerate() {
+            for (column_index, cell) in row.cells.iter().enumerate() {
+                let merged_range = merged_ranges
+                    .iter()
+                    .find(|range| range.contains(row_index, column_index));
+                let anchor_range = merged_range.filter(|range| {
+                    range.top_row == row_index && range.left_col == column_index
+                });
+                self.write_table_cell(cell, anchor_range, merged_range.is_some())?;
             }
         }
 
@@ -10955,7 +10947,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     }
 
     /// Write table cell data
-    fn write_table_cell(&mut self, cell: &TableCell) -> Result<()> {
+    fn write_table_cell(
+        &mut self,
+        cell: &TableCell,
+        merged_range: Option<&table::CellRange>,
+        merged: bool,
+    ) -> Result<()> {
         // Cell type
         self.writer.write_i16(171, cell.cell_type as i16)?;
 
@@ -10963,10 +10960,19 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // extended cell flags (group 92).
         self.writer.write_i16(172, cell.edge_flags as i16)?;
 
-        self.writer.write_i16(173, cell.merged as i16)?;
+        self.writer
+            .write_i16(173, if merged_range.is_some() {
+                0
+            } else if merged {
+                1
+            } else {
+                cell.merged as i16
+            })?;
         self.writer.write_i16(174, cell.auto_fit as i16)?;
-        self.writer.write_i16(175, cell.merge_width as i16)?;
-        self.writer.write_i16(176, cell.merge_height as i16)?;
+        let merge_width = merged_range.map_or(cell.merge_width, |range| range.col_count() as i32);
+        let merge_height = merged_range.map_or(cell.merge_height, |range| range.row_count() as i32);
+        self.writer.write_i16(175, merge_width as i16)?;
+        self.writer.write_i16(176, merge_height as i16)?;
         if self.dxf_version >= DxfVersion::AC1021 {
             self.writer.write_i32(91, cell.flag)?;
             self.writer.write_i32(92, cell.state.bits() as i32)?;

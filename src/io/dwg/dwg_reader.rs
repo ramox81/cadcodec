@@ -1063,6 +1063,7 @@ impl<R: Read + Seek> DwgReader<R> {
                     crate::io::dxf::code_page::encoding_from_dwg_code_page(info.code_page),
                 ) {
                     Ok(header_vars) => document.header = header_vars,
+                    Err(e) if !failsafe => return Err(e),
                     Err(e) => report_read_error(
                         &mut self.notifications,
                         &mut diagnostics,
@@ -1180,6 +1181,19 @@ impl<R: Read + Seek> DwgReader<R> {
                         skipped_source_records = build_outcome.skipped_records;
                         diagnostics.extend(build_outcome.diagnostics);
                         self.notifications.extend(build_outcome.notifications);
+                        if let Some(message) = build_outcome.fatal {
+                            if !failsafe {
+                                return Err(DxfError::Parse(message));
+                            }
+                            report_read_error(
+                                &mut self.notifications,
+                                &mut diagnostics,
+                                "record-decode-fatal",
+                                ReadStage::RecordStream,
+                                Some("AcDb:AcDbObjects"),
+                                message,
+                            );
+                        }
                     },
                     Err(e) => report_read_error(
                         &mut self.notifications,
@@ -3054,10 +3068,12 @@ pub(crate) fn recover_roundtrip_gradients(document: &mut crate::document::CadDoc
                 crate::entities::hatch::GradientColorEntry {
                     value: 0.0,
                     color: Color::from_index(c1 as i16),
+                    ..Default::default()
                 },
                 crate::entities::hatch::GradientColorEntry {
                     value: 1.0,
                     color: Color::from_index(c2 as i16),
+                    ..Default::default()
                 },
             ];
             h.gradient_color.name = name;
