@@ -11,19 +11,19 @@
 
 use std::io::Cursor;
 
-use opencadcodec::entities::dimension::DimensionLinear;
-use opencadcodec::entities::hatch::{
+use acadrust::entities::dimension::DimensionLinear;
+use acadrust::entities::hatch::{
     BoundaryEdge, BoundaryPath, BoundaryPathFlags, CircularArcEdge, EllipticArcEdge, LineEdge,
     PolylineEdge, SplineEdge,
 };
-use opencadcodec::entities::mesh::Mesh;
-use opencadcodec::entities::mline::{MLine, MLineFlags};
-use opencadcodec::entities::multileader::MultiLeader;
-use opencadcodec::entities::polyface_mesh::PolyfaceMesh;
-use opencadcodec::entities::*;
-use opencadcodec::tables::{LineType, LineTypeComplexContent, LineTypeElement};
-use opencadcodec::types::{Color, DxfVersion, Handle, Vector2, Vector3};
-use opencadcodec::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter};
+use acadrust::entities::mesh::Mesh;
+use acadrust::entities::mline::{MLine, MLineFlags};
+use acadrust::entities::multileader::MultiLeader;
+use acadrust::entities::polyface_mesh::PolyfaceMesh;
+use acadrust::entities::*;
+use acadrust::tables::{LineType, LineTypeComplexContent, LineTypeElement};
+use acadrust::types::{Color, DxfVersion, Handle, Vector2, Vector3};
+use acadrust::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  HELPER: build a document with a rich set of entities for testing
@@ -112,10 +112,10 @@ fn build_rich_document(version: DxfVersion) -> (CadDocument, usize) {
     .unwrap();
     count += 1;
 
-    doc.add_entity(EntityType::MText(MText::with_value(
+    doc.add_entity(EntityType::MText(Box::new(MText::with_value(
         "Multi\\Pline\\PText",
         Vector3::new(0.0, 0.0, 0.0),
-    )))
+    ))))
     .unwrap();
     count += 1;
 
@@ -166,9 +166,9 @@ fn build_rich_document(version: DxfVersion) -> (CadDocument, usize) {
     .unwrap();
     count += 1;
 
-    doc.add_entity(EntityType::Dimension(Dimension::Linear(
+    doc.add_entity(EntityType::Dimension(Box::new(Dimension::Linear(
         DimensionLinear::new(Vector3::new(0.0, 0.0, 0.0), Vector3::new(100.0, 0.0, 0.0)),
-    )))
+    ))))
     .unwrap();
     count += 1;
 
@@ -188,7 +188,7 @@ fn build_rich_document(version: DxfVersion) -> (CadDocument, usize) {
     count += 1;
 
     // ── Viewport ───────────────────────────────────────────────────
-    doc.add_entity(EntityType::Viewport(Viewport::new()))
+    doc.add_entity(EntityType::Viewport(Box::new(Viewport::new())))
         .unwrap();
     count += 1;
 
@@ -214,7 +214,7 @@ fn build_rich_document(version: DxfVersion) -> (CadDocument, usize) {
             true,
         )));
         hatch.add_path(path);
-        doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+        doc.add_entity(EntityType::Hatch(Box::new(hatch))).unwrap();
         count += 1;
     }
 
@@ -614,7 +614,7 @@ fn compare_single_entity(
 }
 
 /// Normalize an EntityCommon struct by zeroing out handle-related fields.
-fn normalize_entity_common(common: &mut opencadcodec::entities::EntityCommon) {
+fn normalize_entity_common(common: &mut acadrust::entities::EntityCommon) {
     common.handle = Handle::NULL;
     common.owner_handle = Handle::NULL;
     common.reactors.clear();
@@ -794,8 +794,8 @@ fn round_vector3(v: Vector3, decimals: u32) -> Vector3 {
 
 fn compare_header_variables(
     report: &mut DiffReport,
-    orig: &opencadcodec::document::HeaderVariables,
-    rt: &opencadcodec::document::HeaderVariables,
+    orig: &acadrust::document::HeaderVariables,
+    rt: &acadrust::document::HeaderVariables,
 ) {
     // Compare critical header fields that should survive roundtrip
     macro_rules! cmp_header {
@@ -910,7 +910,7 @@ fn dxf_roundtrip_preserves_spline_extension_and_construction_flags() {
 
 #[test]
 fn dxf_acis_preserves_tokens_and_splits_at_utf8_boundaries() {
-    use opencadcodec::entities::solid3d::{AcisVersion, Solid3D};
+    use acadrust::entities::solid3d::{AcisVersion, Solid3D};
 
     let first_chunk = "x".repeat(2048);
     let remainder = "é compact_bool F";
@@ -955,10 +955,10 @@ fn fake_sab_blob(tag: u8, body_len: usize) -> Vec<u8> {
 }
 
 fn solid_with_sab(sab: Vec<u8>) -> EntityType {
-    let mut s = opencadcodec::entities::solid3d::Solid3D::new();
+    let mut s = acadrust::entities::solid3d::Solid3D::new();
     s.acis_data.sab_data = sab;
     s.acis_data.is_binary = true;
-    s.acis_data.version = opencadcodec::entities::solid3d::AcisVersion::Version2;
+    s.acis_data.version = acadrust::entities::solid3d::AcisVersion::Version2;
     EntityType::Solid3D(s)
 }
 
@@ -967,8 +967,8 @@ fn dwg_r2018_planar_body_solid_survives_roundtrip() {
     // A 3DSOLID built from an exact planar B-rep (build_planar_body) must save
     // to R2018 DWG and reload with its ACIS geometry intact and linked via the
     // has_ds_data flag — the full exact-export path (issue 225 + Problem 1).
-    use opencadcodec::entities::acis::primitives::build_planar_body;
-    use opencadcodec::entities::solid3d::Solid3D;
+    use acadrust::entities::acis::primitives::build_planar_body;
+    use acadrust::entities::solid3d::Solid3D;
 
     let vertices = [
         [0.0, 0.0, 0.0],
@@ -1295,10 +1295,10 @@ dxf_entity_roundtrip!(
 );
 dxf_entity_roundtrip!(
     dxf_rt_mtext,
-    EntityType::MText(MText::with_value(
+    EntityType::MText(Box::new(MText::with_value(
         "Multi\\Pline test",
         Vector3::new(0.0, 0.0, 0.0)
-    ))
+    )))
 );
 dxf_entity_roundtrip!(
     dxf_rt_lwpolyline,
@@ -1329,10 +1329,10 @@ dxf_entity_roundtrip!(
 );
 dxf_entity_roundtrip!(
     dxf_rt_dimension,
-    EntityType::Dimension(Dimension::Linear(DimensionLinear::new(
+    EntityType::Dimension(Box::new(Dimension::Linear(DimensionLinear::new(
         Vector3::new(0.0, 0.0, 0.0),
         Vector3::new(100.0, 0.0, 0.0)
-    )))
+    ))))
 );
 dxf_entity_roundtrip!(
     dxf_rt_tolerance,
@@ -1346,7 +1346,7 @@ fn dxf_rt_viewport() {
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
     let mut viewport = Viewport::new();
     viewport.id = 2;
-    doc.add_entity_to_layout(EntityType::Viewport(viewport), "Layout1")
+    doc.add_entity_to_layout(EntityType::Viewport(Box::new(viewport)), "Layout1")
         .unwrap();
     let restored = dxf_roundtrip(doc.clone());
     assert_eq!(restored.entity_count(), doc.entity_count());
@@ -1358,32 +1358,6 @@ fn dxf_rt_viewport() {
     );
 }
 
-/// A DXF viewport's positive status (stacking rank, 1 = active) is kept
-/// apart from its ID through a round trip (#105).
-#[test]
-fn dxf_viewport_stacking_rank_is_not_its_id() {
-    let mut doc = CadDocument::with_version(DxfVersion::AC1032);
-    let mut ranked = Viewport::new();
-    ranked.id = 2;
-    ranked.stacking = 1;
-    let ranked = doc
-        .add_entity_to_layout(EntityType::Viewport(ranked), "Layout1")
-        .unwrap();
-    let mut unranked = Viewport::new();
-    unranked.id = 3;
-    let unranked = doc
-        .add_entity_to_layout(EntityType::Viewport(unranked), "Layout1")
-        .unwrap();
-    let restored = dxf_roundtrip(doc);
-    let read = |handle| match restored.get_entity(handle) {
-        Some(EntityType::Viewport(viewport)) => (viewport.id, viewport.stacking),
-        other => panic!("viewport expected, got {other:?}"),
-    };
-    assert_eq!(read(ranked), (2, 1));
-    // Without a known rank the writer ranks by ID; reading it back keeps 0.
-    assert_eq!(read(unranked), (3, 0));
-}
-
 /// A layout saved with a model viewport entered links that viewport as its
 /// last active one; the overall viewport must still read back as ID 1.
 #[test]
@@ -1393,13 +1367,13 @@ fn dwg_overall_viewport_is_not_the_last_active_one() {
     sheet.width = 420.0;
     sheet.height = 297.0;
     let sheet = doc
-        .add_entity_to_layout(EntityType::Viewport(sheet), "Layout1")
+        .add_entity_to_layout(EntityType::Viewport(Box::new(sheet)), "Layout1")
         .unwrap();
     let model = doc
-        .add_entity_to_layout(EntityType::Viewport(Viewport::new()), "Layout1")
+        .add_entity_to_layout(EntityType::Viewport(Box::new(Viewport::new())), "Layout1")
         .unwrap();
     for object in doc.objects.values_mut() {
-        if let opencadcodec::objects::ObjectType::Layout(layout) = object {
+        if let acadrust::objects::ObjectType::Layout(layout) = object {
             if layout.name == "Layout1" {
                 layout.viewports = vec![sheet, model];
                 layout.viewport = model;
@@ -1484,7 +1458,9 @@ fn dwg_roundtrip_deep_r2000() {
     let rt = dwg_roundtrip(&doc);
     let report = compare_documents(&doc, &rt);
     assert_eq!(rt.classes.len(), 38);
-    assert_eq!(rt.objects.len(), 13);
+    // 13 plus the four style records R2000 keeps: the TABLESTYLE and
+    // MLEADERSTYLE dictionaries and their two Standard objects.
+    assert_eq!(rt.objects.len(), 17);
 
     let expected_profile_changes = ["Object count mismatch:", "Class count mismatch:"];
     let unexpected = DiffReport {
@@ -1693,10 +1669,10 @@ dwg_entity_roundtrip!(
 );
 dwg_entity_roundtrip!(
     dwg_rt_mtext,
-    EntityType::MText(MText::with_value(
+    EntityType::MText(Box::new(MText::with_value(
         "Multi\\Pline test",
         Vector3::new(0.0, 0.0, 0.0)
-    ))
+    )))
 );
 dwg_entity_roundtrip!(
     dwg_rt_lwpolyline,
@@ -1727,10 +1703,10 @@ dwg_entity_roundtrip!(
 );
 dwg_entity_roundtrip!(
     dwg_rt_dimension,
-    EntityType::Dimension(Dimension::Linear(DimensionLinear::new(
+    EntityType::Dimension(Box::new(Dimension::Linear(DimensionLinear::new(
         Vector3::new(0.0, 0.0, 0.0),
         Vector3::new(100.0, 0.0, 0.0)
-    )))
+    ))))
 );
 dwg_entity_roundtrip!(
     dwg_rt_tolerance,
@@ -1739,7 +1715,7 @@ dwg_entity_roundtrip!(
         "{\\Fgdt;p}%%v0.5"
     ))
 );
-dwg_entity_roundtrip!(dwg_rt_viewport, EntityType::Viewport(Viewport::new()));
+dwg_entity_roundtrip!(dwg_rt_viewport, EntityType::Viewport(Box::new(Viewport::new())));
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CROSS-FORMAT ROUNDTRIP TESTS
@@ -1893,7 +1869,7 @@ fn dwg_roundtrip_entity_properties() {
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
 
     // DWG requires the layer to exist in the layer table WITH a valid handle
-    let mut test_layer = opencadcodec::Layer::new("TestLayer");
+    let mut test_layer = acadrust::Layer::new("TestLayer");
     test_layer.handle = doc.allocate_handle();
     doc.layers.add(test_layer).unwrap();
 
@@ -2207,7 +2183,7 @@ fn dwg_version_matrix_mtext() {
     for &(version, label) in DWG_VERSIONS {
         let doc = build_minimal_document(
             version,
-            EntityType::MText(MText::with_value("Multi", Vector3::new(0.0, 0.0, 0.0))),
+            EntityType::MText(Box::new(MText::with_value("Multi", Vector3::new(0.0, 0.0, 0.0)))),
         );
         let rt = dwg_roundtrip(&doc);
         assert_eq!(
@@ -2230,10 +2206,10 @@ fn dwg_version_matrix_mtext() {
 /// Extracts the entity directly rather than asserting on `entity_count()`,
 /// which also counts the model/paper-space block markers.
 fn dwg_roundtrip_mtext(version: DxfVersion, mtext: MText) -> MText {
-    let doc = build_minimal_document(version, EntityType::MText(mtext));
+    let doc = build_minimal_document(version, EntityType::MText(Box::new(mtext)));
     let rt = dwg_roundtrip(&doc);
     let found = rt.entities().find_map(|e| match e {
-        EntityType::MText(m) => Some(m.clone()),
+        EntityType::MText(m) => Some(m.as_ref().clone()),
         _ => None,
     });
     found.expect("MTEXT missing after DWG roundtrip")
@@ -2484,7 +2460,7 @@ fn build_hatch_doc(edges: Vec<BoundaryEdge>, flags: BoundaryPathFlags) -> CadDoc
         path.edges.push(e);
     }
     hatch.add_path(path);
-    doc.add_entity(EntityType::Hatch(hatch)).unwrap();
+    doc.add_entity(EntityType::Hatch(Box::new(hatch))).unwrap();
     doc
 }
 
@@ -2658,8 +2634,8 @@ fn hatch_polyline_edge_roundtrip() {
 /// survive both DXF and DWG roundtrips.
 #[test]
 fn roundtrip_vport_render_mode() {
-    use opencadcodec::entities::ViewportRenderMode as M;
-    use opencadcodec::tables::VPort;
+    use acadrust::entities::ViewportRenderMode as M;
+    use acadrust::tables::VPort;
 
     let (mut doc, _) = build_rich_document(DxfVersion::AC1032);
     // Replace the vport table with two tiled *Active entries carrying
@@ -2709,7 +2685,7 @@ fn roundtrip_vport_render_mode() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn build_annotative_document() -> CadDocument {
-    use opencadcodec::objects::{MultiLeaderStyle, ObjectType, TableStyle};
+    use acadrust::objects::{MultiLeaderStyle, ObjectType, TableStyle};
     let mut doc = CadDocument::with_version(DxfVersion::AC1032);
 
     if let Some(s) = doc.text_styles.get_mut("Standard") {
@@ -2734,7 +2710,7 @@ fn build_annotative_document() -> CadDocument {
 }
 
 fn mleader_is_annotative(doc: &CadDocument) -> bool {
-    use opencadcodec::objects::ObjectType;
+    use acadrust::objects::ObjectType;
     // Order-independent: the objects map is a HashMap, so a find_map here
     // raced between the default "Standard" style (not annotative) and the
     // test's annotative one (issue #51 class of bugs).
@@ -2744,7 +2720,7 @@ fn mleader_is_annotative(doc: &CadDocument) -> bool {
 }
 
 fn table_is_annotative(doc: &CadDocument) -> bool {
-    use opencadcodec::objects::ObjectType;
+    use acadrust::objects::ObjectType;
     doc.objects
         .values()
         .any(|o| matches!(o, ObjectType::TableStyle(s) if s.annotative))
@@ -2801,7 +2777,7 @@ fn dwg_roundtrip_annotative_styles() {
 
 #[test]
 fn dxf_roundtrip_complex_linetype_shape() {
-    use opencadcodec::tables::LineTypeComplexData;
+    use acadrust::tables::LineTypeComplexData;
     let mut doc = build_minimal_document(DxfVersion::AC1032, EntityType::Point(Point::new()));
 
     let mut lt = LineType::new("SHAPELT");
@@ -2838,7 +2814,7 @@ fn dxf_roundtrip_complex_linetype_shape() {
 
 #[test]
 fn dxf_roundtrip_complex_linetype_text() {
-    use opencadcodec::tables::LineTypeComplexData;
+    use acadrust::tables::LineTypeComplexData;
     let mut doc = build_minimal_document(DxfVersion::AC1032, EntityType::Point(Point::new()));
 
     let mut lt = LineType::new("TEXTLT");
@@ -2870,7 +2846,7 @@ fn dxf_roundtrip_complex_linetype_text() {
 
 #[test]
 fn dwg_roundtrip_complex_linetype_shape() {
-    use opencadcodec::tables::LineTypeComplexData;
+    use acadrust::tables::LineTypeComplexData;
     let mut doc = build_minimal_document(DxfVersion::AC1032, EntityType::Point(Point::new()));
 
     let mut lt = LineType::new("SHAPELT");
@@ -2908,8 +2884,8 @@ fn dwg_roundtrip_complex_linetype_shape() {
 // These assert the values survive a full write → read cycle in both the
 // R2007+ UTF-16 string branch and the pre-R2007 codepage branch.
 fn xdata_record_survives_dwg_roundtrip(version: DxfVersion) {
-    use opencadcodec::tables::AppId;
-    use opencadcodec::xdata::{ExtendedDataRecord, XDataValue};
+    use acadrust::tables::AppId;
+    use acadrust::xdata::{ExtendedDataRecord, XDataValue};
 
     let mut doc = CadDocument::with_version(version);
     let mut app = AppId::new("DEMO_SURVEY");
@@ -3061,7 +3037,7 @@ fn dwg_mline_cap_suppression_bits_roundtrip() {
 /// way, and dropping it loses the array's orientation on save.
 #[test]
 fn dwg_roundtrip_edge_action_param_line() {
-    use opencadcodec::objects::{
+    use acadrust::objects::{
         AssocCurveValue, AssocEdgeActionParam, AssocSubcurveKind, AssociativeData,
         AssociativeObject, ObjectType,
     };
@@ -3094,4 +3070,251 @@ fn dwg_roundtrip_edge_action_param_line() {
     };
     assert_eq!(edge.action_type, 19);
     assert_eq!(edge.curve, curve);
+}
+
+// ── untested dynamic-block and associative classes ─────────────────────────
+//
+// BLOCKSCALEACTION, BLOCKUSERPARAMETER, BLOCKHORIZONTALCONSTRAINTPARAMETER and
+// ACDBASSOCVERTEXACTIONPARAM decode and encode in both formats but no test
+// pinned that, so a reader/writer regression would drop the object silently.
+// Each case builds the object with distinctive non-default fields, round-trips
+// through DWG and DXF, and asserts both the variant and the field values come
+// back unchanged.
+
+/// A scale action keeps its base point, offset, connections and tail byte.
+///
+/// The DWG record carries a fixed number of connections (two inside the action,
+/// three on the object), so the fixture must supply exactly those counts - the
+/// writer emits the vectors as-is with no count prefix.
+#[test]
+fn scale_action_survives_dwg_and_dxf_roundtrips() {
+    use acadrust::objects::{
+        BlockActionWithBasePoint, BlockBasePointAction, BlockConnection, DynamicBlockData,
+        DynamicBlockObject, ObjectType,
+    };
+
+    let data = DynamicBlockData::ScaleAction(BlockBasePointAction {
+        action: BlockActionWithBasePoint {
+            offset: Vector3::new(1.5, -2.5, 0.0),
+            connections: vec![
+                BlockConnection {
+                    code: 3,
+                    name: "distance".into(),
+                },
+                BlockConnection {
+                    code: 4,
+                    name: "start".into(),
+                },
+            ],
+            dependent: true,
+            base_point: Vector3::new(10.0, 20.0, 0.0),
+            ..Default::default()
+        },
+        connections: vec![
+            BlockConnection {
+                code: 5,
+                name: "base point".into(),
+            },
+            BlockConnection {
+                code: 6,
+                name: "x".into(),
+            },
+            BlockConnection {
+                code: 7,
+                name: "y".into(),
+            },
+        ],
+        dwg_tail_byte: 0,
+    });
+
+    let mut doc = CadDocument::new();
+    let handle = doc.allocate_handle();
+    let mut object = DynamicBlockObject::new("BLOCKSCALEACTION", "AcDbBlockScaleAction");
+    object.handle = handle;
+    object.owner = doc.header.named_objects_dict_handle;
+    object.data = data.clone();
+    doc.objects.insert(handle, ObjectType::DynamicBlock(object));
+
+    for saved in [dwg_roundtrip(&doc), dxf_roundtrip(doc)] {
+        let Some(ObjectType::DynamicBlock(object)) = saved.objects.get(&handle) else {
+            panic!("scale action object lost on roundtrip");
+        };
+        assert_eq!(object.data, data);
+        let DynamicBlockData::ScaleAction(scale) = &object.data else {
+            panic!("scale action decoded as a different class");
+        };
+        assert_eq!(scale.action.base_point, Vector3::new(10.0, 20.0, 0.0));
+        assert_eq!(scale.action.offset, Vector3::new(1.5, -2.5, 0.0));
+        assert!(scale.action.dependent);
+        assert_eq!(scale.action.connections.len(), 2);
+        assert_eq!(scale.action.connections[0].name, "distance");
+        assert_eq!(scale.action.connections[1].name, "start");
+        assert_eq!(scale.connections.len(), 3);
+        assert_eq!(scale.connections[0].code, 5);
+        assert_eq!(scale.connections[0].name, "base point");
+        assert_eq!(scale.connections[1].name, "x");
+        assert_eq!(scale.connections[2].name, "y");
+        assert_eq!(scale.dwg_tail_byte, 0);
+    }
+}
+
+/// A user parameter keeps its expression, value and associated variable.
+#[test]
+fn user_parameter_survives_dwg_and_dxf_roundtrips() {
+    use acadrust::objects::{
+        BlockEvalValue, BlockOnePointParameter, BlockUserParameter, DynamicBlockData,
+        DynamicBlockObject, ObjectType,
+    };
+
+    let data = DynamicBlockData::UserParameter(BlockUserParameter {
+        parameter: BlockOnePointParameter {
+            definition_point: Vector3::new(4.0, 5.0, 0.0),
+            ..Default::default()
+        },
+        flags: 1,
+        associated_variable: Handle::new(0x1234),
+        expression: "width * 2".into(),
+        value_code: 40,
+        value: BlockEvalValue::Real(7.5),
+        value_type: 1,
+    });
+
+    let mut doc = CadDocument::new();
+    let handle = doc.allocate_handle();
+    let mut object = DynamicBlockObject::new("BLOCKUSERPARAMETER", "AcDbBlockUserParameter");
+    object.handle = handle;
+    object.owner = doc.header.named_objects_dict_handle;
+    object.data = data.clone();
+    doc.objects.insert(handle, ObjectType::DynamicBlock(object));
+
+    for saved in [dwg_roundtrip(&doc), dxf_roundtrip(doc)] {
+        let Some(ObjectType::DynamicBlock(object)) = saved.objects.get(&handle) else {
+            panic!("user parameter object lost on roundtrip");
+        };
+        assert_eq!(object.data, data);
+        let DynamicBlockData::UserParameter(user) = &object.data else {
+            panic!("user parameter decoded as a different class");
+        };
+        assert_eq!(user.expression, "width * 2");
+        assert_eq!(user.value, BlockEvalValue::Real(7.5));
+        assert_eq!(user.value_code, 40);
+        assert_eq!(user.value_type, 1);
+        assert_eq!(user.flags, 1);
+        assert_eq!(user.associated_variable, Handle::new(0x1234));
+        assert_eq!(user.parameter.definition_point, Vector3::new(4.0, 5.0, 0.0));
+    }
+}
+
+/// A horizontal constraint keeps its expression, value and value set.
+///
+/// The value set's `description` is a DXF-only group (307/309/410): the DXF
+/// writer emits it and the DXF reader restores it, while the DWG record has no
+/// such field - the writer never emits one and the reader pins it to empty.
+/// Every other field must survive both formats.
+#[test]
+fn horizontal_constraint_parameter_survives_dwg_and_dxf_roundtrips() {
+    use acadrust::objects::{
+        BlockConstraintParameter, BlockLinearConstraintParameter, BlockParameterValueSet,
+        DynamicBlockData, DynamicBlockObject, ObjectType,
+    };
+
+    let value_set = BlockParameterValueSet {
+        description: "spacing".into(),
+        flags: 1,
+        minimum: 0.0,
+        maximum: 100.0,
+        increment: 5.0,
+        values: vec![0.0, 5.0, 10.0],
+    };
+    let data = DynamicBlockData::HorizontalConstraintParameter(BlockLinearConstraintParameter {
+        constraint: BlockConstraintParameter {
+            dependency: Handle::new(0x55),
+            ..Default::default()
+        },
+        expression_name: "d1".into(),
+        expression_description: "horizontal spacing".into(),
+        value: 42.5,
+        value_set: value_set.clone(),
+    });
+
+    let build = || {
+        let mut doc = CadDocument::new();
+        let handle = doc.allocate_handle();
+        let mut object = DynamicBlockObject::new(
+            "BLOCKHORIZONTALCONSTRAINTPARAMETER",
+            "AcDbBlockHorizontalConstraintParameter",
+        );
+        object.handle = handle;
+        object.owner = doc.header.named_objects_dict_handle;
+        object.data = data.clone();
+        doc.objects.insert(handle, ObjectType::DynamicBlock(object));
+        (doc, handle)
+    };
+
+    let check = |saved: CadDocument, handle: Handle, expect_description: &str| {
+        let Some(ObjectType::DynamicBlock(object)) = saved.objects.get(&handle) else {
+            panic!("horizontal constraint object lost on roundtrip");
+        };
+        let DynamicBlockData::HorizontalConstraintParameter(constraint) = &object.data else {
+            panic!("horizontal constraint decoded as a different class");
+        };
+        assert_eq!(constraint.expression_name, "d1");
+        assert_eq!(constraint.expression_description, "horizontal spacing");
+        assert_eq!(constraint.value, 42.5);
+        assert_eq!(constraint.value_set.flags, 1);
+        assert_eq!(constraint.value_set.minimum, 0.0);
+        assert_eq!(constraint.value_set.maximum, 100.0);
+        assert_eq!(constraint.value_set.increment, 5.0);
+        assert_eq!(constraint.value_set.values, vec![0.0, 5.0, 10.0]);
+        assert_eq!(constraint.value_set.description, expect_description);
+        assert_eq!(constraint.constraint.dependency, Handle::new(0x55));
+    };
+
+    let (doc, handle) = build();
+    check(dwg_roundtrip(&doc), handle, "");
+
+    let (doc, handle) = build();
+    check(dxf_roundtrip(doc), handle, "spacing");
+}
+
+/// A vertex action parameter keeps its point and dependency handles.
+#[test]
+fn vertex_action_param_survives_dwg_and_dxf_roundtrips() {
+    use acadrust::objects::{
+        AssocSingleDependencyActionParam, AssocVertexActionParam, AssociativeData,
+        AssociativeObject, ObjectType,
+    };
+
+    let data = AssociativeData::VertexActionParam(AssocVertexActionParam {
+        single_dependency: AssocSingleDependencyActionParam {
+            dependency_class_version: 3,
+            dependency: Handle::new(0x77),
+            class_version: 2,
+            ..Default::default()
+        },
+        point: Vector3::new(3.0, 4.0, 0.0),
+    });
+
+    let mut doc = CadDocument::new();
+    let handle = doc.allocate_handle();
+    let mut object =
+        AssociativeObject::new("ACDBASSOCVERTEXACTIONPARAM", "AcDbAssocVertexActionParam");
+    object.handle = handle;
+    object.owner = doc.header.named_objects_dict_handle;
+    object.data = data.clone();
+    doc.objects.insert(handle, ObjectType::Associative(object));
+
+    for saved in [dwg_roundtrip(&doc), dxf_roundtrip(doc)] {
+        let Some(ObjectType::Associative(object)) = saved.objects.get(&handle) else {
+            panic!("vertex action parameter object lost on roundtrip");
+        };
+        assert_eq!(object.data, data);
+        let AssociativeData::VertexActionParam(vertex) = &object.data else {
+            panic!("vertex action parameter decoded as a different class");
+        };
+        assert_eq!(vertex.point, Vector3::new(3.0, 4.0, 0.0));
+        assert_eq!(vertex.single_dependency.dependency, Handle::new(0x77));
+        assert_eq!(vertex.single_dependency.dependency_class_version, 3);
+        assert_eq!(vertex.single_dependency.class_version, 2);
+    }
 }

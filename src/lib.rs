@@ -1,8 +1,8 @@
-//! # opencadcodec
+//! # acadrust
 //!
 //! A pure Rust library for reading, writing, and inspecting CAD files in DXF
 //! (ASCII and binary) and native binary DWG formats. DXF support spans R12
-//! through R2018+; DWG support spans R13 through R2018+.
+//! through R2018+; DWG support spans R12 through R2018+.
 //!
 //! ## Highlights
 //!
@@ -27,16 +27,16 @@
 //!
 //! ```toml
 //! [dependencies]
-//! opencadcodec = { version = "0.6.0", features = ["serde", "import"] }
+//! acadrust = { version = "0.6.4", features = ["serde", "import"] }
 //! ```
 //!
 //! ## Quick Start — DXF
 //!
 //! ```rust,no_run
-//! use opencadcodec::DxfReader;
-//! use opencadcodec::DxfWriter;
+//! use acadrust::DxfReader;
+//! use acadrust::DxfWriter;
 //!
-//! # fn main() -> opencadcodec::Result<()> {
+//! # fn main() -> acadrust::Result<()> {
 //! let doc = DxfReader::from_file("input.dxf")?.read()?;
 //! println!("Entities: {}", doc.entities().count());
 //! DxfWriter::new(&doc).write_to_file("output.dxf")?;
@@ -47,9 +47,9 @@
 //! ## Quick Start — DWG
 //!
 //! ```rust,no_run
-//! use opencadcodec::{CadDocument, Color, DwgReader, DwgWriter, EntityType, Line};
+//! use acadrust::{CadDocument, Color, DwgReader, DwgWriter, EntityType, Line};
 //!
-//! # fn main() -> opencadcodec::Result<()> {
+//! # fn main() -> acadrust::Result<()> {
 //! let mut reader = DwgReader::from_file("input.dwg")?;
 //! let doc = reader.read()?;
 //! println!("Entities: {}", doc.entities().count());
@@ -71,9 +71,9 @@
 //! default.
 //!
 //! ```rust,no_run
-//! use opencadcodec::{DxfReader, DxfReaderConfiguration};
+//! use acadrust::{DxfReader, DxfReaderConfiguration};
 //!
-//! # fn main() -> opencadcodec::Result<()> {
+//! # fn main() -> acadrust::Result<()> {
 //! let config = DxfReaderConfiguration { failsafe: true, ..Default::default() };
 //! let outcome = DxfReader::from_file("drawing.dxf")?
 //!     .with_configuration(config)
@@ -90,10 +90,10 @@
 //! OBJ, glTF/GLB, and FBX by extension and converts them to a [`CadDocument`].
 //!
 //! ```rust,no_run
-//! # fn main() -> opencadcodec::Result<()> {
+//! # fn main() -> acadrust::Result<()> {
 //! # #[cfg(feature = "import")]
 //! # {
-//! use opencadcodec::{import_file, ImportConfig};
+//! use acadrust::{import_file, ImportConfig};
 //!
 //! let doc = import_file("model.glb", &ImportConfig::default())?;
 //! println!("Imported {} entities", doc.entities().count());
@@ -108,10 +108,10 @@
 //! be serialized to JSON using your chosen JSON crate.
 //!
 //! ```rust,no_run
-//! # fn main() -> opencadcodec::Result<()> {
+//! # fn main() -> acadrust::Result<()> {
 //! # #[cfg(feature = "serde")]
 //! # {
-//! use opencadcodec::{CadDocument, DxfReader};
+//! use acadrust::{CadDocument, DxfReader};
 //!
 //! let doc = DxfReader::from_file("drawing.dxf")?.read()?;
 //! let json = serde_json::to_string(&doc).unwrap();
@@ -139,7 +139,7 @@
 //!
 //! | Code | AutoCAD | DXF | DWG |
 //! |------|---------|-----|-----|
-//! | AC1009 | R12 | R/W | — |
+//! | AC1009 | R12 | R/W | R/W |
 //! | AC1012 | R13 | R/W | R/W |
 //! | AC1014 | R14 | R/W | R/W |
 //! | AC1015 | 2000 | R/W | R/W |
@@ -149,11 +149,16 @@
 //! | AC1027 | 2013 | R/W | R/W |
 //! | AC1032 | 2018+ | R/W | R/W |
 //!
+//! DXF R12 is written as R13 unless requested explicitly with
+//! [`DxfWriter::with_version`](io::dxf::DxfWriter::with_version), which emits a
+//! genuine R12 file and converts newer entities to R12 entities.
+//!
 //! `R/W` describes the format-level reader and writer paths. Entity
 //! availability varies by file version. See the
-//! [per-version compatibility matrix](https://github.com/hakanaktt/acadrust/blob/main/src/docs/entity_status_matrix.md),
-//! which records tested fixtures and CAD-engine audit results rather than a
-//! guarantee for every possible drawing.
+//! [R12 support status](https://github.com/hakanaktt/acadrust/blob/main/src/docs/ac1009_support.md)
+//! for confirmed AC1009 fidelity gaps. DXF export promotes R12 documents to
+//! R13 or later. Compatibility results describe tested fixtures and CAD-engine
+//! audits rather than a guarantee for every possible drawing.
 
 #![allow(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
@@ -179,6 +184,10 @@ pub mod vba;
 pub mod xdata;
 
 // Re-export commonly used types
+pub use audit::{
+    AuditIssue, AuditIssueCode, AuditLocation, AuditReport, AuditSeverity, RepairAction,
+    RepairReport,
+};
 pub use error::{DxfError, Result};
 pub use types::{
     BoundingBox2D, BoundingBox3D, Color, DxfVersion, Handle, LineWeight, Transparency, Vector2,
@@ -213,6 +222,7 @@ pub use io::read::{
     push_read_diagnostic, ReadDiagnostic, ReadOutcome, ReadStage, ReadStats, SourceFormat,
     MAX_READ_DIAGNOSTICS,
 };
+pub use io::recover::RecoverOutcome;
 
 // Re-export ACIS types
 pub use entities::acis::primitives;
@@ -228,6 +238,8 @@ pub use io::import::{
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod audit;
 
 #[cfg(test)]
 mod tests {

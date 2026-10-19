@@ -134,8 +134,6 @@ pub struct DwgObjectWriter<'a> {
     pub(super) linetype_handles: std::collections::HashMap<String, Handle>,
     /// Cached fallback for owners without a direct extension-dictionary handle.
     pub(super) xdic_owner_index: std::sync::Arc<std::collections::HashMap<Handle, Handle>>,
-    /// The INSERTs and TABLEs that reference each block record, for the
-    /// record's insert list.
     pub(super) block_users: std::sync::Arc<std::collections::HashMap<Handle, Vec<Handle>>>,
 }
 
@@ -280,9 +278,6 @@ impl<'a> DwgObjectWriter<'a> {
         })
     }
 
-    /// Index the entities that reference each block record: INSERTs by block
-    /// name and TABLEs by their block (the reference application finds the
-    /// table of a cell text, and the fields in it, through this list).
     fn build_block_users(document: &CadDocument) -> std::collections::HashMap<Handle, Vec<Handle>> {
         let mut users: std::collections::HashMap<Handle, Vec<Handle>> = std::collections::HashMap::new();
         for entity in document.entities() {
@@ -303,9 +298,6 @@ impl<'a> DwgObjectWriter<'a> {
         users
     }
 
-    /// A block record's insert list: the stored references that still exist,
-    /// then every INSERT or TABLE of the drawing that uses the block (a
-    /// drawing read from DXF or edited keeps no list of its own).
     fn block_insert_handles(&self, record: &BlockRecord) -> Vec<Handle> {
         let mut out: Vec<Handle> = record
             .insert_handles
@@ -324,8 +316,17 @@ impl<'a> DwgObjectWriter<'a> {
     /// Index the fallback ownership lookup used by `extension_dictionary_handle`.
     fn build_xdic_owner_index(document: &CadDocument) -> std::collections::HashMap<Handle, Handle> {
         let mut index = std::collections::HashMap::new();
-        for (handle, object) in &document.objects {
-            if let crate::objects::ObjectType::Dictionary(dictionary) = object {
+        // Several dictionaries can share one non-dictionary owner, and
+        // `or_insert` keeps the first one seen. `objects` is a hash map, so
+        // "first" would be a different dictionary on every write and the
+        // extension-dictionary handle that lands in the file would change with
+        // it. Walk in handle order so the lowest handle always wins.
+        let mut handles: Vec<Handle> = document.objects.keys().copied().collect();
+        handles.sort_by_key(|handle| handle.value());
+        for handle in handles {
+            if let Some(crate::objects::ObjectType::Dictionary(dictionary)) =
+                document.objects.get(&handle)
+            {
                 if handle.is_null() || dictionary.owner.is_null() {
                     continue;
                 }
@@ -335,7 +336,7 @@ impl<'a> DwgObjectWriter<'a> {
                 ) {
                     continue;
                 }
-                index.entry(dictionary.owner).or_insert(*handle);
+                index.entry(dictionary.owner).or_insert(handle);
             }
         }
         index
@@ -795,16 +796,13 @@ impl<'a> DwgObjectWriter<'a> {
 
     fn write_layer(&mut self, layer: &crate::tables::Layer) {
         let transparency_app = self.document.app_ids.get("AcCmTransparency");
-        let had_transparency_eed = transparency_app.is_some_and(|app| {
-            self.document
-                .eed_by_handle
-                .get(&layer.handle)
-                .is_some_and(|blocks| {
-                    blocks
-                        .iter()
-                        .any(|(app_handle, _)| *app_handle == app.handle.value())
+        let had_transparency_eed = self
+            .existing_xdata_values(layer.handle, "AcCmTransparency")
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    matches!(value, crate::xdata::XDataValue::Integer32(_))
                 })
-        });
+            });
         let transparency_eed = transparency_app.and_then(|app| {
             (!layer.transparency.is_opaque() || had_transparency_eed).then(|| {
                 let mut bytes = vec![71];
@@ -821,7 +819,14 @@ impl<'a> DwgObjectWriter<'a> {
             .app_ids
             .get(crate::tables::layer::LAYER_DESCRIPTION_APP)
             .and_then(|app| {
-                (!layer.description.is_empty()).then(|| {
+                let had_description = self
+                    .existing_xdata_values(layer.handle, crate::tables::layer::LAYER_DESCRIPTION_APP)
+                    .is_some_and(|values| {
+                        values.iter().filter(|value| {
+                            matches!(value, crate::xdata::XDataValue::String(_))
+                        }).count() >= 2
+                    });
+                (!layer.description.is_empty() || had_description).then(|| {
                     let code_page = crate::io::dxf::code_page::dwg_code_page_index(
                         &self.document.header.code_page,
                     );
@@ -952,7 +957,7 @@ impl<'a> DwgObjectWriter<'a> {
 
     fn write_text_style(&mut self, style: &crate::tables::TextStyle) {
         let mut eed: Vec<(u64, Vec<u8>)> =
-            self.annotative_eed_block(style.annotative).into_iter().collect();
+            self.annotative_eed_block_for_handle(style.handle, style.annotative).into_iter().collect();
         // The TrueType typeface goes in `ACAD` EED; the record has no field.
         if !style.true_type_font.trim().is_empty() {
             if let Some(app) = self.document.app_ids.get("ACAD") {
@@ -961,7 +966,7 @@ impl<'a> DwgObjectWriter<'a> {
                     crate::io::dwg::typeface_eed::encode(
                         self.version.r2007_plus(),
                         style.true_type_font.trim(),
-                        crate::io::dwg::typeface_eed::DEFAULT_FONT_FLAGS,
+                        style.true_type_font_flags,
                     ),
                 ));
             }
@@ -1534,7 +1539,7 @@ impl<'a> DwgObjectWriter<'a> {
         let dimtfillclr_color = ds
             .dimtfillclr_true_color
             .unwrap_or_else(|| crate::types::Color::from_index(ds.dimtfillclr));
-        let anno = self.annotative_eed_block(ds.annotative);
+        let anno = self.annotative_eed_block_for_handle(ds.handle, ds.annotative);
         self.write_common_non_entity_data_eed(
             common::OBJ_DIMSTYLE,
             ds.handle,
@@ -2117,7 +2122,14 @@ impl<'a> DwgObjectWriter<'a> {
     fn write_block_header_with_handles(&mut self, record: &BlockRecord, entity_handles: &[Handle]) {
         // Before R2007 the block record has no insertion-units field; the
         // units travel in the ACAD `DesignCenter Data` EED (version 1).
-        let extra = if self.version.r2007_plus() || record.units == 0 {
+        let had_units = self
+            .existing_xdata_values(record.handle, "ACAD")
+            .is_some_and(|values| {
+                values.iter().any(|value| {
+                    matches!(value, crate::xdata::XDataValue::String(label) if label == "DesignCenter Data")
+                })
+            });
+        let extra = if self.version.r2007_plus() || (record.units == 0 && !had_units) {
             Vec::new()
         } else {
             let mut units = crate::xdata::ExtendedDataRecord::new("ACAD");
@@ -2505,7 +2517,7 @@ impl<'a> DwgObjectWriter<'a> {
             registered += 1;
         }
         eprintln!(
-            "[opencadcodec raw-all] registered={registered} excluded={excluded} version-skipped={skipped} exclude={exclude:?}"
+            "[acadrust raw-all] registered={registered} excluded={excluded} version-skipped={skipped} exclude={exclude:?}"
         );
     }
 

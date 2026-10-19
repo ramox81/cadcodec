@@ -2011,9 +2011,6 @@ impl<'a> DwgObjectWriter<'a> {
         self.register_object(e.common.handle);
     }
 
-    /// Writes a count followed by MPOLYGON loops: closed polylines without
-    /// flags, typed edges or boundary handles. Paths that are not a single
-    /// polyline edge cannot be expressed in this format and are skipped.
     fn write_mpolygon_loops(&mut self, paths: &[BoundaryPath], invalid: bool) {
         let loops: Vec<&PolylineEdge> = paths
             .iter()
@@ -2348,11 +2345,12 @@ impl<'a> DwgObjectWriter<'a> {
         // Elevation BD 11 Z-coord
         self.writer.write_bit_double(base.text_middle_point.z);
 
-        // Flags byte — bit 0: text positioned at a user-defined location.
+        // Flags byte — bit 0 is set when the text sits at its default place,
+        // the opposite of DXF group 70 bit 128.
         let flags_byte = if base.text_user_positioned {
-            base.dwg_flags_byte | 0x01
-        } else {
             base.dwg_flags_byte & !0x01
+        } else {
+            base.dwg_flags_byte | 0x01
         };
         self.writer.write_byte(flags_byte);
 
@@ -3248,7 +3246,7 @@ impl<'a> DwgObjectWriter<'a> {
     ///
     // ── Table (ACAD_TABLE) ──────────────────────────────────────────
     //
-    // Inverse of the table reader. Cell styles / borders opencadcodec does not
+    // Inverse of the table reader. Cell styles / borders acadrust does not
     // model are written as empty presence-flag stubs (the anonymous block
     // renders the visual), and the retained data — dimensions, cell contents
     // (text/number) — is written in full so it round-trips.
@@ -5095,16 +5093,8 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            // AcDs-backed R2013+ bodies have no trailing acis-empty bit when
-            // the wireframe flag is false. The next field is the R2007
-            // unknown BL.
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            // AcDs relocates the geometry, but material bindings remain inline.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5134,13 +5124,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5170,13 +5154,7 @@ impl<'a> DwgObjectWriter<'a> {
 
         // SAB binary path already wrote trailing fields; skip for SAT/empty.
         if !tail_written {
-            self.writer.write_bit_long(0);
-
-            // R2013+: modeler-geometry revision block (COMMON_3DSOLID).
-            // Empty / SAT bodies carry no materials block (materials only
-            // follow binary SAB, handled on the early-return path). Omitting
-            // this block corrupts the entity stream for R2013+ and prevents
-            // the file from opening in AutoCAD/TrueView/BricsCAD.
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5272,7 +5250,7 @@ impl<'a> DwgObjectWriter<'a> {
             self.write_acis_data(e.point_of_reference, &e.acis_data, &e.wires, &e.silhouettes)
         };
         if !tail_written {
-            self.writer.write_bit_long(0);
+            self.write_acis_materials(&e.acis_data, false);
             if self.version.r2013_plus(self.dxf_version) {
                 self.write_acis_revision(&e.acis_data.revision);
             }
@@ -5428,7 +5406,6 @@ impl<'a> DwgObjectWriter<'a> {
     ///
     /// For R2013 and later, ACIS data lives in the AcDsPrototype_1b section.
     /// The entity stream indicates that modeler geometry is not inline, but its
-    /// native COMMON_3DSOLID wireframe cache header still remains in the entity.
     fn write_acis_empty(&mut self, acis: &AcisData) {
         // R2013+ AcDs-backed records no longer carry the legacy leading
         // `acis_empty` bit.  Their first modeler-geometry bit is the
@@ -5447,8 +5424,8 @@ impl<'a> DwgObjectWriter<'a> {
         self.writer.write_bit(acis.wireframe_isoline_present);
         if acis.wireframe_isoline_present {
             self.writer.write_bit_long(0); // wires
+            self.writer.write_bit_long(0); // silhouettes
         }
-        self.writer.write_bit_long(0); // silhouettes
         // COMMON_3DSOLID has an extra-modeler-data gate only when the
         // AcDs-backed entity contains a wireframe section.
         self.writer.write_bit(acis.extra_acis_data.is_none());
@@ -5489,8 +5466,6 @@ impl<'a> DwgObjectWriter<'a> {
         }
     }
 
-    /// Modeler block: B, then BS 2 and SAB bytes, or BS 1 and the
-    /// encrypted SAT text in length-prefixed blocks ending with 0.
     fn write_modeler_block(&mut self, extra: &AcisData) {
         self.writer.write_bit(false);
         if extra.is_binary && !extra.sab_data.is_empty() {
@@ -5531,9 +5506,6 @@ impl<'a> DwgObjectWriter<'a> {
         self.queue_sab_entry(acis, entity.common().handle);
     }
 
-    /// SAT text to SAB. A body whose text carries no save date gets the
-    /// drawing's save date (TDUPDATE), as the reference application stamps
-    /// its save time there.
     fn sab_from_sat(&self, sat: &crate::entities::acis::SatDocument) -> Vec<u8> {
         let julian = self.document.header.update_date_julian;
         if !sat.header.date.is_empty() || julian <= 0.0 {
@@ -5587,8 +5559,6 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_acis_data_impl(point, acis, wires, silhouettes, false)
     }
 
-    /// Modeler data of a B-rep history node. From R2007 on the record ends
-    /// with the SAB stream: no wireframe cache, materials or revision follow.
     pub(super) fn write_history_acis_data(&mut self, acis: &AcisData) {
         if !self.version.r2007_plus() {
             self.write_acis_data(Vector3::ZERO, acis, &[], &[]);
@@ -5772,7 +5742,8 @@ impl<'a> DwgObjectWriter<'a> {
                 self.writer.write_3bit_double(anchor);
             }
             self.writer.write_bit_long(acis.wireframe_isolines);
-            let isoline_present = acis.wireframe_isoline_present || !wires.is_empty();
+            let isoline_present =
+                acis.wireframe_isoline_present || !wires.is_empty() || !silhouettes.is_empty();
             self.writer.write_bit(isoline_present);
 
             if isoline_present {
@@ -5780,23 +5751,27 @@ impl<'a> DwgObjectWriter<'a> {
                 for wire in wires {
                     self.write_wire(wire);
                 }
-            }
 
-            self.writer.write_bit_long(silhouettes.len() as i32);
-            for sil in silhouettes {
-                self.writer.write_bit_long_long(sil.viewport_id);
-                self.writer.write_3bit_double(sil.target);
-                self.writer.write_3bit_double(sil.view_direction);
-                self.writer.write_3bit_double(sil.up_vector);
-                self.writer.write_bit(sil.is_perspective);
-                let has_wires = sil.has_wires || !sil.wires.is_empty();
-                self.writer.write_bit(has_wires);
-                if !has_wires {
-                    continue;
-                }
-                self.writer.write_bit_long(sil.wires.len() as i32);
-                for wire in &sil.wires {
-                    self.write_wire(wire);
+                self.writer.write_bit_long(silhouettes.len() as i32);
+                for sil in silhouettes {
+                    if self.version.r2010_plus() {
+                        self.writer.write_bit_long_long(sil.viewport_id);
+                    } else {
+                        self.writer.write_bit_long(sil.viewport_id as i32);
+                    }
+                    self.writer.write_3bit_double(sil.target);
+                    self.writer.write_3bit_double(sil.view_direction);
+                    self.writer.write_3bit_double(sil.up_vector);
+                    self.writer.write_bit(sil.is_perspective);
+                    let has_wires = sil.has_wires || !sil.wires.is_empty();
+                    self.writer.write_bit(has_wires);
+                    if !has_wires {
+                        continue;
+                    }
+                    self.writer.write_bit_long(sil.wires.len() as i32);
+                    for wire in &sil.wires {
+                        self.write_wire(wire);
+                    }
                 }
             }
         }
@@ -5906,6 +5881,7 @@ mod tests {
                 assert_eq!(reader.read_3bit_double(), Vector3::ZERO);
                 assert_eq!(reader.read_3bit_double(), Vector3::UNIT_X);
                 assert!(!reader.read_bit());
+                reader.check_error().unwrap();
             }
         }
     }

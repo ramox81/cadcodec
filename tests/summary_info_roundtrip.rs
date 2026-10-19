@@ -1,11 +1,8 @@
-//! Drawing properties (DWGPROPS, the `AcDb:SummaryInfo` section) survive a
-//! DWG write and read: the eight document strings and the custom properties,
-//! including non-ASCII text in R2004 (drawing code page) and R2007+ (UTF-16).
 
 use std::io::Cursor;
 
-use opencadcodec::types::DxfVersion;
-use opencadcodec::{CadDocument, DwgReader, DwgWriter};
+use acadrust::types::DxfVersion;
+use acadrust::{CadDocument, DwgReader, DwgWriter};
 
 fn document_with_properties(version: DxfVersion) -> CadDocument {
     let mut document = CadDocument::with_version(version);

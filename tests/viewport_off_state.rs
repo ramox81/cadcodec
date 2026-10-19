@@ -1,5 +1,5 @@
-use opencadcodec::entities::{Viewport, ViewportStatusFlags};
-use opencadcodec::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter, EntityType};
+use acadrust::entities::{Viewport, ViewportStatusFlags};
+use acadrust::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter, EntityType};
 use std::io::Cursor;
 
 const ON: i32 = 0x8000;
@@ -13,7 +13,7 @@ fn drawing(bits: i32, off_screen: bool) -> CadDocument {
     view.height = 100.;
     view.status = ViewportStatusFlags::from_bits(bits);
     view.off_screen = off_screen;
-    doc.add_entity_to_layout(EntityType::Viewport(view), "Layout1")
+    doc.add_entity_to_layout(EntityType::Viewport(Box::new(view)), "Layout1")
         .unwrap();
     doc
 }

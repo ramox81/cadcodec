@@ -1,5 +1,5 @@
-use opencadcodec::entities::Viewport;
-use opencadcodec::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter, EntityType};
+use acadrust::entities::Viewport;
+use acadrust::{CadDocument, DwgReader, DwgWriter, DxfReader, DxfWriter, EntityType};
 use std::io::Cursor;
 
 fn drawing(mode: i16) -> CadDocument {
@@ -9,7 +9,7 @@ fn drawing(mode: i16) -> CadDocument {
     view.width = 160.;
     view.height = 100.;
     view.shade_plot_mode = mode;
-    doc.add_entity_to_layout(EntityType::Viewport(view), "Layout1")
+    doc.add_entity_to_layout(EntityType::Viewport(Box::new(view)), "Layout1")
         .unwrap();
     doc
 }

@@ -9,9 +9,9 @@
 
 use std::io::Cursor;
 
-use opencadcodec::entities::{EntityType, MText, MultiLeader};
-use opencadcodec::types::{DxfVersion, Vector3};
-use opencadcodec::{CadDocument, DxfReader, DxfWriter};
+use acadrust::entities::{EntityType, MText, MultiLeader};
+use acadrust::types::{DxfVersion, Vector3};
+use acadrust::{CadDocument, DxfReader, DxfWriter};
 
 fn dxf_roundtrip(doc: &CadDocument) -> CadDocument {
     let bytes = DxfWriter::new(doc)
@@ -26,10 +26,10 @@ fn dxf_roundtrip(doc: &CadDocument) -> CadDocument {
 #[test]
 fn plain_mtext_not_annotative_after_dxf_roundtrip() {
     let mut doc = CadDocument::with_version(DxfVersion::AC1027);
-    doc.add_entity(EntityType::MText(MText::with_value(
+    doc.add_entity(EntityType::MText(Box::new(MText::with_value(
         "Plain",
         Vector3::new(1.0, 2.0, 0.0),
-    )))
+    ))))
     .unwrap();
 
     let rt = dxf_roundtrip(&doc);

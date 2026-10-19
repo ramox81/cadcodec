@@ -1,12 +1,13 @@
 [package]
-name = "opencadcodec"
-version = "0.6.0"
+name = "acadrust"
+version = "0.6.4"
 edition = "2021"
 authors = ["Hakan AK"]
 description = "A pure Rust library for reading and writing CAD files in DXF format (ASCII and Binary) and DWG format (Binary)."
 license = "MPL-2.0"
-repository = "https://github.com/HakanSeven12/opencadcodec"
-homepage = "https://github.com/HakanSeven12/opencadcodec"
+repository = "https://github.com/hakanaktt/acadrust"
+homepage = "https://github.com/hakanaktt/acadrust"
+documentation = "https://docs.rs/acadrust"
 readme = "README.md"
 keywords = ["cad", "dxf", "dwg", "drawing", "vector-graphics"]
 categories = ["parser-implementations", "encoding"]
@@ -34,6 +35,7 @@ foldhash = "0.2"
 
 # Encoding
 encoding_rs = "0.8"
+oem_cp = "2.1"
 
 # Serialization (optional)
 serde = { version = "1", features = ["derive", "rc"], optional = true }

@@ -9,7 +9,8 @@ use crate::document::CadDocument;
 use crate::entities::*;
 use crate::error::Result;
 use crate::objects::{
-    BlockEvalValue, BlockVisibilityParameter, BookColor, DataObject, DataObjectData, Dictionary,
+    BlockEvalValue, BlockPropertiesTableValue, BlockVisibilityParameter, BookColor, DataObject,
+    DataObjectData, Dictionary,
     DictionaryVariable, DictionaryWithDefault, DimSubtype, DynamicBlockData, DynamicBlockObject,
     GeoData, Group, ImageDefinition, ImageDefinitionReactor, Layout, MLineStyle, Material,
     MaterialColor, MaterialMap, MaterialProceduralValue, MaterialTexture, MultiLeaderStyle,
@@ -74,9 +75,9 @@ pub struct SectionWriter<'a, W: DxfStreamWriter> {
     sab_entries: Vec<(Handle, Vec<u8>)>,
     /// Whether currently writing paper space entities (for group code 67)
     writing_paper_space: bool,
-    /// Viewport IDs (69) for viewports of the active paper-space layout whose
-    /// source (DWG) does not store one: 1, 2, ... in entity order.
-    active_viewport_ids: HashMap<Handle, i16>,
+    /// Viewport IDs (69) derived per paper-space block when the source does
+    /// not store them, reserving explicit IDs before filling gaps.
+    paper_viewport_ids: HashMap<Handle, i16>,
     /// Set of all handles that will exist in the output DXF.
     /// Used to filter reactor/xdictionary references to non-existent objects.
     valid_handles: HashSet<Handle>,
@@ -114,7 +115,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             dxf_version: DxfVersion::AC1024,
             sab_entries: Vec::new(),
             writing_paper_space: false,
-            active_viewport_ids: HashMap::new(),
+            paper_viewport_ids: HashMap::new(),
             valid_handles: HashSet::new(),
             bylayer_linetype_handle: Handle::NULL,
             byblock_linetype_handle: Handle::NULL,
@@ -413,6 +414,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_header_variable("$ATTMODE", |w| w.write_i16(70, hdr.attribute_visibility))?;
         self.write_header_variable("$TEXTSIZE", |w| w.write_double(40, hdr.text_height))?;
         self.write_header_variable("$TRACEWID", |w| w.write_double(40, hdr.trace_width))?;
+        self.write_header_variable("$ELEVATION", |w| w.write_double(40, hdr.elevation))?;
+        self.write_header_variable("$THICKNESS", |w| w.write_double(40, hdr.thickness))?;
+        self.write_header_variable("$FILLETRAD", |w| w.write_double(40, hdr.fillet_radius))?;
+        self.write_header_variable("$CHAMFERA", |w| w.write_double(40, hdr.chamfer_distance_a))?;
+        self.write_header_variable("$CHAMFERB", |w| w.write_double(40, hdr.chamfer_distance_b))?;
         self.write_header_variable("$SKETCHINC", |w| w.write_double(40, hdr.sketch_increment))?;
         self.write_header_variable("$SKPOLY", |w| w.write_i16(70, hdr.sketch_type.clamp(0, 2)))?;
         // SKTOLERANCE is application state, not a portable DXF header variable.
@@ -482,6 +488,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_header_variable("$LUPREC", |w| w.write_i16(70, hdr.linear_unit_precision))?;
         self.write_header_variable("$AUNITS", |w| w.write_i16(70, hdr.angular_unit_format))?;
         self.write_header_variable("$AUPREC", |w| w.write_i16(70, hdr.angular_unit_precision))?;
+        self.write_header_variable("$ANGBASE", |w| w.write_double(50, hdr.angle_base.to_degrees()))?;
+        self.write_header_variable("$ANGDIR", |w| w.write_i16(70, hdr.angle_direction))?;
         self.write_header_variable("$MEASUREMENT", |w| w.write_i16(70, hdr.measurement))?;
         self.write_header_variable("$INSUNITS", |w| w.write_i16(70, hdr.insertion_units))?;
         // The drawing property "Hyperlink base" (R2000+); omitted when empty.
@@ -765,6 +773,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
 
         // === UCS ===
+        if let Some(state) = &hdr.legacy {
+            self.write_header_variable("$UNITMODE", |w| w.write_i16(70, state.unit_mode))?;
+        }
         self.write_header_variable("$UCSORG", |w| {
             let v = &hdr.model_space_ucs_origin;
             w.write_double(10, v.x)?;
@@ -890,6 +901,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         for vport in document.vports.iter() {
             self.write_vport_entry(vport, table_handle, document)?;
+            self.write_table_xdata(document, vport.handle, &[])?;
         }
 
         self.write_table_end()?;
@@ -1079,6 +1091,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         for ltype in document.line_types.iter() {
             self.write_ltype_entry(ltype, table_handle, document)?;
+            self.write_table_xdata(document, ltype.handle, &[])?;
         }
 
         self.write_table_end()?;
@@ -1260,20 +1273,22 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // Plot flag (code 290 is Bool type - single byte in binary)
         self.writer.write_bool(290, layer.is_plottable)?;
 
+        let mut generated = Vec::new();
         // AutoCAD stores layer transparency as AcCmTransparency XDATA.
-        if !layer.transparency.is_opaque() {
-            self.writer.write_string(1001, "AcCmTransparency")?;
-            self.writer
-                .write_i32(1071, layer.transparency.to_dxf_value())?;
+        if !layer.transparency.is_opaque() || document.object_xdata.get(&layer.handle).is_some_and(|data| data.get_record("AcCmTransparency").is_some()) {
+            let mut record = crate::xdata::ExtendedDataRecord::new("AcCmTransparency");
+            record.values.push(XDataValue::Integer32(layer.transparency.to_dxf_value()));
+            generated.push(record);
         }
 
         // ... and the description as AcAecLayerStandard XDATA, the text being
         // the second of two strings.
-        if !layer.description.is_empty() {
-            self.writer.write_string(1001, "AcAecLayerStandard")?;
-            self.writer.write_string(1000, "")?;
-            self.writer.write_string(1000, &layer.description)?;
+        if !layer.description.is_empty() || document.object_xdata.get(&layer.handle).is_some_and(|data| data.get_record("AcAecLayerStandard").is_some()) {
+            let mut record = crate::xdata::ExtendedDataRecord::new("AcAecLayerStandard");
+            record.values = vec![XDataValue::String(String::new()), XDataValue::String(layer.description.clone())];
+            generated.push(record);
         }
+        self.write_table_xdata(document, layer.handle, &generated)?;
 
         Ok(())
     }
@@ -1363,10 +1378,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer.write_string(1000, style.true_type_font.trim())?;
             self.writer.write_i32(
                 1071,
-                crate::io::dwg::typeface_eed::DEFAULT_FONT_FLAGS,
+                style.true_type_font_flags,
             )?;
         }
-        self.write_annotative_xdata(style.annotative)?;
+        self.write_table_annotative_xdata(document, style.handle, style.annotative)?;
 
         Ok(())
     }
@@ -1378,6 +1393,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         for view in document.views.iter() {
             self.write_view_entry(view, table_handle, document)?;
+            self.write_table_xdata(document, view.handle, &[])?;
         }
 
         self.write_table_end()?;
@@ -1497,6 +1513,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         for ucs in document.ucss.iter() {
             self.write_ucs_entry(ucs, table_handle, document)?;
+            self.write_table_xdata(document, ucs.handle, &[])?;
         }
 
         self.write_table_end()?;
@@ -1596,7 +1613,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_subclass("AcDbRegAppTableRecord")?;
         self.writer.write_string(2, &name)?;
         self.writer.write_i16(70, 0)?;
-
+        self.write_table_xdata(document, appid.handle, &[])?;
         Ok(())
     }
 
@@ -1811,7 +1828,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer.write_i16(371, dimstyle.dimlwd)?;
             self.writer.write_i16(372, dimstyle.dimlwe)?;
         }
-        self.write_annotative_xdata(dimstyle.annotative)?;
+        self.write_table_annotative_xdata(document, dimstyle.handle, dimstyle.annotative)?;
 
         Ok(())
     }
@@ -1869,22 +1886,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer
                 .write_i16(281, if block_record.scale_uniformly { 1 } else { 0 })?;
         }
-        let mut xdata = ExtendedData::new();
-        if self.dxf_version < DxfVersion::AC1021 && block_record.units != 0 {
+        let mut generated = Vec::new();
+        if self.dxf_version < DxfVersion::AC1021 && (block_record.units != 0 || document.object_xdata.get(&block_record.handle).and_then(|data| data.get_record("ACAD")).is_some_and(|record| record.values.iter().any(|value| matches!(value, XDataValue::String(value) if value == "DesignCenter Data")))) {
             // Older files keep the units in ACAD `DesignCenter Data` xdata.
             let mut units = crate::xdata::ExtendedDataRecord::new("ACAD");
             units.values = crate::tables::block_record::design_center_units_values(block_record.units);
-            xdata.add_record(units);
+            generated.push(units);
         }
-        // The record's own XDATA (a dynamic block's tags, for one).
-        if let Some(own) = document.object_xdata.get(&block_record.handle) {
-            for record in own.records() {
-                if xdata.get_record(&record.application_name).is_none() {
-                    xdata.add_record(record.clone());
-                }
-            }
-        }
-        self.write_xdata(&xdata)?;
+        self.write_table_xdata(document, block_record.handle, &generated)?;
 
         Ok(())
     }
@@ -1980,6 +1989,28 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
+    fn number_paper_space_viewports(&mut self, block: &BlockRecord, document: &CadDocument) {
+        let viewports = block
+            .entity_handles
+            .iter()
+            .filter_map(|handle| match document.get_entity(*handle) {
+                Some(EntityType::Viewport(viewport)) => Some(viewport),
+                _ => None,
+            });
+        let used_ids: HashSet<i16> = viewports
+            .clone()
+            .map(|viewport| viewport.id)
+            .filter(|id| *id > 0)
+            .collect();
+        let mut available_ids = (1..=i16::MAX).filter(|id| !used_ids.contains(id));
+        for viewport in viewports {
+            if viewport.id == 0 {
+                self.paper_viewport_ids
+                    .insert(viewport.common.handle, available_ids.next().unwrap_or(0));
+            }
+        }
+    }
+
     /// Write a complete block definition (BLOCK...entities...ENDBLK)
     fn write_block_definition(
         &mut self,
@@ -1990,6 +2021,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // Block names are case-insensitive: drawings written by other tools
         // use "*MODEL_SPACE" / "*PAPER_SPACE".
         let is_paper_space = block_record.is_paper_space();
+        if is_paper_space {
+            self.number_paper_space_viewports(block_record, document);
+        }
 
         // Determine block flags from stored BlockFlags
         let mut flags: i16 = 0;
@@ -2111,19 +2145,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writing_paper_space = true;
         if let Some(paper_space) = document.block_records.get("*Paper_Space") {
             let owner = paper_space.handle();
-            // DWG does not store viewport IDs. AutoCAD numbers the active
-            // layout's viewports 1, 2, ... in entity order (1 = the overall
-            // paper-space viewport); an ID of 0 there makes it create another
-            // overall viewport when the DXF is opened.
-            let mut next_id = 1i16;
-            for eh in &paper_space.entity_handles {
-                if let Some(&idx) = document.entity_index.get(eh) {
-                    if let EntityType::Viewport(vp) = document.entities[idx].as_ref() {
-                        self.active_viewport_ids.insert(vp.common.handle, next_id);
-                        next_id = next_id.saturating_add(1);
-                    }
-                }
-            }
+            self.number_paper_space_viewports(paper_space, document);
             for eh in &paper_space.entity_handles {
                 if let Some(&idx) = document.entity_index.get(eh) {
                     self.write_entity_with_owner(&document.entities[idx], owner)?;
@@ -2744,8 +2766,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_dynamic_element_dxf(&value.element)?;
         self.writer.write_subclass("AcDbBlockAction")?;
         self.writer
-            .write_i32(70, value.parameter_ids.len() as i32)?;
-        for id in &value.parameter_ids {
+            .write_i32(70, value.action_ids.len() as i32)?;
+        for id in &value.action_ids {
             self.writer.write_i32(91, *id)?;
         }
         self.writer.write_i32(71, value.dependencies.len() as i32)?;
@@ -3054,9 +3076,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Embedded construction entity: its type, then (unless absent) the body
-    /// length in bits, padded to whole bytes like the reference application
-    /// does, and the body in 310 chunks.
     fn write_history_entity_dxf(
         &mut self,
         type_code: i32,
@@ -3133,7 +3152,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             DynamicBlockData::AlignmentGrip(value) => {
                 self.write_dynamic_grip_dxf(&value.grip)?;
                 self.writer.write_subclass("AcDbBlockAlignmentGrip")?;
-                self.writer.write_point3d(140, value.orientation)?;
+                // Orientation vector groups are 140/141/142, not 140/150/160.
+                self.writer.write_double(140, value.orientation.x)?;
+                self.writer.write_double(141, value.orientation.y)?;
+                self.writer.write_double(142, value.orientation.z)?;
             }
             DynamicBlockData::FlipGrip(value) => {
                 self.write_dynamic_grip_dxf(&value.grip)?;
@@ -3361,6 +3383,36 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                     self.writer.write_string(304, &column.connection_name)?;
                 }
                 self.writer.write_bool(280, value.flag_280)?;
+            }
+            DynamicBlockData::PropertiesTable(value) => {
+                self.write_dynamic_one_point_dxf(&value.parameter)?;
+                self.writer.write_subclass("AcDbBlockPropertiesTable")?;
+                for field in &value.fields {
+                    match &field.value {
+                        BlockPropertiesTableValue::Text(value) => {
+                            self.writer.write_string(field.code, value)?;
+                        }
+                        BlockPropertiesTableValue::Boolean(value) => {
+                            self.writer.write_bool(field.code, *value)?;
+                        }
+                        BlockPropertiesTableValue::Integer(value) => match field.code {
+                            160..=169 => self.writer.write_i64(field.code, *value)?,
+                            60..=79 | 170..=179 | 270..=279 | 370..=389 | 400..=409 => {
+                                self.writer.write_i16(field.code, *value as i16)?;
+                            }
+                            _ => self.writer.write_i32(field.code, *value as i32)?,
+                        },
+                        BlockPropertiesTableValue::Real(value) => {
+                            self.writer.write_double(field.code, *value)?;
+                        }
+                        BlockPropertiesTableValue::Handle(value) => {
+                            self.writer.write_handle(field.code, *value)?;
+                        }
+                        BlockPropertiesTableValue::Binary(value) => {
+                            self.writer.write_binary(field.code, value)?;
+                        }
+                    }
+                }
             }
             DynamicBlockData::StretchAction(value) => {
                 self.write_dynamic_action_dxf(&value.action)?;
@@ -4042,7 +4094,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             self.writer.write_double(40, vertex.start_width)?;
             self.writer.write_double(41, vertex.end_width)?;
             self.writer.write_double(42, vertex.bulge)?;
-            if vertex.vertex_id != 0 {
+            // Vertex ids only exist in R2010+ drawings; earlier formats have
+            // no such field.
+            if vertex.vertex_id != 0 && self.dxf_version >= DxfVersion::AC1024 {
                 self.writer.write_i32(91, vertex.vertex_id)?;
             }
         }
@@ -4187,7 +4241,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Write an MTEXT text value (may need to be split for long text).
     fn write_mtext_value(&mut self, value: &str) -> Result<()> {
         // DXF text format is line-based, so literal \n / \r in the value would
         // corrupt the file.  Replace them with the MText paragraph mark \P.
@@ -5018,22 +5071,24 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_double(40, viewport.width)?;
         self.writer.write_double(41, viewport.height)?;
 
-        // Status / stacking order (68) and viewport ID (69). IDs are only
-        // meaningful in the active layout; AutoCAD writes 0/0 elsewhere.
+        // Status / stacking order (68) and viewport ID (69). Every paper-space
+        // layout needs IDs: an on-screen viewport with ID 0 would emit 68=0
+        // and be interpreted as switched off.
         let id = if viewport.id != 0 {
             viewport.id
         } else {
-            self.active_viewport_ids
+            self.paper_viewport_ids
                 .get(&viewport.common.handle)
                 .copied()
                 .unwrap_or(0)
         };
-        let status = match (viewport.is_on(), viewport.off_screen) {
-            (false, _) => 0,
-            (true, true) => -1,
-            (true, false) if viewport.stacking > 0 => viewport.stacking,
-            (true, false) => id,
-        };
+        let status = viewport.dxf_status.unwrap_or_else(|| {
+            match (viewport.is_on(), viewport.off_screen) {
+                (false, _) => 0,
+                (true, true) => -1,
+                (true, false) => id,
+            }
+        });
         self.writer.write_i16(68, status)?;
         self.writer.write_i16(69, id)?;
 
@@ -5238,15 +5293,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Whether an ATTDEF/ATTRIB is written as a multiline attribute (R2018+).
     fn attribute_is_multiline(&self, is_multiline: bool, embedded: Option<&MText>) -> bool {
         self.dxf_version >= DxfVersion::AC1032 && (is_multiline || embedded.is_some())
     }
 
-    /// Write the multiline tail of an ATTDEF/ATTRIB: MTEXT flag, `72` 0, the
-    /// alignment point and the `101` embedded MTEXT object. Without a stored
-    /// embedded MTEXT one is built from the attribute's own text geometry,
-    /// as the DWG writer does.
     #[allow(clippy::too_many_arguments)]
     fn write_attribute_mtext(
         &mut self,
@@ -5307,8 +5357,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Group 1 of an attribute's text part: its value, or for a multiline
-    /// attribute the embedded MTEXT's value.
     fn write_attribute_text_value(
         &mut self,
         multiline: bool,
@@ -5488,16 +5536,10 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Table cell values: as in AcDbField values only flag bit 0 suppresses
-    /// the body (the reference application writes it with flags 2 and 6).
     fn write_field_cell_value_dxf(&mut self, value: &CellValue) -> Result<()> {
         self.write_cell_value_dxf_masked(value, 1, true)
     }
 
-    /// `body_mask`: R2007+ value flags that suppress the value body. AcDbField
-    /// values use bit 0 only (flag 2 still carries a body).
-    /// `point_size`: write the size (92) before a point (table cells; AcDbField
-    /// values have none).
     fn write_cell_value_dxf_masked(
         &mut self,
         value: &CellValue,
@@ -9114,7 +9156,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         Ok(())
     }
 
-    /// Write the XDATA of a non-entity object after its groups.
     fn write_object_xdata(
         &mut self,
         document: &CadDocument,
@@ -9130,8 +9171,32 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         }
     }
 
+    fn write_table_annotative_xdata(&mut self, document: &CadDocument, handle: Handle, annotative: bool) -> Result<()> {
+        let has_source = document.object_xdata.get(&handle).is_some_and(|data| data.get_record("AcadAnnotative").is_some());
+        let mut generated = Vec::new();
+        if annotative || has_source {
+            let mut record = crate::xdata::ExtendedDataRecord::new("AcadAnnotative");
+            record.values = vec![
+                XDataValue::String("AnnotativeData".to_string()),
+                XDataValue::ControlString("{".to_string()),
+                XDataValue::Integer16(1), XDataValue::Integer16(i16::from(annotative)),
+                XDataValue::ControlString("}".to_string()),
+            ];
+            generated.push(record);
+        }
+        self.write_table_xdata(document, handle, &generated)
+    }
+
+    fn write_table_xdata(&mut self, document: &CadDocument, handle: Handle, generated: &[crate::xdata::ExtendedDataRecord]) -> Result<()> {
+        let mut data = document.object_xdata.get(&handle).cloned().unwrap_or_default();
+        for replacement in generated {
+            data.merge_modeled_record(replacement);
+        }
+        self.write_xdata(&data)
+    }
+
     /// Write extended data (XDATA)
-    fn write_xdata(&mut self, xdata: &ExtendedData) -> Result<()> {
+    pub(crate) fn write_xdata(&mut self, xdata: &ExtendedData) -> Result<()> {
         if xdata.is_empty() {
             return Ok(());
         }
@@ -10199,9 +10264,6 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     ///
     /// When only SAB binary data is present (no SAT text), attempts to
     /// convert via `SabReader` before falling back to an empty entry.
-    /// One profile of a surface record: the type under `type_group`, then
-    /// the body bit length and chunks; a polyline the modeler keeps as a body
-    /// writes the SAT version (1) and the encrypted SAT text instead.
     fn write_surface_profile(
         &mut self,
         type_group: i32,
@@ -11286,14 +11348,28 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         // Clip boundary type
         self.writer.write_i16(71, wipeout.clip_type as i16)?;
 
+        // A polygonal clip boundary is a closed ring: the reference DXF repeats
+        // the first point as the last and counts it in 91. An unclosed ring
+        // leaves the reader short of a point and the drawing is discarded.
+        let ring_is_closed = wipeout.clip_type == crate::entities::WipeoutClipType::Polygonal
+            && wipeout.clip_boundary_vertices.len() >= 3
+            && wipeout.clip_boundary_vertices.first() != wipeout.clip_boundary_vertices.last();
+
         // Clip boundary count
-        self.writer
-            .write_i32(91, wipeout.clip_boundary_vertices.len() as i32)?;
+        self.writer.write_i32(
+            91,
+            (wipeout.clip_boundary_vertices.len() + usize::from(ring_is_closed)) as i32,
+        )?;
 
         // Clip boundary vertices
         for v in &wipeout.clip_boundary_vertices {
             self.writer.write_double(14, v.x)?;
             self.writer.write_double(24, v.y)?;
+        }
+        if ring_is_closed {
+            let first = wipeout.clip_boundary_vertices[0];
+            self.writer.write_double(14, first.x)?;
+            self.writer.write_double(24, first.y)?;
         }
 
         Ok(())
@@ -11718,8 +11794,6 @@ fn get_boundary_path_bits(flags: &BoundaryPathFlags) -> u32 {
     flags.bits()
 }
 
-/// Split a SAT text line into pieces of at most 255 characters at token
-/// boundaries; a counted string (`@<n> <text>`) is never split.
 fn wrap_sat_line(line: &str) -> Vec<&str> {
     const LIMIT: usize = 240;
     let bytes = line.as_bytes();

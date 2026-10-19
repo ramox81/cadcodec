@@ -93,8 +93,8 @@ impl<'a> DwgObjectWriter<'a> {
             self.writer
                 .write_handle(DwgReferenceType::SoftPointer, handle.value());
         }
-        self.writer.write_bit_long(value.parameter_ids.len() as i32);
-        for id in &value.parameter_ids {
+        self.writer.write_bit_long(value.action_ids.len() as i32);
+        for id in &value.action_ids {
             self.writer.write_bit_long(*id);
         }
     }
@@ -169,9 +169,6 @@ impl<'a> DwgObjectWriter<'a> {
             .write_handle(DwgReferenceType::HardPointer, value.material.value());
     }
 
-    /// Embedded construction entity: type, then (unless absent) the body
-    /// length in bits and the body, padded to whole bytes like the reference
-    /// application does.
     fn write_history_entity(&mut self, entity: Option<&crate::entities::EmbeddedEntity>) {
         let Some(entity) = entity else {
             self.writer.write_bit_long(0);
@@ -563,6 +560,32 @@ impl<'a> DwgObjectWriter<'a> {
                 }
                 self.writer.write_bit(value.flag_280);
             }
+            DynamicBlockData::PropertiesTable(value) => {
+                self.write_dynamic_one_point(&value.parameter);
+                for field in &value.fields {
+                    match &field.value {
+                        BlockPropertiesTableValue::Text(value) => {
+                            self.writer.write_variable_text(value);
+                        }
+                        BlockPropertiesTableValue::Boolean(value) => {
+                            self.writer.write_bit(*value);
+                        }
+                        BlockPropertiesTableValue::Integer(value) => match field.code {
+                            170..=179 | 270..=279 | 370..=389 => {
+                                self.writer.write_bit_short(*value as i16);
+                            }
+                            _ => self.writer.write_bit_long(*value as i32),
+                        },
+                        BlockPropertiesTableValue::Real(value) => {
+                            self.writer.write_bit_double(*value);
+                        }
+                        BlockPropertiesTableValue::Handle(value) => self
+                            .writer
+                            .write_handle(DwgReferenceType::HardPointer, value.value()),
+                        BlockPropertiesTableValue::Binary(_) => {}
+                    }
+                }
+            }
             DynamicBlockData::StretchAction(value) => {
                 self.write_dynamic_action(&value.action);
                 for connection in &value.connections {
@@ -702,8 +725,12 @@ impl<'a> DwgObjectWriter<'a> {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
-    use crate::{CadDocument, objects::{BlockEvaluationGraph, BlockEvaluationNode}, types::{DxfVersion, Handle}};
     use crate::io::dwg::dwg_stream_readers::bit_reader::DwgBitReader;
+    use crate::{
+        objects::{BlockEvaluationGraph, BlockEvaluationNode},
+        types::{DxfVersion, Handle},
+        CadDocument,
+    };
 
     #[test]
     fn evaluation_graph_owns_its_expression_in_the_handle_stream() {
@@ -712,13 +739,25 @@ mod ownership_tests {
         object.handle = Handle::new(0x100);
         object.owner = Handle::new(0x50);
         object.data = DynamicBlockData::EvaluationGraph(BlockEvaluationGraph {
-            nodes: vec![BlockEvaluationNode { expression: Handle::new(0x1234), ..Default::default() }],
+            nodes: vec![BlockEvaluationNode {
+                expression: Handle::new(0x1234),
+                ..Default::default()
+            }],
             ..Default::default()
         });
         let mut writer = DwgObjectWriter::new(&doc).unwrap();
         writer.write_dynamic_block(&object);
-        let offset = writer.handle_map.iter().find(|(h,_)| *h == 0x100).unwrap().1 as usize;
-        let mut reader = DwgBitReader::new(writer.output[offset..].to_vec(), writer.version, writer.dxf_version);
+        let offset = writer
+            .handle_map
+            .iter()
+            .find(|(h, _)| *h == 0x100)
+            .unwrap()
+            .1 as usize;
+        let mut reader = DwgBitReader::new(
+            writer.output[offset..].to_vec(),
+            writer.version,
+            writer.dxf_version,
+        );
         let bytes = reader.read_modular_short() as i64;
         let handle_bits = reader.read_modular_char() as i64;
         reader.set_position_in_bits(reader.position_in_bits() + bytes * 8 - handle_bits);

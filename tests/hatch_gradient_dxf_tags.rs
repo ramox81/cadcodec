@@ -3,7 +3,7 @@
 //! round trip cannot catch the other order.
 use std::io::Cursor;
 
-use opencadcodec::{CadDocument, Color, DxfReader, EntityType};
+use acadrust::{CadDocument, Color, DxfReader, EntityType};
 
 fn read_dxf(bytes: Vec<u8>) -> CadDocument {
     DxfReader::from_reader(Cursor::new(bytes))
@@ -53,9 +53,9 @@ fn aci_alone_is_kept() {
 
 #[test]
 fn dwg_keeps_gradient_color_book_names() {
-    use opencadcodec::entities::hatch::GradientColorEntry;
-    use opencadcodec::entities::{BoundaryEdge, BoundaryPath, Hatch, LineEdge};
-    use opencadcodec::{DwgReadOptions, DwgReader, DwgWriter, Vector2};
+    use acadrust::entities::hatch::GradientColorEntry;
+    use acadrust::entities::{BoundaryEdge, BoundaryPath, Hatch, LineEdge};
+    use acadrust::{DwgReadOptions, DwgReader, DwgWriter, Vector2};
     let mut hatch = Hatch::new();
     let mut path = BoundaryPath::new();
     for (a, b) in [((0.0, 0.0), (1.0, 0.0)), ((1.0, 0.0), (1.0, 1.0)), ((1.0, 1.0), (0.0, 0.0))] {
@@ -81,7 +81,7 @@ fn dwg_keeps_gradient_color_book_names() {
         },
     ];
     let mut doc = CadDocument::new();
-    doc.add_entity(EntityType::Hatch(hatch.clone())).unwrap();
+    doc.add_entity(EntityType::Hatch(Box::new(hatch.clone()))).unwrap();
     let bytes = DwgWriter::write_to_vec(&doc).unwrap();
     let back = DwgReader::from_stream_with_options(Cursor::new(bytes), DwgReadOptions::failsafe())
         .read()
