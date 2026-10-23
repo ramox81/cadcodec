@@ -2,6 +2,10 @@
 
 ### Unreleased
 
+- **DWG 2010 REGION tails** - Read an empty silhouette count retained after
+  an absent isoline cache when the complete bounded material tail validates.
+  Preserve the count-free layout and existing truncated-stream checks.
+
 - **Serde reference and provenance retention** - With the `serde` feature,
   `EntityCommon` now includes `layer_handle`, `linetype_handle`,
   `color_book_handle`, `face_visual_style_handle`, `edge_visual_style_handle`,
@@ -17,6 +21,10 @@
   complete CAD snapshot.
   The serialized structs gain fields; positional formats require a separate
   compatibility strategy.
+
+- **DWG 2010 associative arcs** - Preserve the observed terminal AC1024
+  three-scalar edge-arc layout without synthesizing a fourth value. Modern
+  four-scalar arcs and nested curve layouts retain their existing contracts.
 
 - **Genuine DXF R12 output** - `DxfWriter::with_version(DxfVersion::AC1009)`
   writes a real R12 file: no handles, CLASSES or OBJECTS, R12 table records,
