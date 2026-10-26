@@ -18,6 +18,29 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// An angle in degrees for a DXF angle group, chosen so the reader's
+/// `to_radians` gives back exactly `radians`. A plain `to_degrees` can land
+/// one representable step off that value, and the angle then reads back
+/// changed by one ULP.
+pub(crate) fn degrees(radians: f64) -> f64 {
+    let degrees = radians.to_degrees();
+    if !degrees.is_finite() || degrees.to_radians() == radians {
+        return degrees;
+    }
+    let (mut down, mut up) = (degrees, degrees);
+    for _ in 0..4 {
+        up = up.next_up();
+        if up.to_radians() == radians {
+            return up;
+        }
+        down = down.next_down();
+        if down.to_radians() == radians {
+            return down;
+        }
+    }
+    degrees
+}
+
 /// DXF file writer
 pub struct DxfWriter<'a> {
     document: &'a CadDocument,
@@ -74,6 +97,21 @@ impl<'a> DxfWriter<'a> {
     pub fn write_to_writer<W: Write>(&self, writer: W) -> Result<()> {
         if self.version == Some(crate::types::DxfVersion::AC1009) {
             return self.write_r12(writer);
+        }
+        for (handle, object) in &self.document.objects {
+            if let crate::objects::ObjectType::Unknown {
+                type_name,
+                raw_dxf_codes: None,
+                ..
+            } = object
+            {
+                if crate::objects::associative_canonical_name(type_name) == "ASSOC2DCONSTRAINTGROUP"
+                {
+                    return Err(crate::error::DxfError::NotImplemented(format!(
+                        "Cannot export undecoded constraint group {type_name} at handle {handle} to DXF; save as the source DWG version to preserve its payload"
+                    )));
+                }
+            }
         }
         // BricsCAD's binary DXF importer rejects the R2000/R2004 headers even
         // when their records are otherwise valid.  The same records are
@@ -193,7 +231,9 @@ impl<'a> DxfWriter<'a> {
             ));
         }
         let mut stream_writer = DxfTextWriter::new(writer);
-        if let Some(encoding) = crate::io::dxf::code_page::encoding_from_code_page(&self.document.header.code_page) {
+        if let Some(encoding) =
+            crate::io::dxf::code_page::encoding_from_code_page(&self.document.header.code_page)
+        {
             stream_writer.set_encoding(encoding);
         }
         r12::write_r12(&mut stream_writer, self.document)?;

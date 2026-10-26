@@ -204,7 +204,10 @@ impl AssociativeData {
             Self::Variable(value) => {
                 action_references(&value.action, target)
                     || eval_references(&value.value, target)
-                    || value.dependencies.iter().any(|item| item.dependency == target)
+                    || value
+                        .dependencies
+                        .iter()
+                        .any(|item| item.dependency == target)
             }
             Self::CompoundActionParam(value)
             | Self::PointRefActionParam(value)
@@ -456,14 +459,18 @@ fn eval_references(value: &AssocEvalVariant, target: Handle) -> bool {
 }
 
 fn array_items_reference(items: &[AssocArrayItem], target: Handle) -> bool {
-    items.iter().any(|item| {
-        item.first_handle == Some(target) || item.second_handle == Some(target)
-    })
+    items
+        .iter()
+        .any(|item| item.first_handle == Some(target) || item.second_handle == Some(target))
 }
 
 fn visit_array_items(items: &mut [AssocArrayItem], visit: &mut impl FnMut(&mut Handle)) {
     for item in items {
-        for handle in item.first_handle.iter_mut().chain(item.second_handle.iter_mut()) {
+        for handle in item
+            .first_handle
+            .iter_mut()
+            .chain(item.second_handle.iter_mut())
+        {
             visit(handle);
         }
     }
@@ -1373,6 +1380,18 @@ pub struct AssocDimensionReference {
     pub intersection_gs_marker: i32,
     pub intersection_xref_paths: Vec<String>,
     pub has_last_point_reference: bool,
+}
+
+impl AssocDimensionReference {
+    /// Whether a reference with this osnap type and number of referenced
+    /// objects stores its main sub-entity (subent type, GS marker, xref
+    /// paths). A reference that snaps to no object has none to describe:
+    /// AutoCAD writes an `_End` "last point" reference with no objects as
+    /// class name, osnap type, object count, distance, point and the
+    /// continuation bit only, in DWG and DXF alike.
+    pub fn stores_main_subentity(osnap_type: u8, object_count: usize) -> bool {
+        osnap_type != 0 && object_count > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

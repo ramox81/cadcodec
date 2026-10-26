@@ -126,7 +126,7 @@ fn is_paper_space(name: &str) -> bool {
 }
 
 fn degrees(radians: f64) -> f64 {
-    radians.to_degrees()
+    super::degrees(radians)
 }
 
 impl<'a, W: DxfStreamWriter> R12Writer<'a, W> {
@@ -984,7 +984,7 @@ impl<'a, W: DxfStreamWriter> R12Writer<'a, W> {
         if depth >= MAX_EXPLODE_DEPTH {
             return Ok(());
         }
-        for part in e.explode() {
+        for part in e.flatten() {
             self.write_entity(&part, paper, depth + 1)?;
         }
         Ok(())

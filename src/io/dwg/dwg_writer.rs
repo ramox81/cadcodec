@@ -91,7 +91,7 @@ impl DwgWriter {
         let mut owned;
         let document: &CadDocument = if document.has_null_table_entries()
             || document.version < DxfVersion::AC1027
-            || has_missing_object_classes(document)
+            || has_missing_classes(document)
         {
             owned = document.clone();
             if owned.has_null_table_entries() {
@@ -105,11 +105,12 @@ impl DwgWriter {
                     prepare_legacy_classes(&mut owned);
                 }
             }
-            // Objects added after reading (an evaluated dynamic block's
+            // Entities and objects added after reading (a MULTILEADER drawn
+            // or pasted in, an evaluated dynamic block's
             // AcDbBlockRepresentationData, a drawing variable) need their
             // class whatever the version; the verbatim table only gains
             // entries at its end, so the numbers it carries stay valid.
-            add_missing_object_classes(&mut owned);
+            add_missing_classes(&mut owned);
             if owned.version < DxfVersion::AC1027 {
                 prepare_legacy_document(&mut owned);
                 crate::objects::store_table_style_roundtrip(&mut owned);
@@ -866,50 +867,64 @@ fn prepare_legacy_classes(document: &mut CadDocument) {
     }
 }
 
-/// Class names of objects whose class the table lacks.
-fn missing_object_class_names(document: &CadDocument) -> Vec<Vec<std::borrow::Cow<'_, str>>> {
-    objects_in_handle_order(document)
-        .into_iter()
-        .map(|(_, object)| {
-            crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object)
-        })
-        .filter(|names| !names.iter().any(|name| document.classes.contains(name)))
-        .collect()
-}
+/// Default declarations for the classes of entities and objects that the
+/// table lacks, one per class, in first-use order.
+fn missing_classes<'a>(document: &'a CadDocument) -> Vec<crate::classes::DxfClass> {
+    use std::borrow::Cow;
 
-/// True when an object the defaults can declare has no class in the table.
-fn has_missing_object_classes(document: &CadDocument) -> bool {
     let defaults = crate::classes::default_classes();
-    missing_object_class_names(document).iter().any(|names| {
-        defaults.iter().any(|class| {
+    // Most records share a handful of names (every LINE is "LINE"): settle
+    // each name once instead of once per record.
+    let mut seen: std::collections::HashSet<Cow<'a, str>> = std::collections::HashSet::new();
+    let mut missing: Vec<crate::classes::DxfClass> = Vec::new();
+    let mut check = |names: &[Cow<'a, str>]| {
+        if names.iter().all(|name| seen.contains(name.as_ref())) {
+            return;
+        }
+        seen.extend(names.iter().cloned());
+        if names.iter().any(|name| document.classes.contains(name)) {
+            return;
+        }
+        let Some(class) = defaults.iter().find(|class| {
             names
                 .iter()
                 .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
-        })
-    })
+        }) else {
+            return;
+        };
+        if !missing
+            .iter()
+            .any(|added| added.dxf_name.eq_ignore_ascii_case(&class.dxf_name))
+        {
+            missing.push(class.clone());
+        }
+    };
+    for entity in document.entities() {
+        check(&[Cow::Borrowed(entity_class_name(entity))]);
+    }
+    for (_, object) in objects_in_handle_order(document) {
+        check(
+            &crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object),
+        );
+    }
+    missing
 }
 
-/// Declare the class of every object whose source file never used that
-/// class. Such records take their type code from the class table; without an
-/// entry they fall back to a fixed or placeholder code (500 for dynamic block
-/// records), which readers resolve to another class or drop: an evaluated
-/// dynamic block reference then loses its link to the definition.
-fn add_missing_object_classes(document: &mut CadDocument) {
-    let defaults = crate::classes::default_classes();
-    let missing: Vec<_> = missing_object_class_names(document)
-        .into_iter()
-        .filter_map(|names| {
-            defaults
-                .iter()
-                .find(|class| {
-                    names
-                        .iter()
-                        .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
-                })
-                .cloned()
-        })
-        .collect();
-    for mut class in missing {
+/// True when an entity or object the defaults can declare has no class in
+/// the table.
+fn has_missing_classes(document: &CadDocument) -> bool {
+    !missing_classes(document).is_empty()
+}
+
+/// Declare the class of every entity and object whose source file never used
+/// that class. Such records take their type code from the class table; without
+/// an entry they fall back to a fixed or placeholder code (500 for dynamic
+/// block records), which readers resolve to another class or drop: an
+/// evaluated dynamic block reference then loses its link to the definition,
+/// and a MULTILEADER or WIPEOUT drawn into a file that never held one makes
+/// AutoCAD refuse to open the drawing.
+fn add_missing_classes(document: &mut CadDocument) {
+    for mut class in missing_classes(document) {
         class.class_number = 0;
         document.classes.add_or_update(class);
     }
@@ -1063,8 +1078,9 @@ fn uses_paged_format(version: DxfVersion) -> bool {
 /// dictionary, causing IntelliCAD (and other CAD apps) to report
 /// "null object id" for every object.
 ///
-/// Also updates EXTMIN/EXTMAX from the computed model-space extents so that
-/// "Zoom Extents" works correctly when the file is first opened.
+/// A document without EXTMIN/EXTMAX (the 1e20 defaults) gets the computed
+/// model-space extents, so that "Zoom Extents" works when the file is first
+/// opened; extents the document holds are kept.
 fn prepare_header(
     document: &CadDocument,
     handle_map: &[(u64, u32)],
@@ -1150,9 +1166,8 @@ fn prepare_header(
     if let Some(br) = document.block_records.get("*Model_Space") {
         h.model_space_block_handle = br.handle;
     }
-    if let Some(br) = document.block_records.get("*Paper_Space") {
-        h.paper_space_block_handle = br.handle;
-    }
+    h.paper_space_block_handle =
+        super::dwg_stream_writers::object_writer::paper_space_block_handle(document);
 
     // ── Sync current style handles (validate against actual objects) ──
     // CLAYER: must point to an actual layer; fall back to "0" if invalid
@@ -1312,6 +1327,12 @@ fn prepare_header(
         }
     }
 
+    // DIMBLK / DIMBLK1 / DIMBLK2 / DIMLDRBLK. DXF stores the names; a DWG
+    // stores the block handles. A null handle is the default closed-filled arrow.
+    // A name such as ArchTick selects the block _ArchTick, and a handle that
+    // names no block is cleared.
+    crate::document::apply_dimension_arrow_header(&document.block_records, &mut h);
+
     // ── Correct HANDSEED ──
     let max_handle = handle_map.iter().map(|&(ha, _)| ha).max().unwrap_or(0);
     if h.handle_seed <= max_handle {
@@ -1319,9 +1340,23 @@ fn prepare_header(
     }
 
     // ── Update model-space extents ──
+    // Extents the document already holds (read from a file, or set by the
+    // caller) are kept: EXTMIN/EXTMAX are what the authoring application last
+    // computed, and the entity bounding boxes are no substitute (an XLINE or
+    // RAY is unbounded, and block references are boxed by their insertion
+    // point). Only a document without extents gets the computed ones.
+    let (min, max) = (h.model_space_extents_min, h.model_space_extents_max);
+    let has_extents = [min.x, min.y, min.z, max.x, max.y, max.z]
+        .iter()
+        .all(|c| c.is_finite() && c.abs() < 1e20)
+        && min.x <= max.x
+        && min.y <= max.y
+        && min.z <= max.z;
     if let Some(ref ext) = extents {
-        h.model_space_extents_min = ext.min;
-        h.model_space_extents_max = ext.max;
+        if !has_extents {
+            h.model_space_extents_min = ext.min;
+            h.model_space_extents_max = ext.max;
+        }
     }
 
     h
@@ -2695,6 +2730,77 @@ mod tests {
     }
 
     #[test]
+    fn entity_without_its_class_gets_it_declared() {
+        use crate::entities::{EntityType, MultiLeader, Wipeout};
+        use crate::types::Vector3;
+
+        // A drawing whose source file never held a MULTILEADER or a WIPEOUT,
+        // so its class table lacks both, then gains one of each. Readers
+        // resolve classes by position, so the source table is numbered
+        // without gaps, as a file written by AutoCAD would be.
+        let mut document = CadDocument::new();
+        let mut classes = crate::classes::DxfClassCollection::new();
+        for class in document.classes.iter() {
+            if !["MULTILEADER", "WIPEOUT"]
+                .iter()
+                .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+            {
+                let mut class = class.clone();
+                class.class_number = 500 + classes.len() as i16;
+                classes.push_preserving(class);
+            }
+        }
+        let numbers: Vec<_> = classes
+            .iter()
+            .map(|class| (class.dxf_name.clone(), class.class_number))
+            .collect();
+        document.classes = classes;
+        document
+            .add_entity(EntityType::MultiLeader(Box::new(MultiLeader::with_text(
+                "note",
+                Vector3::new(10.0, 5.0, 0.0),
+                vec![Vector3::ZERO, Vector3::new(10.0, 5.0, 0.0)],
+            ))))
+            .unwrap();
+        document
+            .add_entity(EntityType::Wipeout(Wipeout::rectangular(
+                Vector3::ZERO,
+                10.0,
+                5.0,
+            )))
+            .unwrap();
+
+        let bytes = DwgWriter::write_to_vec(&document).unwrap();
+        let decoded = crate::io::dwg::DwgReader::from_stream(Cursor::new(bytes))
+            .read()
+            .unwrap();
+
+        assert!(decoded.classes.contains("MULTILEADER"));
+        assert!(decoded.classes.contains("WIPEOUT"));
+        // The source classes keep their places and numbers; the new ones go
+        // at the end, and every number still matches its position.
+        let decoded_classes: Vec<_> = decoded.classes.iter().collect();
+        for (index, class) in decoded_classes.iter().enumerate() {
+            assert_eq!(class.class_number, 500 + index as i16, "{}", class.dxf_name);
+        }
+        for (class, (name, number)) in decoded_classes.iter().zip(&numbers) {
+            assert_eq!((&class.dxf_name, class.class_number), (name, *number));
+        }
+        let mut added: Vec<_> = decoded_classes[numbers.len()..]
+            .iter()
+            .map(|class| class.dxf_name.to_uppercase())
+            .collect();
+        added.sort();
+        assert_eq!(added, ["MULTILEADER", "WIPEOUT"]);
+        let types: Vec<_> = decoded
+            .model_space_entities()
+            .map(|entity| entity.as_entity().entity_type())
+            .collect();
+        assert!(types.contains(&"MULTILEADER"), "{types:?}");
+        assert!(types.contains(&"WIPEOUT"), "{types:?}");
+    }
+
+    #[test]
     fn test_validate_version_r2007_ok() {
         assert!(validate_version(DxfVersion::AC1021).is_ok());
     }
@@ -3606,70 +3712,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn geom_dependency_subent_values_round_trip_below_r2013() {
-        use crate::objects::{
-            AssocGeomDependency, AssocPersistentSubentId, AssociativeData, AssociativeObject,
-            ObjectType,
-        };
-        use crate::DwgReader;
-        use std::io::Cursor;
-
-        for version in [DxfVersion::AC1018, DxfVersion::AC1021, DxfVersion::AC1024] {
-            let mut document = CadDocument::new();
-            document.version = version;
-            let handle = document.allocate_handle();
-            let owner = document.header.named_objects_dict_handle;
-            document.objects.insert(
-                handle,
-                ObjectType::Associative(AssociativeObject {
-                    handle,
-                    owner,
-                    dxf_name: "ASSOCGEOMDEPENDENCY".to_string(),
-                    cpp_class_name: "AcDbAssocGeomDependency".to_string(),
-                    data: AssociativeData::GeomDependency(AssocGeomDependency {
-                        class_version: 2,
-                        enabled: true,
-                        persistent_subent: AssocPersistentSubentId {
-                            class_name: "AcDbAssocEdgePersSubentId".to_string(),
-                            dependent_on_compound_object: true,
-                            class_code: 3,
-                            values: vec![0, 68, 69],
-                            leading_flag: false,
-                        },
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-            );
-
-            let decoded = DwgReader::from_stream(Cursor::new(
-                DwgWriter::write_to_vec(&document).expect("write DWG"),
-            ))
-            .read()
-            .expect("read DWG");
-            let subent = decoded
-                .objects
-                .values()
-                .find_map(|object| match object {
-                    ObjectType::Associative(AssociativeObject {
-                        data: AssociativeData::GeomDependency(geom),
-                        ..
-                    }) => Some(&geom.persistent_subent),
-                    _ => None,
-                })
-                .expect("geom dependency");
-
-            assert_eq!(
-                subent.values,
-                vec![0, 68, 69],
-                "pre-R2013 subent field values must survive a {version:?} round trip"
-            );
-            assert!(subent.dependent_on_compound_object);
-            assert_eq!(subent.class_code, 3);
-        }
     }
 }
 

@@ -201,6 +201,8 @@ impl<'a> SemanticInventoryV1<'a> {
             acis_sab_handles: _,
             raw_acds_data: _,
             r12_header_raw: _,
+            r12_table_usage: _,
+            r12_block_tags: _,
             raw_acds_fingerprint: _,
             raw_records: _,
             original_objects: _,
@@ -273,6 +275,16 @@ impl<'a> SemanticInventoryV1<'a> {
                     SemanticReferenceV1::Resolved(SemanticNodeV1::Object(object)),
                     owner,
                 );
+            }
+            if let ObjectType::ImageDefinition(definition) = object {
+                for reactor in &definition.reactors {
+                    self.visit_relationship(
+                        &mut visitor,
+                        SemanticRelationshipKindV1::Reactor,
+                        SemanticReferenceV1::Resolved(SemanticNodeV1::Object(object)),
+                        *reactor,
+                    );
+                }
             }
         }
 
