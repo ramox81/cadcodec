@@ -70,6 +70,7 @@ impl DwgWriter {
         }
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
+        prepare_unique_seqends(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
         prepare_active_viewport_elevation(&mut prepared);
@@ -165,6 +166,7 @@ impl DwgWriter {
         validate_version(document.version)?;
         let mut prepared = crate::io::loft_parameters::prepared(document);
         prepare_surface_classes(&mut prepared);
+        prepare_unique_seqends(&mut prepared);
         prepare_database_references(&mut prepared);
         prepare_table_keys(&mut prepared);
         prepare_active_viewport_elevation(&mut prepared);
@@ -258,6 +260,24 @@ fn validate_unknown_records(document: &CadDocument) -> Result<()> {
                     data,
                     document.version,
                 )?;
+            }
+        }
+        if let crate::entities::EntityType::Extended(entity) = entity {
+            // An SPDS format entity has no model: its vendor schema is not
+            // public, so only its raw bytes can be written. Without bytes of
+            // the target version the record would go out empty.
+            if let crate::entities::ExtendedEntityData::Format(data) = &entity.data {
+                if data.raw_dwg_data.is_none()
+                    || data
+                        .raw_dwg_version
+                        .is_some_and(|version| version != document.version)
+                    || document.version == DxfVersion::AC1009
+                {
+                    return Err(DxfError::NotImplemented(format!(
+                        "Cannot encode SPDS format entity at handle {} as DWG {:?}: compatible raw DWG data is required",
+                        entity.common.handle, document.version
+                    )));
+                }
             }
         }
         if let crate::entities::EntityType::Unknown(entity) = entity {
@@ -747,6 +767,72 @@ fn prepare_surface_classes(document: &mut std::borrow::Cow<'_, CadDocument>) {
     }
 }
 
+/// An INSERT's SEQEND is written under a handle no other record of the drawing has.
+/// A block reference copied within or between drawings keeps the SEQEND handle it had (the
+/// copy paths renew its ATTRIB handles only), so two records were written under one handle:
+/// another INSERT's SEQEND, or whatever entity, ATTRIB or object of the target drawing holds
+/// that handle; the reader keeps one, and an ATTRIB lost that way was gone from the saved
+/// drawing. On the output copy, a SEQEND handle already in use is cleared, so the writer
+/// allocates a fresh one; the first claimant keeps it.
+fn prepare_unique_seqends(document: &mut std::borrow::Cow<'_, CadDocument>) {
+    use crate::entities::EntityType;
+    use crate::tables::TableEntry;
+    let doc = document.as_ref();
+    let mut used = std::collections::HashSet::new();
+    macro_rules! table {
+        ($t:expr) => {
+            used.insert($t.handle().value());
+            used.extend($t.iter().map(|e| e.handle().value()));
+        };
+    }
+    table!(doc.layers);
+    table!(doc.line_types);
+    table!(doc.text_styles);
+    table!(doc.dim_styles);
+    table!(doc.app_ids);
+    table!(doc.views);
+    table!(doc.vports);
+    table!(doc.ucss);
+    table!(doc.vx_table);
+    table!(doc.block_records);
+    for record in doc.block_records.iter() {
+        used.extend([
+            record.block_entity_handle.value(),
+            record.block_end_handle.value(),
+        ]);
+    }
+    used.extend(doc.objects.keys().map(|h| h.value()));
+    for entity in doc.entities() {
+        used.insert(entity.common().handle.value());
+        match entity {
+            EntityType::Insert(i) => {
+                used.extend(i.attributes.iter().map(|a| a.common.handle.value()))
+            }
+            EntityType::Polyline3D(p) => used.extend(p.vertices.iter().map(|v| v.handle.value())),
+            _ => {}
+        }
+    }
+    let clashes: Vec<Handle> = doc
+        .entities()
+        .filter_map(|e| match e {
+            EntityType::Insert(i) => i
+                .seqend_handle
+                .filter(|h| !h.is_null() && !used.insert(h.value()))
+                .map(|_| i.common.handle),
+            _ => None,
+        })
+        .collect();
+    if clashes.is_empty() {
+        return;
+    }
+    let output = document.to_mut();
+    for handle in clashes {
+        if let Some(EntityType::Insert(i)) = output.get_entity_mut(handle) {
+            i.seqend_handle = None;
+        }
+    }
+}
+
 /// Re-key symbol-table entries that were renamed in place.
 ///
 /// Tables key entries by the name captured at insertion, so a caller that
@@ -880,7 +966,13 @@ fn objects_in_handle_order(document: &CadDocument) -> Vec<(Handle, &crate::objec
 /// class-registered record takes its type code from that number. A class the
 /// profile would drop while an entity or object still uses it leaves the
 /// record without a valid type code, so it is kept, after the profile.
+///
+/// A proxy names its class by number instead (`class_id`, DXF 91): that class
+/// is kept as well, and the proxy takes the class's new number once the table
+/// is rebuilt. Without it the number points past the table or at another
+/// class, and readers refuse the proxy (ODA: "No ClassId").
 fn prepare_legacy_classes(document: &mut CadDocument) {
+    let proxies = proxy_classes(document);
     let entity_classes = document.entities().map(entity_class_name);
     let object_classes = objects_in_handle_order(document)
         .into_iter()
@@ -903,6 +995,7 @@ fn prepare_legacy_classes(document: &mut CadDocument) {
         .chain(object_classes)
         .chain(field_classes)
         .filter_map(|name| document.classes.get_by_name(&name).cloned())
+        .chain(proxies.iter().map(|(_, class)| class.clone()))
         .filter(|class| seen.insert(class.dxf_name.to_ascii_uppercase()))
         .collect();
 
@@ -913,6 +1006,71 @@ fn prepare_legacy_classes(document: &mut CadDocument) {
             document.classes.add_or_update(class);
         }
     }
+
+    for (proxy, class) in proxies {
+        let Some(number) = document
+            .classes
+            .get_by_name(&class.dxf_name)
+            .map(|class| i32::from(class.class_number))
+        else {
+            continue;
+        };
+        match proxy {
+            ProxyRecord::Entity(handle) => {
+                if let Some(crate::entities::EntityType::Extended(entity)) =
+                    document.get_entity_mut(handle)
+                {
+                    if let crate::entities::ExtendedEntityData::Proxy(data) = &mut entity.data {
+                        data.class_id = number;
+                    }
+                }
+            }
+            ProxyRecord::Object(handle) => {
+                if let Some(crate::objects::ObjectType::ProxyObject(object)) =
+                    document.objects.get_mut(&handle)
+                {
+                    object.class_id = number;
+                }
+            }
+        }
+    }
+}
+
+/// A proxy record, by handle.
+enum ProxyRecord {
+    Entity(Handle),
+    Object(Handle),
+}
+
+/// Every proxy entity and proxy object whose `class_id` names a class of the
+/// table, with that class.
+fn proxy_classes(document: &CadDocument) -> Vec<(ProxyRecord, crate::classes::DxfClass)> {
+    let class_of = |class_id: i32| {
+        document
+            .classes
+            .iter()
+            .find(|class| i32::from(class.class_number) == class_id)
+            .cloned()
+    };
+    let entities = document.entities().filter_map(|entity| match entity {
+        crate::entities::EntityType::Extended(extended) => match &extended.data {
+            crate::entities::ExtendedEntityData::Proxy(data) => Some((
+                ProxyRecord::Entity(extended.common.handle),
+                class_of(data.class_id)?,
+            )),
+            _ => None,
+        },
+        _ => None,
+    });
+    let objects = objects_in_handle_order(document)
+        .into_iter()
+        .filter_map(|(handle, object)| match object {
+            crate::objects::ObjectType::ProxyObject(data) => {
+                Some((ProxyRecord::Object(handle), class_of(data.class_id)?))
+            }
+            _ => None,
+        });
+    entities.chain(objects).collect()
 }
 
 /// Default declarations for the classes of entities and objects that the
@@ -925,7 +1083,9 @@ fn missing_classes<'a>(document: &'a CadDocument) -> Vec<crate::classes::DxfClas
     // each name once instead of once per record.
     let mut seen: std::collections::HashSet<Cow<'a, str>> = std::collections::HashSet::new();
     let mut missing: Vec<crate::classes::DxfClass> = Vec::new();
-    let mut check = |names: &[Cow<'a, str>]| {
+    // `own`: the declaration a registered-class record carries itself (its
+    // DXF and C++ class names), used when the defaults don't know the class.
+    let mut check = |names: &[Cow<'a, str>], own: Option<crate::classes::DxfClass>| {
         if names.iter().all(|name| seen.contains(name.as_ref())) {
             return;
         }
@@ -933,26 +1093,47 @@ fn missing_classes<'a>(document: &'a CadDocument) -> Vec<crate::classes::DxfClas
         if names.iter().any(|name| document.classes.contains(name)) {
             return;
         }
-        let Some(class) = defaults.iter().find(|class| {
-            names
-                .iter()
-                .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
-        }) else {
+        let Some(class) = defaults
+            .iter()
+            .find(|class| {
+                names
+                    .iter()
+                    .any(|name| class.dxf_name.eq_ignore_ascii_case(name))
+            })
+            .cloned()
+            .or(own)
+        else {
             return;
         };
         if !missing
             .iter()
             .any(|added| added.dxf_name.eq_ignore_ascii_case(&class.dxf_name))
         {
-            missing.push(class.clone());
+            missing.push(class);
         }
     };
     for entity in document.entities() {
-        check(&[Cow::Borrowed(entity_class_name(entity))]);
+        let own = match entity {
+            crate::entities::EntityType::Extended(extended) => match &extended.data {
+                crate::entities::ExtendedEntityData::RegisteredClass(data) => Some(
+                    crate::classes::DxfClass::new_entity(&data.dxf_name, &data.cpp_class_name),
+                ),
+                _ => None,
+            },
+            _ => None,
+        };
+        check(&[Cow::Borrowed(entity_class_name(entity))], own);
     }
     for (_, object) in objects_in_handle_order(document) {
+        let own = match object {
+            crate::objects::ObjectType::RegisteredClass(data) => Some(
+                crate::classes::DxfClass::new(&data.dxf_name, &data.cpp_class_name),
+            ),
+            _ => None,
+        };
         check(
             &crate::io::dwg::dwg_stream_writers::object_writer::objects::object_class_names(object),
+            own,
         );
     }
     missing
