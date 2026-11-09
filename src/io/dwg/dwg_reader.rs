@@ -337,6 +337,17 @@ pub struct DwgReadOptions {
     /// forces). The DXF reader always derives eagerly.
     #[cfg_attr(feature = "serde", serde(default))]
     pub defer_solid_reference_point: bool,
+    /// When `true`, entities are read without the verbatim bytes a DWG save
+    /// copies for an unedited entity: `EntityCommon::raw_record`, and the raw
+    /// EED of every XDATA block that decoded into a record. That saves memory
+    /// for read-only use. The model is the same; a DWG written from the
+    /// document re-encodes those entities and their XDATA records instead of
+    /// copying the source bytes. Objects keep their raw data.
+    ///
+    /// The default (`false`) keeps the bytes, so an unedited entity is saved
+    /// byte for byte.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skip_roundtrip_data: bool,
 }
 
 impl Default for DwgReadOptions {
@@ -348,6 +359,7 @@ impl Default for DwgReadOptions {
             max_decompressed_bytes: None,
             password: None,
             defer_solid_reference_point: false,
+            skip_roundtrip_data: false,
         }
     }
 }
@@ -392,6 +404,13 @@ impl DwgReadOptions {
     /// (see [`Self::defer_solid_reference_point`]).
     pub fn with_deferred_solid_reference_point(mut self) -> Self {
         self.defer_solid_reference_point = true;
+        self
+    }
+
+    /// Read without the bytes kept for a byte-exact re-save
+    /// (see [`Self::skip_roundtrip_data`]).
+    pub fn without_roundtrip_data(mut self) -> Self {
+        self.skip_roundtrip_data = true;
         self
     }
 
@@ -1480,12 +1499,13 @@ impl<R: Read + Seek> DwgReader<R> {
 
         // AC1009/R12 predates the section-map/object-stream model used by the
         // normal DWG reader. Dispatch it to the byte-aligned pre-R13 codec
-        // before attempting the R13+ file-header parser.
+        // before attempting the R13+ file-header parser. AC1006/R10 shares
+        // that layout and is read into an R11/R12 document.
         self.stream.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 6];
         self.stream.read_exact(&mut magic)?;
         self.stream.seek(SeekFrom::Start(0))?;
-        if magic == *b"AC1009" || magic == *b"AD1009" {
+        if magic == *b"AC1009" || magic == *b"AD1009" || magic == *b"AC1006" {
             let mut bytes = Vec::new();
             self.stream.read_to_end(&mut bytes)?;
             let mut document = match crate::io::dwg::r12::read_document(
@@ -1797,11 +1817,16 @@ impl<R: Read + Seek> DwgReader<R> {
                             self.shard.as_mut().filter(|shard| shard.objects.is_none())
                         {
                             shard.plan_first(&mut obj_reader, objects_buf, handle_count, &document);
+                        } else {
+                            // The object reader holds the only other copy and
+                            // frees it once every record is decoded.
+                            drop(objects_buf);
                         }
                         record_stream_read = true;
                         obj_reader.set_mesh_budget(self.options.mesh_budget());
                         let mut builder = crate::io::dwg::dwg_document_builder::DwgDocumentBuilder::new(obj_reader);
                         builder.set_failsafe(failsafe);
+                        builder.set_skip_roundtrip_data(self.options.skip_roundtrip_data);
                         if let Some(progress) = &self.progress {
                             builder.set_progress_callback(progress.clone());
                         }

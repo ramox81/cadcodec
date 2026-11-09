@@ -2369,7 +2369,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 | EntityType::PolygonMesh(_)
                 | EntityType::AttributeEntity(_)
                 | EntityType::Unknown(_)
-        ) {
+        ) && !arch_written_as_proxy(entity)
+        {
             let lofted = match entity {
                 EntityType::Surface(surface) => Some(&surface.surface_data),
                 _ => None,
@@ -5678,6 +5679,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_common_entity_data(&attdef.common, owner)?;
         self.writer.write_subclass("AcDbText")?;
 
+        // Thickness precedes the insertion point, as in TEXT.
+        if attdef.thickness != 0.0 {
+            self.writer.write_double(39, attdef.thickness)?;
+        }
+
         // Insertion point
         self.writer.write_point3d(10, attdef.insertion_point)?;
 
@@ -5856,6 +5862,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_entity_type("ATTRIB")?;
         self.write_common_entity_data(&attrib.common, owner)?;
         self.writer.write_subclass("AcDbText")?;
+
+        // Thickness precedes the insertion point, as in TEXT.
+        if attrib.thickness != 0.0 {
+            self.writer.write_double(39, attrib.thickness)?;
+        }
 
         // Insertion point
         self.writer.write_point3d(10, attrib.insertion_point)?;
@@ -8736,7 +8747,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             } => {
                 // No AcDbBlkRefObjectContextData marker: ACAD refuses it
                 // ("Missing DXF group code: 1"), as for TEXT.
-                self.writer.write_double(50, *rotation)?;
+                self.writer.write_double(50, super::degrees(*rotation))?;
                 self.writer.write_double(10, insertion.x)?;
                 self.writer.write_double(20, insertion.y)?;
                 self.writer.write_double(30, insertion.z)?;
@@ -8755,7 +8766,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 // AcDbTextObjectContextData marker, and refuses the file with
                 // one ("Missing DXF group code: 1").
                 self.writer.write_i16(70, *horizontal_mode)?;
-                self.writer.write_double(50, *rotation)?;
+                self.writer.write_double(50, super::degrees(*rotation))?;
                 self.writer.write_double(10, insertion.x)?;
                 self.writer.write_double(20, insertion.y)?;
                 self.writer.write_double(11, alignment.x)?;
@@ -12669,4 +12680,20 @@ fn wrap_sat_line(line: &str) -> Vec<&str> {
     }
     pieces.push(&line[start..]);
     pieces
+}
+
+/// An Arch entity read from DWG (no DXF class body) with proxy graphics is
+/// written through `write_unknown_entity`, which writes its XDATA itself.
+fn arch_written_as_proxy(entity: &EntityType) -> bool {
+    let EntityType::Extended(e) = entity else {
+        return false;
+    };
+    let ExtendedEntityData::Arch(data) = &e.data else {
+        return false;
+    };
+    data.raw_dxf_codes.is_none()
+        && e.common
+            .graphic_data
+            .as_deref()
+            .is_some_and(|graphics| !graphics.is_empty())
 }

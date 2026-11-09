@@ -5409,7 +5409,7 @@ impl<'a> SectionReader<'a> {
                     "AcDbAnnotScaleObjectContextData"
                 };
                 ObjectContextKind::BlkRef {
-                    rotation: fields.f64(section, 50),
+                    rotation: fields.f64(section, 50).to_radians(),
                     insertion: fields.point3(section, 10),
                     scale_factor: Vector3::new(
                         fields.f64(section, 41),
@@ -5429,7 +5429,7 @@ impl<'a> SectionReader<'a> {
                 };
                 ObjectContextKind::Text {
                     horizontal_mode: fields.i16(section, 70),
-                    rotation: fields.f64(section, 50),
+                    rotation: fields.f64(section, 50).to_radians(),
                     insertion: fields.point2(section, 10),
                     alignment: fields.point2(section, 11),
                 }
@@ -10429,6 +10429,10 @@ impl<'a> SectionReader<'a> {
                         {
                             dimstyle.dimtxsty = text_style.name.clone();
                         }
+                    } else if let Some(text_style) = document.text_styles.get(&dimstyle.dimtxsty) {
+                        // Without group 340 DIMTXSTY keeps its default, Standard; a null
+                        // handle written to DWG is an AUDIT error.
+                        dimstyle.dimtxsty_handle = text_style.handle;
                     }
                     document.dim_styles.add_or_replace(dimstyle);
                     self.decoded_records = self.decoded_records.saturating_add(1);
@@ -16974,6 +16978,7 @@ impl<'a> SectionReader<'a> {
         let mut default_value = String::new();
         let mut insertion_point = PointReader::new();
         let mut height = 0.0;
+        let mut thickness = 0.0;
         let mut rotation = 0.0;
         let mut layer = String::from("0");
         let mut color = Color::ByLayer;
@@ -17087,6 +17092,11 @@ impl<'a> SectionReader<'a> {
                         );
                     }
                 }
+                39 => {
+                    if let Some(v) = pair.as_double() {
+                        thickness = v;
+                    }
+                }
                 40 => {
                     if let Some(h) = pair.as_double() {
                         height = h;
@@ -17122,6 +17132,7 @@ impl<'a> SectionReader<'a> {
         let mut attdef = AttributeDefinition::new(tag, prompt, default_value);
         attdef.insertion_point = insertion_point.get_point().unwrap_or(Vector3::zero());
         attdef.height = height;
+        attdef.thickness = thickness;
         attdef.rotation = rotation;
         attdef.lock_position = lock_position;
         if let Some(p) = alignment_point.get_point() {
@@ -17962,6 +17973,11 @@ impl<'a> SectionReader<'a> {
                 // flipped insert lands at the mirror position.
                 210 | 220 | 230 => {
                     normal.add_coordinate(&pair);
+                }
+                39 => {
+                    if let Some(v) = pair.as_double() {
+                        attrib.thickness = v;
+                    }
                 }
                 40 => {
                     if let Some(v) = pair.as_double() {
