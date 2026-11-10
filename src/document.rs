@@ -112,6 +112,9 @@ fn material_checker_texture(entries: &[XRecordEntry]) -> Option<MaterialTexture>
 }
 
 mod dim_header;
+mod handle_reservation;
+pub(crate) mod handle_usage;
+pub use handle_reservation::{HandleReservation, HandleReservationError, HandleReservationIter};
 mod legacy_header;
 mod semantic_inventory;
 pub(crate) use dim_header::{
@@ -4986,6 +4989,34 @@ impl CadDocument {
                 if let Some(name) = row.text_style_handle.and_then(|h| text_styles.get(&h)) {
                     row.text_style_name = name.clone();
                 }
+            }
+        }
+    }
+
+    /// An MLEADERSTYLE's name is its key in the ACAD_MLEADERSTYLE dictionary;
+    /// group 3 is only its description (AutoCAD's "Annotative" style has
+    /// `3 Standard`). Name every style the dictionary lists; the others keep the
+    /// name taken from group 3.
+    pub(crate) fn name_mleader_styles_from_dictionary(&mut self) {
+        let Some(ObjectType::Dictionary(root)) =
+            self.objects.get(&self.header.named_objects_dict_handle)
+        else {
+            return;
+        };
+        let Some(dictionary) = root.get("ACAD_MLEADERSTYLE") else {
+            return;
+        };
+        let Some(ObjectType::Dictionary(styles)) = self.objects.get(&dictionary) else {
+            return;
+        };
+        let names: Vec<(Handle, String)> = styles
+            .entries
+            .iter()
+            .map(|(name, handle)| (*handle, name.clone()))
+            .collect();
+        for (handle, name) in names {
+            if let Some(ObjectType::MultiLeaderStyle(style)) = self.objects.get_mut(&handle) {
+                style.name = name;
             }
         }
     }

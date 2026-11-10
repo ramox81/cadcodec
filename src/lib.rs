@@ -195,6 +195,7 @@
 //! | [`entities::acis`] | ACIS/SAT/SAB parsing, writing, and primitive builders |
 //! | [`notification`] | Structured parse notifications and recovery counts |
 //! | [`classes::arch`] | ACAD Arch entities, objects, constructors, and edits |
+//! | [`classes::civil`] | Civil 3D class catalog and TIN surface geometry |
 //!
 //! ## File Version Support
 //!
@@ -257,8 +258,10 @@ pub use types::{
 
 // Re-export entity types
 pub use entities::{
-    Arc, Circle, Ellipse, EmbeddedEntity, Entity, EntityType, Line, LwPolyline, MText, Point,
-    Polyline, ProxyGraphicRecord, ProxyGraphics, ProxyUnicodeText, Spline, Text,
+    Arc, CheckedProxyGraphicRecord, CheckedProxyGraphics, Circle, Ellipse, EmbeddedEntity, Entity,
+    EntityType, Line, LwPolyline, MText, Point, Polyline, ProxyGraphicCommand, ProxyGraphicError,
+    ProxyGraphicErrorReason, ProxyGraphicRecord, ProxyGraphics, ProxyLegacyText,
+    ProxyLegacyTextStyle, ProxyStyledUnicodeText, ProxyUnicodeText, Spline, Text,
 };
 
 // Re-export table types
@@ -269,10 +272,10 @@ pub use tables::{
 
 // Re-export document
 pub use document::{
-    BlockGraph, CadDocument, Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1,
-    SemanticNodeV1, SemanticObjectV1, SemanticPartV1, SemanticReferenceV1,
-    SemanticRelationshipKindV1, SemanticTableRecordV1, SolidHistoryGraph,
-    SEMANTIC_INVENTORY_VERSION,
+    BlockGraph, CadDocument, HandleReservation, HandleReservationError, HandleReservationIter,
+    Preview, PreviewFormat, SemanticEntityV1, SemanticInventoryV1, SemanticNodeV1,
+    SemanticObjectV1, SemanticPartV1, SemanticReferenceV1, SemanticRelationshipKindV1,
+    SemanticTableRecordV1, SolidHistoryGraph, SEMANTIC_INVENTORY_VERSION,
 };
 pub use layer_state::{LayerState, LayerStateLayer, LayerStateMask};
 
