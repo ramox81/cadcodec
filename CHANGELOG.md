@@ -2,6 +2,64 @@
 
 ### Unreleased
 
+- **Civil 3D pipe networks** - `ArchEntityData::pipe_ends` reads a pipe's
+  start and end, `structure_position` a structure's insertion point, and
+  `ArchObject::network_part_fields` a part definition's number fields
+  (inner diameter, wall thickness, structure diameter, ...) with their
+  units, in drawings from Civil 3D 2013 and 2018 on.
+
+- **Civil 3D alignments** - Masking regions read with any number of
+  regions (the list opens with three `BL 2` before its count). Free lines
+  between two fixed arcs are solved tangent to both, ending the first arc
+  and starting the second where the line meets them; composite solutions
+  keep their element joins, so each piece takes its own style component.
+
+- **Civil 3D spirals and curves** - Spiral records carry their shape:
+  `SpiralShape` (clothoid, Bloss, sinusoidal, biquadratic, cubic parabola,
+  Japanese cubic, sine half-wave) on `SpiralIn` / `SpiralOut`, each drawn
+  with its own geometry. Alignments read whole circles (by centre and
+  radius, or centre and start point) and arcs from a stored point onto the
+  next line.
+
+- **Civil 3D 2013 drawings** - Style display components, assembly
+  attachments and alignment elements read in drawings Civil 3D 2013 wrote:
+  their component and attachment tags carry 70 where later releases carry
+  80, some alignments open each element with `BS 0`, and subassemblies and
+  assemblies keep one null handle fewer before the assembly and baseline
+  style. Alignments solve arcs of a given radius fitted between a line and
+  a fixed arc, arcs that leave a line and end at a stored point, lines
+  through two stored points, and elements stored as a chain of points.
+  Curves are walked with the exact chord of each step, so small radii no
+  longer drift off their end point. `corridor_baselines` returns a
+  corridor's feature line groups per baseline, and
+  `corridor_feature_line_groups` now covers every baseline instead of the
+  first.
+
+- **Civil 3D labels** - `label_stations` keeps a label at station 0, which
+  the record stores in two bits, and negative stations before it, so a
+  data band labels the alignment start and stations before it. Text
+  components written without the component marker read their x/y offsets
+  and gap too.
+
+- **Civil 3D styles** - `ArchObject::display_components` reads a Civil 3D
+  style's display components (visibility, color, layer, linetype,
+  lineweight, linetype scale) in the order the style class defines them,
+  and `surface_contour_intervals` a surface style's minor and major contour
+  intervals. `TinSurface::boundary` and `TinSurface::contours` draw a
+  surface's outline and contours, `alignment_pieces` gives an alignment's
+  lines, curves and spirals, and `profile_pieces` a profile's tangents and
+  vertical curves, so each can take its own style component.
+  `alignment_masked_ranges` gives the station ranges an alignment hides,
+  `profile_view_axes` a profile view style's axis intervals, tick sizes and
+  text heights, `marker` a marker style's point shape and size,
+  `label_tick` / `label_line` a label's tick block and leader line,
+  `band_height` a data band's height, `code_set` / `code_set_defaults` a code
+  set's styles, and `corridor_feature_line_groups` a corridor's feature lines
+  grouped by region. `LabelText` gains the text component's attachment,
+  rotation, x/y offsets, gap and anchor point; station formats add the
+  `9+99.99` and whole-station options. Alignment geometry points keep every
+  join inside compound pieces and are named BP, EP, PI, PCC, PRC and SPI.
+
 - **Civil 3D classes** - `classes::civil` names the `AECC_*` classes:
   `kind_of` / `ArchEntityData::civil_kind` give alignments, profiles, profile
   views, TIN surfaces, corridors, assemblies, subassemblies, parcels, sample

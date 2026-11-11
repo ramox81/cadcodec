@@ -11,15 +11,19 @@ mod alignment;
 mod bits;
 mod corridor;
 mod labels;
+mod network;
 mod profile;
 mod sample_lines;
+mod style;
 mod subassembly;
 mod tin;
 
-pub use alignment::{AlignmentElement, AlignmentElementKind, GeometryPoint};
+pub use alignment::{AlignmentElement, AlignmentElementKind, AlignmentPiece, GeometryPoint, SpiralShape};
 pub use labels::{parse_format, property, LabelPart, LabelText};
-pub use profile::{ProfileViewFrame, Pvi};
+pub use network::PartField;
+pub use profile::{ProfilePiece, ProfileViewFrame, Pvi};
 pub use sample_lines::SampleLines;
+pub use style::{DisplayComponent, Marker, ViewAxes, ViewAxis};
 pub use subassembly::{AssemblyLayout, Attachment, SubassemblyShape};
 pub use tin::{TinSurface, TinTriangle, TinVertex};
 
@@ -220,6 +224,29 @@ impl ArchEntityData {
             .unwrap_or_default()
     }
 
+    /// Solved lines, curves and spirals of a Civil 3D alignment, each with
+    /// its points.
+    pub fn alignment_pieces(&self) -> Vec<(AlignmentPiece, Vec<Vector2>)> {
+        self.alignment_elements()
+            .map(|elements| alignment::pieces_by_kind(&elements))
+            .unwrap_or_default()
+    }
+
+    /// Station ranges a Civil 3D alignment hides (its masking).
+    pub fn alignment_masked_ranges(&self) -> Vec<(f64, f64)> {
+        let Some(first) = self.alignment_start_station() else {
+            return Vec::new();
+        };
+        let length: f64 = self
+            .alignment_polylines()
+            .first()
+            .map(|run| run.windows(2).map(|w| w[0].distance(&w[1])).sum())
+            .unwrap_or(0.0);
+        self.main_stream()
+            .map(|(data, start, end)| alignment::masked_ranges(data, start, end, first, first + length))
+            .unwrap_or_default()
+    }
+
     /// Geometry points (TS, SC, PC, ...) along the first solved run of a
     /// Civil 3D alignment.
     pub fn alignment_geometry_points(&self) -> Vec<GeometryPoint> {
@@ -287,6 +314,17 @@ impl ArchEntityData {
             .unwrap_or_default()
     }
 
+    /// Tangents and vertical curves of a Civil 3D profile in
+    /// station/elevation.
+    pub fn profile_pieces(&self) -> Vec<(ProfilePiece, Vec<Vector2>)> {
+        if self.civil_kind() != Some(CivilKind::Profile) {
+            return Vec::new();
+        }
+        self.main_stream()
+            .map(|(data, start, end)| profile::pieces(data, start, end))
+            .unwrap_or_default()
+    }
+
     /// PVIs of a Civil 3D design profile.
     pub fn profile_pvis(&self) -> Vec<Pvi> {
         if self.civil_kind() != Some(CivilKind::Profile) {
@@ -332,8 +370,9 @@ impl ArchEntityData {
         if self.civil_kind() != Some(CivilKind::Subassembly) {
             return None;
         }
+        let strings = self.decode().strings;
         let (data, start, end) = self.main_stream()?;
-        subassembly::find(data, start, end)
+        subassembly::find(data, start, end, &strings)
     }
 
     /// Handle of the assembly a Civil 3D subassembly belongs to.
@@ -341,8 +380,35 @@ impl ArchEntityData {
         if self.civil_kind() != Some(CivilKind::Subassembly) {
             return None;
         }
-        // Body handles: two nulls, then the owning assembly.
-        self.decode().handles.get(2).copied().filter(|h| *h != 0)
+        // Body handles: two nulls (one in Civil 3D 2013), then the owning
+        // assembly.
+        self.decode().handles.iter().take(3).skip(1).copied().find(|h| *h != 0)
+    }
+
+    /// Start and end of a Civil 3D pipe (`AECC_PIPE`), as stored.
+    pub fn pipe_ends(&self) -> Option<(crate::types::Vector3, crate::types::Vector3)> {
+        if self.dxf_name != "AECC_PIPE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        network::pipe_ends(data, start, end)
+    }
+
+    /// Insertion point of a Civil 3D structure (`AECC_STRUCTURE`), found
+    /// inside the extents its cached preview records.
+    pub fn structure_position(&self) -> Option<crate::types::Vector3> {
+        if self.dxf_name != "AECC_STRUCTURE" {
+            return None;
+        }
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for p in self.profiles.iter().flatten() {
+            min = [min[0].min(p.x), min[1].min(p.y)];
+            max = [max[0].max(p.x), max[1].max(p.y)];
+        }
+        (min[0] <= max[0]).then_some(())?;
+        let (data, start, end) = self.main_stream()?;
+        network::structure_position(data, start, end, min, max)
     }
 
     /// Baseline point of a Civil 3D assembly and where each of its
@@ -360,6 +426,29 @@ impl ArchEntityData {
         let handles = self.decode().handles;
         let (data, start, end) = self.main_stream()?;
         subassembly::assembly_layout(data, start, end, &handles, (min, max))
+    }
+
+    /// Feature lines of a Civil 3D corridor per baseline, each grouped by
+    /// point code in the order of the corridor's code list.
+    pub fn corridor_baselines(&self) -> Vec<Vec<Vec<Vec<(f64, crate::types::Vector3)>>>> {
+        if self.civil_kind() != Some(CivilKind::Corridor) {
+            return Vec::new();
+        }
+        self.main_stream()
+            .map(|(data, start, end)| corridor::baselines(data, start, end))
+            .unwrap_or_default()
+    }
+
+    /// Feature lines of a Civil 3D corridor grouped by point code, in the
+    /// order of the corridor's code list (the feature line styles its body
+    /// references follow the same order).
+    pub fn corridor_feature_line_groups(&self) -> Vec<Vec<Vec<(f64, crate::types::Vector3)>>> {
+        if self.civil_kind() != Some(CivilKind::Corridor) {
+            return Vec::new();
+        }
+        self.main_stream()
+            .map(|(data, start, end)| corridor::feature_line_groups(data, start, end))
+            .unwrap_or_default()
     }
 
     /// Raw record and the bit range of its class body.
@@ -385,6 +474,132 @@ impl ArchObject {
         }
         let (data, start, end) = self.main_stream()?;
         labels::text_component(data, start, end)
+    }
+
+    /// Display components of a Civil 3D object style, in the order the
+    /// style class defines them: every component of the plan view, then the
+    /// model view and the other view directions.
+    ///
+    /// `is_layer` tells layer handles apart, which places each component's
+    /// layer and linetype among the style's references.
+    pub fn display_components(&self, is_layer: impl Fn(u64) -> bool) -> Vec<DisplayComponent> {
+        if self.civil_kind() != Some(CivilObjectKind::Style) {
+            return Vec::new();
+        }
+        let handles = self.decode().handles;
+        self.main_stream()
+            .map(|(data, start, end)| style::components(data, start, end, &handles, is_layer))
+            .unwrap_or_default()
+    }
+
+    /// Plotted length and angle (radians, to the anchor's direction) of a
+    /// Civil 3D label line component.
+    pub fn label_line(&self) -> Option<(f64, f64)> {
+        if self.dxf_name != "AECC_LABEL_RADIAL_LINE_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        labels::line_component(data, start, end)
+    }
+
+    /// Plotted height of a Civil 3D profile view data band.
+    pub fn band_height(&self) -> Option<f64> {
+        if self.dxf_name != "AECC_PROFILE_VIEW_DATA_BAND_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        style::keyed(&style::keyed_doubles(data, start, end), style::BAND_HEIGHT.0, style::BAND_HEIGHT.1).filter(|v| *v > 0.0)
+    }
+
+    /// Block and plotted size of a Civil 3D label tick style.
+    pub fn label_tick(&self) -> Option<(u64, f64)> {
+        if self.dxf_name != "AECC_LABEL_TICK_STYLE" {
+            return None;
+        }
+        // The block is the style's last non-null reference.
+        let block = self.decode().handles.iter().rev().copied().find(|h| *h != 0)?;
+        let (data, start, end) = self.main_stream()?;
+        Some((block, style::tick_size(data, start, end)?))
+    }
+
+    /// Axis intervals, tick sizes and text heights of a Civil 3D profile
+    /// view style.
+    pub fn profile_view_axes(&self) -> Option<ViewAxes> {
+        if self.dxf_name != "AECC_PROFILE_VIEW_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        style::view_axes(data, start, end)
+    }
+
+    /// Point style of a Civil 3D marker style (`AECC_ROADWAYMARKER_STYLE`).
+    pub fn marker(&self) -> Option<Marker> {
+        if self.dxf_name != "AECC_ROADWAYMARKER_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        style::marker(data, start, end)
+    }
+
+    /// Codes of a Civil 3D code set style (`AECC_ROADWAY_STYLE_SET`) with
+    /// the style each one draws with: point codes map to marker styles, link
+    /// codes to link styles and area codes to shape styles. Each code is
+    /// four strings (code, name, description, blank) and five references
+    /// (material, style, label style, feature line style, blank); the
+    /// leading reference groups without strings are the defaults.
+    pub fn code_set(&self) -> Vec<(String, u64)> {
+        self.code_set_parts().1
+    }
+
+    /// Default styles of a Civil 3D code set style: for uncoded markers,
+    /// links and shapes, then for codes the set does not list.
+    pub fn code_set_defaults(&self) -> Vec<u64> {
+        self.code_set_parts().0
+    }
+
+    fn code_set_parts(&self) -> (Vec<u64>, Vec<(String, u64)>) {
+        if self.dxf_name != "AECC_ROADWAY_STYLE_SET" {
+            return (Vec::new(), Vec::new());
+        }
+        let decoded = self.decode();
+        let strings = &decoded.strings;
+        let Some(first) = (4..strings.len().saturating_sub(1))
+            .find(|&i| !strings[i].is_empty() && strings[i] == strings[i + 1])
+        else {
+            return (Vec::new(), Vec::new());
+        };
+        let codes: Vec<&String> = strings[first..].chunks(4).map(|c| &c[0]).collect();
+        let groups: Vec<&[u64]> = decoded.handles.chunks(5).filter(|g| g.len() == 5).collect();
+        let Some(defaults) = groups.len().checked_sub(codes.len()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let entries = codes
+            .into_iter()
+            .zip(&groups[defaults..])
+            .map(|(code, group)| (code.clone(), group[1]))
+            .collect();
+        (groups[..defaults].iter().map(|g| g[1]).collect(), entries)
+    }
+
+    /// `(minor, major)` contour intervals of a Civil 3D surface style.
+    pub fn surface_contour_intervals(&self) -> Option<(f64, f64)> {
+        if self.dxf_name != "AECC_SURFACE_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        style::contour_intervals(data, start, end)
+    }
+
+    /// Number fields of a pipe network part definition
+    /// (`AECC_NETWORK_PART_DEF`): sizes, thicknesses and the like.
+    pub fn network_part_fields(&self) -> Vec<PartField> {
+        if self.dxf_name != "AECC_NETWORK_PART_DEF" {
+            return Vec::new();
+        }
+        let strings = self.decode().strings;
+        self.main_stream()
+            .map(|(data, start, end)| network::part_fields(data, start, end, &strings))
+            .unwrap_or_default()
     }
 
     /// UTF-16 strings the record stores inline (label formats and the
