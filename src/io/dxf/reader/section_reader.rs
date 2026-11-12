@@ -722,16 +722,13 @@ impl ClassDxfFields {
 fn class_dxf_render_settings(
     fields: &mut ClassDxfFields,
     has_predefined_in_base: bool,
-    rapid_rt: bool,
     version: DxfVersion,
 ) -> RenderSettings {
     let section = "AcDbRenderSettings";
     // Same class-version normalisation as the DWG reader.
     let stored_version = fields.i32(section, 90);
     RenderSettings {
-        class_version: if rapid_rt && version == DxfVersion::AC1027 {
-            stored_version + 1
-        } else if !rapid_rt && version >= DxfVersion::AC1027 {
+        class_version: if has_predefined_in_base && version >= DxfVersion::AC1027 {
             stored_version - 1
         } else {
             stored_version
@@ -5959,11 +5956,10 @@ impl<'a> SectionReader<'a> {
             "RENDERSETTINGS" => ClassObjectData::RenderSettings(class_dxf_render_settings(
                 &mut fields,
                 version >= DxfVersion::AC1027,
-                false,
                 version,
             )),
             "MENTALRAYRENDERSETTINGS" => {
-                let base = class_dxf_render_settings(&mut fields, false, false, version);
+                let base = class_dxf_render_settings(&mut fields, false, version);
                 let section = "AcDbMentalRayRenderSettings";
                 ClassObjectData::MentalRayRenderSettings(MentalRayRenderSettings {
                     base,
@@ -6025,7 +6021,7 @@ impl<'a> SectionReader<'a> {
             }
             "RAPIDRTRENDERSETTINGS" => {
                 let section = "AcDbRapidRTRenderSettings";
-                let mut base = class_dxf_render_settings(&mut fields, false, true, version);
+                let mut base = class_dxf_render_settings(&mut fields, false, version);
                 let version = fields.i32(section, 90);
                 let render_target = fields.i32(section, 70);
                 let render_level = fields.i32(section, 90);

@@ -2,6 +2,43 @@
 
 ### Unreleased
 
+- **Civil 3D station equations, design speeds and sites** -
+  `ArchEntityData::alignment_station_equations` and
+  `alignment_design_speeds` read an alignment's equations (raw station,
+  back, ahead, increasing) and speeds; `display_station` gives the
+  station Civil 3D shows past the equations. `ArchObject::topology` reads
+  the graph a site container or alignment companion keeps (edges through
+  nodes with the faces on both sides); `Topology::face_polylines` gives a
+  parcel's boundary.
+
+- **Civil 3D offset and connected alignments** - Offset alignments draw
+  their spirals (the parent spiral moved sideways over the part it
+  follows) and their widening transitions (curve – line – curve, curve –
+  reverse curve, curve – curve – reverse curve); connected alignments draw
+  their three-centered arcs.
+
+- **Civil 3D profiles** - Layout profiles read every entity Civil 3D
+  writes: symmetric parabolas by length or K, circular curves by length,
+  radius or through a point, asymmetric parabolas, parabolas through three
+  points, between two points with K, radius or a grade, parabolas hanging
+  from the tangent before, tangents leaving a curve towards a point, and
+  free tangents between two curves. `ProfilePiece` gains `Circular` and
+  `AsymmetricParabola`.
+
+- **Civil 3D alignment elements** - Alignments read more of the element
+  records Civil 3D 2018 and later write: the first spiral of a group kept
+  as separate elements, headers with any parameter-lock byte, compound and
+  placed spirals, free spirals and spiral-spiral groups between lines,
+  spiral-curve groups ending at a point, spiral-line and line-spiral
+  groups, spiral-spiral and spiral-line-spiral groups between two curves,
+  reverse curves with spirals through one or two points, long
+  spiral-curve-spiral-curve-spiral groups from their TS, fillets through a
+  point, curves ending at a point or along a direction, lines to or from a
+  point, and open curves by their centre. Groups between curves solve
+  where they leave the first curve. `FreeSpiralLineSpiral` is now
+  `FreeSpiralSpiralCurves { ratio }`; `Circle` carries `closed` and
+  `clockwise`.
+
 - **Civil 3D pipe networks** - `ArchEntityData::pipe_ends` reads a pipe's
   start and end, `structure_position` a structure's insertion point, and
   `ArchObject::network_part_fields` a part definition's number fields

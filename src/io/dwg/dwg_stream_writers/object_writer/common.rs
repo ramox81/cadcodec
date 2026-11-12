@@ -315,7 +315,20 @@ impl<'a> DwgObjectWriter<'a> {
     /// never added, or renamed a layer in place so the entities still carry the
     /// old name. Fall back to layer "0", which every drawing has and which
     /// cannot be renamed or deleted, so the reference stays resolvable.
-    fn entity_layer_handle(&self, layer: &str) -> Handle {
+    ///
+    /// Every entity asks, and a table lookup normalizes the name into a new
+    /// string, so the answer is kept per name as written: the document is
+    /// borrowed for the whole write and cannot change under the cache.
+    fn entity_layer_handle(&mut self, layer: &str) -> Handle {
+        if let Some(&handle) = self.entity_layer_handles.get(layer) {
+            return handle;
+        }
+        let handle = self.resolve_entity_layer_handle(layer);
+        self.entity_layer_handles.insert(layer.to_owned(), handle);
+        handle
+    }
+
+    fn resolve_entity_layer_handle(&self, layer: &str) -> Handle {
         if let Some(entry) = self.document.layers.get(layer) {
             if !entry.handle.is_null() {
                 return entry.handle;
@@ -746,6 +759,33 @@ impl<'a> DwgObjectWriter<'a> {
             false,
             false,
             None,
+            false,
+        );
+    }
+
+    /// As [`write_common_non_entity_data_eed`], but each extra EED block is
+    /// the whole record of its application: it replaces the source record
+    /// instead of being merged into it.
+    pub(super) fn write_common_non_entity_data_replacing_eed(
+        &mut self,
+        type_code: i16,
+        handle: Handle,
+        owner_handle: Handle,
+        reactors: &[Handle],
+        xdictionary_handle: &Option<Handle>,
+        extra_eed: Vec<(u64, Vec<u8>)>,
+    ) {
+        self.write_common_non_entity_data_eed_internal(
+            type_code,
+            handle,
+            owner_handle,
+            reactors,
+            xdictionary_handle,
+            extra_eed,
+            false,
+            false,
+            None,
+            true,
         );
     }
 
@@ -767,6 +807,7 @@ impl<'a> DwgObjectWriter<'a> {
             true,
             false,
             None,
+            false,
         );
     }
 
@@ -791,6 +832,7 @@ impl<'a> DwgObjectWriter<'a> {
             false,
             true,
             Some(has_ds_data),
+            false,
         );
     }
 
@@ -805,6 +847,7 @@ impl<'a> DwgObjectWriter<'a> {
         relative_owner: bool,
         complete_common: bool,
         has_ds_data_override: Option<bool>,
+        replace_extra: bool,
     ) {
         // ── writeCommonData portion ──
 
@@ -855,7 +898,10 @@ impl<'a> DwgObjectWriter<'a> {
                 },
             );
             if let (Some(application), Some(values)) = (application, values) {
-                if eed.get_record(&application.name).is_none() {
+                if replace_extra {
+                    // The block is the application's whole record.
+                    eed.remove_record(&application.name);
+                } else if eed.get_record(&application.name).is_none() {
                     if let Some(values) = self.existing_xdata_values(handle, &application.name) {
                         let mut source = crate::xdata::ExtendedDataRecord::new(&application.name);
                         source.values = values;

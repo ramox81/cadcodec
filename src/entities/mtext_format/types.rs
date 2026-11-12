@@ -171,10 +171,13 @@ impl MTextParagraphAlignment {
             'c' => MTextParagraphAlignment::Center,
             'j' => MTextParagraphAlignment::Justified,
             'd' => MTextParagraphAlignment::Distributed,
-            // ACAD serializes the paragraph *Justify* option as `\pq*` (the
-            // `*` that means "reset" in the other sub-codes), so a `q*` reads as
-            // justified rather than an alignment reset.
-            '*' => MTextParagraphAlignment::Justified,
+            // `\pq*` is the alignment *reset*: like the other sub-codes, `*`
+            // means "go back to the default", so the paragraph inherits the
+            // entity's attachment alignment. Civil 3D and survey exporters
+            // write it to cancel a preceding `\pqc;` or `\pqr;` block, and
+            // those labels stay centred in AutoCAD. Reading it as Justified
+            // instead left every following single-line paragraph ragged-left.
+            '*' => MTextParagraphAlignment::Default,
             _ => MTextParagraphAlignment::Default,
         }
     }
@@ -904,9 +907,7 @@ pub struct MTextDocument {
 /// Returns `true` if the paragraph properties contain any non-default values
 /// that should be serialized into `\p...;` format.
 fn para_has_props(p: &ParagraphProperties) -> bool {
-    p.alignment
-        .as_ref()
-        .map_or(false, |a| !matches!(a, MTextParagraphAlignment::Default))
+    p.alignment.is_some()
         || p.first_line_indent.is_some()
         || p.left_margin.is_some()
         || p.right_margin.is_some()
@@ -1012,7 +1013,8 @@ impl MTextDocument {
                         MTextParagraphAlignment::Center => result.push_str("qc"),
                         MTextParagraphAlignment::Justified => result.push_str("qj"),
                         MTextParagraphAlignment::Distributed => result.push_str("qd"),
-                        MTextParagraphAlignment::Default => {}
+                        // The reset back to the attachment alignment.
+                        MTextParagraphAlignment::Default => result.push_str("q*"),
                     }
                 }
                 if let Some(v) = para_props.first_line_indent {

@@ -4721,17 +4721,15 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         let flags = crate::io::dxf::spline_flags::write(spline);
         self.writer.write_i16(70, flags)?;
 
-        let (clamped_cps, clamped_knots) = spline
-            .periodic_to_clamped_cubic()
-            .map(|(cps, kts)| (Some(cps), Some(kts)))
-            .unwrap_or((None, None));
-        let control_points = clamped_cps.as_deref().unwrap_or(&spline.control_points);
-        let knots = clamped_knots.as_deref().unwrap_or(&spline.knots);
+        let clamped = spline.clamp_periodic_cubic();
+        let (control_points, knots, weights) = clamped.as_ref().map_or(
+            (&spline.control_points, &spline.knots, &spline.weights),
+            |value| (&value.points, &value.knots, &value.weights),
+        );
 
         self.writer.write_i16(71, spline.degree as i16)?;
         self.writer.write_i16(72, knots.len() as i16)?;
-        self.writer
-            .write_i16(73, control_points.len() as i16)?;
+        self.writer.write_i16(73, control_points.len() as i16)?;
         self.writer.write_i16(74, spline.fit_points.len() as i16)?;
 
         // Knot / control-point / fit tolerances (round-trip the stored values).
@@ -4756,7 +4754,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         for (i, point) in control_points.iter().enumerate() {
             self.writer.write_point3d(10, *point)?;
             if spline.flags.rational {
-                let w = spline.weights.get(i).copied().unwrap_or(1.0);
+                let w = weights.get(i).copied().unwrap_or(1.0);
                 self.writer.write_double(41, w)?;
             }
         }
@@ -6757,11 +6755,8 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         &mut self,
         value: &crate::objects::RenderSettings,
         write_has_predefined: bool,
-        rapid_rt: bool,
     ) -> Result<()> {
-        let class_version = if rapid_rt && self.dxf_version == DxfVersion::AC1027 {
-            value.class_version - 1
-        } else if !rapid_rt && self.dxf_version >= DxfVersion::AC1027 {
+        let class_version = if write_has_predefined && self.dxf_version >= DxfVersion::AC1027 {
             value.class_version + 1
         } else {
             value.class_version
@@ -7174,11 +7169,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             }
             Data::RenderSettings(value) => {
                 self.write_class_object_header(object, "AcDbRenderSettings")?;
-                self.write_render_settings_dxf(value, true, false)
+                self.write_render_settings_dxf(value, true)
             }
             Data::MentalRayRenderSettings(value) => {
                 self.write_class_object_header(object, "AcDbRenderSettings")?;
-                self.write_render_settings_dxf(&value.base, false, false)?;
+                self.write_render_settings_dxf(&value.base, false)?;
                 self.writer.write_subclass("AcDbMentalRayRenderSettings")?;
                 self.writer.write_i32(90, value.version)?;
                 self.writer.write_i32(90, value.sampling_min)?;
@@ -7233,7 +7228,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             }
             Data::RapidRtRenderSettings(value) => {
                 self.write_class_object_header(object, "AcDbRenderSettings")?;
-                self.write_render_settings_dxf(&value.base, false, true)?;
+                self.write_render_settings_dxf(&value.base, false)?;
                 self.writer.write_subclass("AcDbRapidRTRenderSettings")?;
                 self.writer.write_i32(90, value.version)?;
                 self.writer.write_i32(70, value.render_target)?;
@@ -11964,18 +11959,25 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             if f & 0x20 != 0 {
                 self.writer.write_double(140, style.text_height)?;
             }
-            for (color_bit, lw_bit, (color_code, weight_code, visibility_code), border) in [
-                (0x40, 0x400, (69, 279, 289), &style.top_border),
-                (0x80, 0x800, (65, 275, 285), &style.right_border),
-                (0x100, 0x1000, (66, 276, 286), &style.bottom_border),
-                (0x200, 0x2000, (68, 278, 288), &style.left_border),
-            ] {
-                if f & color_bit != 0 {
+            // Each edge's colour, line weight and visibility have their own
+            // legacy bits (0x40, 0x400, 0x4000, shifted by the edge).
+            for (i, ((color_code, weight_code, visibility_code), border)) in [
+                ((69, 279, 289), &style.top_border),
+                ((65, 275, 285), &style.right_border),
+                ((66, 276, 286), &style.bottom_border),
+                ((68, 278, 288), &style.left_border),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if f & (0x40 << i) != 0 {
                     self.write_table_cell_color(color_code, border.color)?;
                 }
-                if f & lw_bit != 0 {
+                if f & (0x400 << i) != 0 {
                     self.writer
                         .write_i16(weight_code, border.line_weight.value())?;
+                }
+                if f & (0x4000 << i) != 0 {
                     self.writer.write_bool(visibility_code, !border.invisible)?;
                 }
             }

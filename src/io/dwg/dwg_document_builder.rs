@@ -612,7 +612,7 @@ struct RecordFailure {
     code: &'static str,
     handle: u64,
     offset: usize,
-    type_code: i16,
+    raw_type_code: i16,
     /// True when a failed auxiliary payload was retained as a validated raw record.
     recoverable: bool,
     message: String,
@@ -1011,6 +1011,7 @@ impl DwgDocumentBuilder {
         let mut decoded_pass2 = 0usize;
         let mut diagnostics = Vec::new();
         let mut leader_diagnostics = Vec::new();
+        let mut preserved_diagnostics = Vec::new();
         let total_handles = handles.len();
         self.report_progress(55);
 
@@ -1102,7 +1103,7 @@ impl DwgDocumentBuilder {
         let mut unused_records = 0usize;
         for result in catalog_results {
             match result {
-                Ok((handle, _, _, type_code)) if is_unused_type(type_code) => {
+                Ok((handle, _, raw_type_code, type_code)) if is_unused_type(type_code) => {
                     unused_records += 1;
                     if unused_records == 1 {
                         let mut diagnostic = ReadDiagnostic::new(
@@ -1114,7 +1115,8 @@ impl DwgDocumentBuilder {
                         );
                         diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                         diagnostic.record_handle = Some(handle);
-                        diagnostic.record_type = Some(type_code.to_string());
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut diagnostics, diagnostic);
                     }
                 }
@@ -1159,7 +1161,7 @@ impl DwgDocumentBuilder {
         let pass1_started = web_time::Instant::now();
         let capture_raw_pass1 = std::env::var_os("ACADRUST_RAW_ALL").is_some();
 
-        for &(handle, offset, _, type_code) in &record_catalog {
+        for &(handle, offset, raw_type_code, type_code) in &record_catalog {
             if is_table_type(type_code) {
                 let (_, mut reader) = match self.obj_reader.read_record_at(offset) {
                     Ok(record) => record,
@@ -1180,7 +1182,8 @@ impl DwgDocumentBuilder {
                         diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                         diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                         diagnostic.record_handle = Some(handle);
-                        diagnostic.record_type = Some(type_code.to_string());
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut diagnostics, diagnostic);
                         continue;
                     }
@@ -1239,7 +1242,8 @@ impl DwgDocumentBuilder {
                                 Some("object-section-byte".to_string());
                             diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                             diagnostic.record_handle = Some(handle);
-                            diagnostic.record_type = Some(type_code.to_string());
+                            diagnostic.record_type =
+                                Some(Self::record_type_name(&class_names, raw_type_code));
                             push_read_diagnostic(&mut diagnostics, diagnostic);
                             continue;
                         }
@@ -1483,7 +1487,8 @@ impl DwgDocumentBuilder {
                         diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                         diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                         diagnostic.record_handle = Some(handle);
-                        diagnostic.record_type = Some(type_code.to_string());
+                        diagnostic.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut diagnostics, diagnostic);
                     }
                 }
@@ -2312,7 +2317,7 @@ impl DwgDocumentBuilder {
                                     code: "record-read-failed",
                                     handle,
                                     offset,
-                                    type_code,
+                                    raw_type_code,
                                     recoverable: false,
                                     message: format!(
                                         "Could not read record at handle {handle:#X}, type_code={type_code}: {error}"
@@ -2362,7 +2367,8 @@ impl DwgDocumentBuilder {
                         warning.source_offset_basis = Some("object-section-byte".into());
                         warning.section = Some("AcDb:AcDbObjects".into());
                         warning.record_handle = Some(handle);
-                        warning.record_type = Some(type_code.to_string());
+                        warning.record_type =
+                            Some(Self::record_type_name(&class_names, raw_type_code));
                         push_read_diagnostic(&mut chunk.leader_diagnostics, warning);
                     }
                     if let Some(message) = reader
@@ -2460,7 +2466,7 @@ impl DwgDocumentBuilder {
                             },
                             handle,
                             offset,
-                            type_code,
+                            raw_type_code,
                             recoverable,
                             message: if recoverable {
                                 let name = Self::unknown_object_type_name(&class_names, raw_type_code);
@@ -2595,8 +2601,13 @@ impl DwgDocumentBuilder {
                     diagnostic.source_offset_basis = Some("object-section-byte".to_string());
                     diagnostic.section = Some("AcDb:AcDbObjects".to_string());
                     diagnostic.record_handle = Some(failure.handle);
-                    diagnostic.record_type = Some(failure.type_code.to_string());
-                    push_read_diagnostic(&mut diagnostics, diagnostic);
+                    diagnostic.record_type =
+                        Some(Self::record_type_name(&class_names, failure.raw_type_code));
+                    if failure.recoverable {
+                        push_read_diagnostic(&mut preserved_diagnostics, diagnostic);
+                    } else {
+                        push_read_diagnostic(&mut diagnostics, diagnostic);
+                    }
                 }
                 for (warning_handle, message) in chunk.output.warnings.drain(..) {
                     self.notifications
@@ -2622,6 +2633,12 @@ impl DwgDocumentBuilder {
                 pass2_records.len(),
                 worker_count,
             );
+        }
+        // Strict reads use the first diagnostic to explain a skipped record.
+        // Append preserved-object notices after the record failures so that
+        // they cannot use the failures' diagnostic budget.
+        for diagnostic in preserved_diagnostics {
+            push_read_diagnostic(&mut diagnostics, diagnostic);
         }
         // Every record is decoded; the post-pass reads no section bytes.
         self.obj_reader.release_section();
@@ -7628,58 +7645,87 @@ impl DwgDocumentBuilder {
                                 // the historical one-bit base (default flag),
                                 // while the generic ODA §20.4.89 layout has a
                                 // preceding file-to-extension-dictionary bit.
-                                // Try the native form first and fall back to
-                                // the two-bit ODA form when its bounded decode
-                                // rejects the payload (issue134/native reA).
+                                // A record is in the form whose decode ends
+                                // exactly at the end of its data. The wrong
+                                // form can decode without an error: a two-bit
+                                // record of a default context reads as a
+                                // native one with no leader roots and leaves
+                                // most of the record unread.
+                                let version = self.obj_reader.version();
+                                let dxf_version = self.obj_reader.dxf_version();
                                 let mut legacy = reader.clone();
                                 let legacy_is_default = legacy.read_bit();
                                 let legacy_scale = legacy.read_handle();
                                 let legacy_context =
                                     entities::read_multileader_annotation_context(
                                         &mut legacy,
-                                        self.obj_reader.version(),
-                                        self.obj_reader.dxf_version(),
+                                        version,
+                                        dxf_version,
                                         true,
                                     );
                                 let legacy_ok = legacy.check_error().is_ok();
+                                let legacy_fits =
+                                    legacy_ok && legacy.main_remaining_bits() == 0;
+                                let oda = if legacy_fits {
+                                    None
+                                } else {
+                                    let mut oda = reader.clone();
+                                    let has_file_to_extension_dictionary =
+                                        read_oda_context_file_dictionary_flag(
+                                            &mut oda, version,
+                                        );
+                                    let is_default = oda.read_bit();
+                                    let scale = oda.read_handle();
+                                    let context =
+                                        entities::read_multileader_annotation_context(
+                                            &mut oda,
+                                            version,
+                                            dxf_version,
+                                            true,
+                                        );
+                                    let oda_fits = oda.check_error().is_ok()
+                                        && oda.main_remaining_bits() == 0;
+                                    // Without an exact fit on either side keep
+                                    // the native reading when it has no error.
+                                    (oda_fits || !legacy_ok).then_some((
+                                        oda,
+                                        has_file_to_extension_dictionary,
+                                        is_default,
+                                        scale,
+                                        context,
+                                    ))
+                                };
                                 let (
                                     has_file_to_extension_dictionary,
                                     is_default,
                                     scale,
                                     context,
-                                ) = if legacy_ok {
-                                    *reader = legacy;
-                                    uses_legacy_mleader_context_base = true;
-                                    (
-                                        true,
-                                        legacy_is_default,
-                                        legacy_scale,
-                                        legacy_context,
-                                    )
-                                } else {
-                                    // ODA §20.4.89 layout: the dictionary bit
-                                    // is present. Native AutoCAD records take
-                                    // the branch above and never reach here.
-                                    let has_file_to_extension_dictionary =
-                                        read_oda_context_file_dictionary_flag(
-                                            &mut reader,
-                                            self.obj_reader.version(),
-                                        );
-                                    let is_default = reader.read_bit();
-                                    let scale = reader.read_handle();
-                                    let context =
-                                        entities::read_multileader_annotation_context(
-                                            &mut reader,
-                                            self.obj_reader.version(),
-                                            self.obj_reader.dxf_version(),
-                                            true,
-                                        );
-                                    (
+                                ) = match oda {
+                                    Some((
+                                        oda,
                                         has_file_to_extension_dictionary,
                                         is_default,
                                         scale,
                                         context,
-                                    )
+                                    )) => {
+                                        *reader = oda;
+                                        (
+                                            has_file_to_extension_dictionary,
+                                            is_default,
+                                            scale,
+                                            context,
+                                        )
+                                    }
+                                    None => {
+                                        *reader = legacy;
+                                        uses_legacy_mleader_context_base = true;
+                                        (
+                                            true,
+                                            legacy_is_default,
+                                            legacy_scale,
+                                            legacy_context,
+                                        )
+                                    }
                                 };
                                 Some((
                                     crate::objects::ObjectContextKind::MLeader(
@@ -8336,6 +8382,14 @@ impl DwgDocumentBuilder {
             raw_dwg_version: Some(self.obj_reader.dxf_version()),
         };
         Some((object, common, scale))
+    }
+
+    /// Name a record's type for diagnostics: the DXF name of a fixed type,
+    /// otherwise its class name, as for an unsupported object.
+    fn record_type_name(class_names: &ClassNames, raw_type_code: i16) -> String {
+        fixed_type_name(raw_type_code)
+            .map(str::to_string)
+            .unwrap_or_else(|| Self::unknown_object_type_name(class_names, raw_type_code))
     }
 
     /// Name an unsupported object by its CLASSES-section dxfname when the
