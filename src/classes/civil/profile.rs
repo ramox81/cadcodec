@@ -59,10 +59,18 @@ enum Entity {
 }
 
 struct Record {
+    /// Kind prefix and constraint code.
+    code: (u32, i32),
     id: i32,
     previous: i32,
     next: i32,
     entity: Entity,
+    /// Crest (`true`) or sag where the record says.
+    crest: Option<bool>,
+    /// A parabola's minimum K values from the list (-1 read as `None`).
+    minimum_k: Option<[Option<f64>; 3]>,
+    /// Where the fields this crate reads end.
+    end: usize,
 }
 
 /// `a` of a parabola (elevation'' = 2a) from K or a radius (R = 100 K).
@@ -73,6 +81,14 @@ fn parabola_a(param: i32, value: f64, sag: bool) -> Option<f64> {
         _ => return None,
     };
     (k > 0.0 && k.is_finite()).then(|| if sag { 1.0 } else { -1.0 } / (200.0 * k))
+}
+
+fn sag_or_crest(flag: i32) -> Option<bool> {
+    match flag {
+        0x1001 => Some(true),
+        0x1000 => Some(false),
+        _ => None,
+    }
 }
 
 fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
@@ -105,6 +121,7 @@ fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
     };
     let positive = |v: f64| (v.is_finite() && v > 0.0).then_some(v);
     let zero = |bits: &mut Bits| (bits.bit_double()? == 0.0).then_some(());
+    let mut crest = None;
     let entity = match (prefix, constraint) {
         (2, 0) => Entity::Tangent(point(&mut bits)?, point(&mut bits)?),
         (2, 4) => Entity::Dependent(Some(point(&mut bits)?)),
@@ -129,15 +146,16 @@ fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
         (6, 13) => {
             zero(&mut bits)?;
             let (a, b) = (point(&mut bits)?, point(&mut bits)?);
-            let sag = bits.bit_long()? == 0x1000;
+            let flag = bits.bit_long()?;
+            crest = sag_or_crest(flag);
             let param = bits.bit_long()?;
-            let k = parabola_a(param, bits.bit_double()?, sag)?;
+            let k = parabola_a(param, bits.bit_double()?, flag == 0x1000)?;
             Entity::Curve(CurveDef::ParabolaTwoPoints(a, b, k))
         }
         (6, 32) => {
             zero(&mut bits)?;
             let through = point(&mut bits)?;
-            bits.bit_long()?;
+            crest = sag_or_crest(bits.bit_long()?);
             let param = bits.bit_long()?;
             let a = parabola_a(param, bits.bit_double()?, true)?;
             Entity::Curve(CurveDef::ParabolaFloating(through, a))
@@ -158,10 +176,14 @@ fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
         _ => return None,
     };
     Some(Record {
+        code: (prefix, constraint),
         id,
         previous,
         next,
         entity,
+        crest,
+        minimum_k: None,
+        end: bits.pos,
     })
 }
 
@@ -403,33 +425,140 @@ struct Segment {
     shape: Shape,
 }
 
-/// The entities of a design profile in link order, each resolved: fixed
-/// tangents and curves stand on their points, a free curve sits at the
-/// PVI of the tangents beside it, a floating curve hangs from the tangent
-/// before it, a floating tangent leaves the curve before it towards its
-/// point, a free tangent touches the curves on both sides.
-fn design(data: &[u8], start: usize, end: usize) -> Option<Vec<Segment>> {
-    let records: Vec<Record> = (start..end).filter_map(|pos| record_at(data, pos, end)).collect();
-    // The longest chain from a first entity; a stray header can carry
-    // plausible ids.
-    let mut best: Vec<&Record> = Vec::new();
-    for first in records.iter().filter(|r| r.previous == 0) {
-        let mut chain = vec![first];
-        while chain.len() <= records.len() {
-            let next_id = chain.last().unwrap().next;
-            match records.iter().find(|r| next_id != 0 && r.id == next_id) {
-                Some(r) if !chain.iter().any(|c| c.id == r.id) => chain.push(r),
+/// The entity list at `pos`: `BL n`, then n records end to end (each its
+/// 11-bit kind prefix, the record, and the fields after it: 4 bits after a
+/// tangent, the parabola tail below after a parabola), IDs distinct and
+/// links inside the list.
+fn record_list_at(data: &[u8], pos: usize, end: usize) -> Option<Vec<Record>> {
+    let mut bits = Bits::new(data, pos, end);
+    let n = usize::try_from(bits.bit_long()?).ok().filter(|n| (1..100_000).contains(n))?;
+    let mut at = bits.pos;
+    let mut out: Vec<Record> = Vec::with_capacity(n);
+    // After a parabola fixed by length or K: `BL 0x1001` crest (`0x1000`
+    // sag), `BL 0`, 3 bits; after the other parabolas: `BD, BD`, 1 bit.
+    // Then the three minimum K values (-1 without design criteria).
+    let parabola_tail = |record: &mut Record, crest_after: bool| -> Option<usize> {
+        let mut b = Bits::new(data, record.end, end);
+        if crest_after {
+            record.crest = Some(sag_or_crest(b.bit_long()?)?);
+            (b.bit_long()? == 0).then_some(())?;
+            b.pos += 3;
+        } else {
+            b.bit_double()?;
+            b.bit_double()?;
+            b.pos += 1;
+        }
+        let mut k = [None; 3];
+        for v in &mut k {
+            *v = Some(b.bit_double()?).filter(|v| *v >= 0.0);
+        }
+        record.minimum_k = Some(k);
+        Some(b.pos)
+    };
+    for i in 0..n {
+        let mut record = record_at(data, at + 11, end)?;
+        let last = i + 1 == n;
+        let next = match record.code {
+            (2, _) => record.end + 4,
+            (6, c) => parabola_tail(&mut record, matches!(c, 0 | 2))?,
+            _ if last => record.end,
+            // debt: no sample has a circular or asymmetric curve before
+            // another record; its tail is found by trying both forms.
+            _ => [true, false]
+                .into_iter()
+                .find_map(|after| {
+                    let mut probe = record_at(data, at + 11, end)?;
+                    parabola_tail(&mut probe, after).filter(|e| record_at(data, e + 11, end).is_some())
+                })?,
+        };
+        out.push(record);
+        at = next;
+    }
+    let ids: Vec<i32> = out.iter().map(|r| r.id).collect();
+    let known = |id: i32| id == 0 || ids.contains(&id);
+    let distinct = ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id));
+    (distinct && out.iter().all(|r| known(r.previous) && known(r.next))).then_some(out)
+}
+
+/// Where a profile's criteria bits and entity list sit: after the class
+/// keys (see [`super::alignment::read_keys`]), `BL, BD, BD, BD, 5 x BS`,
+/// 10 bits (criteria in the last three), then the entity list.
+fn section(data: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    let mut bits = Bits::new(data, start, end);
+    super::alignment::read_keys(&mut bits)?;
+    bits.bit_long()?;
+    for _ in 0..3 {
+        bits.bit_double()?;
+    }
+    for _ in 0..5 {
+        bits.bit_short()?;
+    }
+    let criteria_at = bits.pos;
+    bits.pos += 10;
+    (bits.pos < end).then_some((criteria_at, bits.pos))
+}
+
+/// The entity records in link order, run by run: each run starts at a
+/// record without a predecessor (a surface profile sampled in pieces has
+/// several, and Civil 3D draws them all).
+fn runs(data: &[u8], start: usize, end: usize) -> Vec<Vec<Record>> {
+    let records: Vec<Record> = section(data, start, end)
+        .and_then(|(_, list)| match Bits::new(data, list, end).bit_long()? {
+            0 => Some(Vec::new()),
+            _ => record_list_at(data, list, end),
+        })
+        .unwrap_or_default();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for (i, _) in records.iter().enumerate().filter(|(_, r)| r.previous == 0) {
+        let mut run = vec![i];
+        while run.len() <= records.len() {
+            let next_id = records[*run.last().unwrap()].next;
+            match records.iter().position(|r| next_id != 0 && r.id == next_id) {
+                Some(j) if !run.iter().any(|c| records[*c].id == records[j].id) => run.push(j),
                 _ => break,
             }
         }
-        if chain.len() > best.len() {
-            best = chain;
-        }
+        runs.push(run);
     }
-    let chain = best;
-    if chain.iter().all(|r| matches!(r.entity, Entity::Tangent(..))) {
-        return None;
-    }
+    let mut records: Vec<Option<Record>> = records.into_iter().map(Some).collect();
+    runs.into_iter().map(|run| run.into_iter().filter_map(|i| records[i].take()).collect()).collect()
+}
+
+/// Every entity record in link order, run after run.
+fn chain(data: &[u8], start: usize, end: usize) -> Vec<Record> {
+    runs(data, start, end).into_iter().flatten().collect()
+}
+
+/// Ids of a design profile's entities in link order, each marked `true`
+/// for a curve, with a fixed tangent's end station.
+pub(super) fn entity_ids(data: &[u8], start: usize, end: usize) -> Vec<(i32, bool, Option<f64>)> {
+    chain(data, start, end)
+        .iter()
+        .map(|r| match r.entity {
+            Entity::Tangent(_, b) => (r.id, false, Some(b.x)),
+            Entity::Curve(_) => (r.id, true, None),
+            _ => (r.id, false, None),
+        })
+        .collect()
+}
+
+/// Every run's entities resolved into drawn segments.
+fn design(data: &[u8], start: usize, end: usize) -> Option<Vec<Vec<Segment>>> {
+    runs(data, start, end).iter().map(|run| solve(run)).collect()
+}
+
+/// One run's entities, each resolved: fixed tangents and curves stand on
+/// their points, a free curve sits at the PVI of the tangents beside it, a
+/// floating curve hangs from the tangent before it, a floating tangent
+/// leaves the curve before it towards its point, a free tangent touches the
+/// curves on both sides.
+fn solve(owned: &[Record]) -> Option<Vec<Segment>> {
+    // A tangent running backwards (one closes a surface profile) ends what
+    // is drawn.
+    let chain: Vec<&Record> = owned
+        .iter()
+        .take_while(|r| !matches!(r.entity, Entity::Tangent(a, b) if b.x < a.x))
+        .collect();
     let n = chain.len();
     let mut shape: Vec<Option<Shape>> = vec![None; n];
     let mut from: Vec<Option<Vector2>> = vec![None; n];
@@ -437,7 +566,6 @@ fn design(data: &[u8], start: usize, end: usize) -> Option<Vec<Segment>> {
     for (i, r) in chain.iter().enumerate() {
         match r.entity {
             Entity::Tangent(a, b) => {
-                (b.x >= a.x).then_some(())?;
                 // Fixed tangents in a row meet end to start; a stray header
                 // in a surface profile does not.
                 if let Some(Entity::Tangent(_, last)) = i.checked_sub(1).map(|j| chain[j].entity) {
@@ -582,196 +710,15 @@ fn sample(segment: &Segment) -> Vec<Vector2> {
     }
 }
 
-// ponytail: a profile of fixed tangents only keeps the reading below; the
-// entity solver runs where curves or dependent tangents are. One surface
-// profile links two starts (stations 0 and 950) and Civil 3D draws only
-// the second; the rule for that is not known yet.
-/// A design profile: its tangents in order and the vertical curve length
-/// at each joint (0 where the tangents meet without a curve).
-struct Design {
-    tangents: Vec<(Vector2, Vector2)>,
-    curves: Vec<f64>,
-}
-
-/// Every profile entity record opens with a 2-bit kind, then `00000001`,
-/// sixteen zero bits and `10`.
-const RECORD_TANGENT: u32 = 0b01;
-const RECORD_CURVE: u32 = 0b11;
-
-/// Kind of the record opening at `pos`, with the position after its prefix.
-fn record_kind(data: &[u8], pos: usize, end: usize) -> Option<(u32, usize)> {
-    let mut bits = Bits::new(data, pos, end);
-    let mut prefix = 0u32;
-    for _ in 0..28 {
-        prefix = (prefix << 1) | u32::from(bits.bit()?);
-    }
-    ((prefix & 0x03FF_FFFF) == 0b0000_0001_0000_0000_0000_0000_10).then_some((prefix >> 26, bits.pos))
-}
-
-/// Tangent record body: `BL id, BL previous, BL next, RD station,
-/// RD elevation, RD station, RD elevation`.
-fn tangent_at(data: &[u8], pos: usize, end: usize) -> Option<(i32, i32, i32, Vector2, Vector2)> {
-    let mut bits = Bits::new(data, pos, end);
-    let id = bits.bit_long()?;
-    let previous = bits.bit_long()?;
-    let next = bits.bit_long()?;
-    let mut value = || bits.raw_double().filter(|v| v.is_finite() && (*v == 0.0 || v.abs() > 1e-6));
-    let a = Vector2::new(value()?, value()?);
-    let b = Vector2::new(value()?, value()?);
-    let plausible = a.x.abs() < 1e7 && b.x.abs() < 1e7 && a.y.abs() < 1e5 && b.y.abs() < 1e5 && b.x >= a.x;
-    (id > 0 && plausible).then_some((id, previous, next, a, b))
-}
-
-/// Curve record body: `BL id, BL previous, BL next, 4 bits, RD length`.
-fn curve_at(data: &[u8], pos: usize, end: usize) -> Option<(i32, i32, i32, f64)> {
-    let mut bits = Bits::new(data, pos, end);
-    let id = bits.bit_long()?;
-    let previous = bits.bit_long()?;
-    let next = bits.bit_long()?;
-    for _ in 0..4 {
-        bits.bit()?;
-    }
-    let length = bits.raw_double().filter(|v| v.is_finite() && *v > 1e-6 && *v < 1e6)?;
-    (id > 0).then_some((id, previous, next, length))
-}
-
-/// Fixed tangents linked by id from the first one, and the length of the
-/// symmetric curve each joint carries: how a sampled surface profile and a
-/// profile of fixed tangents are read.
-fn tangent_design(data: &[u8], start: usize, end: usize) -> Option<Design> {
-    let mut tangents: Vec<(i32, i32, i32, Vector2, Vector2)> = Vec::new();
-    let mut curves: Vec<(i32, i32, i32, f64)> = Vec::new();
-    for pos in start..end {
-        match record_kind(data, pos, end) {
-            Some((RECORD_TANGENT, body)) => tangents.extend(tangent_at(data, body, end)),
-            Some((RECORD_CURVE, body)) => curves.extend(curve_at(data, body, end)),
-            _ => {}
-        }
-    }
-    // A stray prefix can carry plausible ids; a tangent belongs to the chain
-    // only where it starts at its predecessor's end.
-    let follow = |first: (i32, i32, i32, Vector2, Vector2)| {
-        let mut chain = vec![first];
-        let mut joints = Vec::new();
-        loop {
-            let last = *chain.last().unwrap();
-            let (next_id, length) = match curves.iter().find(|c| c.0 == last.2 && c.1 == last.0) {
-                Some(curve) => (curve.2, curve.3),
-                None => (last.2, 0.0),
-            };
-            if next_id == 0 {
-                break;
-            }
-            match tangents.iter().find(|r| r.0 == next_id && r.3.distance(&last.4) <= 1e-6) {
-                Some(next) if !chain.iter().any(|c| c.0 == next.0) => {
-                    chain.push(*next);
-                    joints.push(length);
-                }
-                _ => break,
-            }
-        }
-        (chain, joints)
-    };
-    let (chain, joints) = tangents
-        .iter()
-        .filter(|r| r.1 == 0)
-        .map(|r| follow(*r))
-        .max_by_key(|(chain, _)| chain.len())?;
-    Some(Design {
-        tangents: chain.iter().map(|r| (r.3, r.4)).collect(),
-        curves: joints,
-    })
-}
-
-/// Point on a tangent at `station`.
-fn on(tangent: (Vector2, Vector2), station: f64) -> Vector2 {
-    let (a, b) = tangent;
-    if (b.x - a.x).abs() < 1e-12 {
-        return a;
-    }
-    Vector2::new(station, a.y + (b.y - a.y) * (station - a.x) / (b.x - a.x))
-}
-
-impl Design {
-    /// Tangent pieces trimmed by the curves, and the curves sampled as
-    /// symmetric parabolas, in station order.
-    fn pieces(&self) -> Vec<(ProfilePiece, Vec<Vector2>)> {
-        let mut out = Vec::new();
-        for (index, &(a, b)) in self.tangents.iter().enumerate() {
-            let cut_in = index.checked_sub(1).map_or(0.0, |i| self.curves[i] / 2.0);
-            let cut_out = self.curves.get(index).map_or(0.0, |l| l / 2.0);
-            let from = on((a, b), a.x + cut_in);
-            let to = on((a, b), b.x - cut_out);
-            // A step (no station length) draws nothing.
-            if to.x > from.x + 1e-9 {
-                out.push((ProfilePiece::Tangent, vec![from, to]));
-            }
-            if cut_out > 0.0 {
-                let next = self.tangents[index + 1];
-                let pvi = b;
-                let p0 = on((a, b), b.x - cut_out);
-                let p2 = on(next, next.0.x + cut_out);
-                let curve = (0..=32)
-                    .map(|i| {
-                        let t = i as f64 / 32.0;
-                        let u = 1.0 - t;
-                        p0 * (u * u) + pvi * (2.0 * u * t) + p2 * (t * t)
-                    })
-                    .collect();
-                out.push((ProfilePiece::Parabola, curve));
-            }
-        }
-        out
-    }
-}
-
-/// Runs of a surface (sampled) profile: `2RD start, 2RD end` segments that
-/// chain end to start.
-fn tangent_runs(data: &[u8], start: usize, end: usize) -> Vec<Vec<Vector2>> {
-    let mut segments: Vec<(Vector2, Vector2)> = Vec::new();
-    let mut pos = start;
-    while pos + 256 <= end {
-        match segment_at(data, pos, end) {
-            Some(segment) => {
-                segments.push(segment);
-                pos += 256;
-            }
-            None => pos += 1,
-        }
-    }
-    // Keep a segment only when it chains to a neighbor; a lone match is noise.
-    let linked = |s: &(Vector2, Vector2)| segments.iter().any(|o| o.0 == s.1 || o.1 == s.0);
-    let mut kept: Vec<(Vector2, Vector2)> = segments.iter().copied().filter(linked).collect();
-    kept.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
-    kept.dedup();
-    let mut runs: Vec<Vec<Vector2>> = Vec::new();
-    for (a, b) in kept {
-        match runs.last_mut() {
-            Some(run) if *run.last().unwrap() == a => run.push(b),
-            Some(run) if run.last().unwrap().x > a.x => {} // overlapping copy
-            _ => runs.push(vec![a, b]),
-        }
-    }
-    runs
-}
-
-/// Tangents and vertical curves of a design profile, or the runs of a
-/// surface profile, in station order.
+/// Tangents and vertical curves of a profile, in station order.
 pub(super) fn pieces(data: &[u8], start: usize, end: usize) -> Vec<(ProfilePiece, Vec<Vector2>)> {
-    if let Some(segments) = design(data, start, end) {
-        return segments
-            .iter()
-            .filter(|s| s.end.x > s.start.x + 1e-9)
-            .map(|s| (s.shape.piece(), sample(s)))
-            .collect();
-    }
-    match tangent_design(data, start, end) {
-        Some(design) => design.pieces(),
-        None => tangent_runs(data, start, end)
-            .into_iter()
-            .map(|run| (ProfilePiece::Tangent, run))
-            .collect(),
-    }
+    design(data, start, end)
+        .unwrap_or_default()
+        .iter()
+        .flatten()
+        .filter(|s| s.end.x > s.start.x + 1e-9)
+        .map(|s| (s.shape.piece(), sample(s)))
+        .collect()
 }
 
 /// Station/elevation polylines of a profile.
@@ -796,23 +743,18 @@ pub struct Pvi {
     pub curve_length: f64,
 }
 
-/// PVIs of a design profile: its start, every joint (a curve's PVI where
-/// the grades on both sides of it meet), and its end. Empty for a surface
-/// profile.
+/// PVIs of a profile: its start, every joint (a curve's PVI where the
+/// grades on both sides of it meet), and its end.
 pub(super) fn pvis(data: &[u8], start: usize, end: usize) -> Vec<Pvi> {
-    let Some(segments) = design(data, start, end) else {
-        let Some(design) = tangent_design(data, start, end) else {
-            return Vec::new();
-        };
-        let mut out = vec![Pvi { point: design.tangents[0].0, curve_length: 0.0 }];
-        for (index, tangent) in design.tangents.iter().enumerate().skip(1) {
-            out.push(Pvi { point: tangent.0, curve_length: design.curves[index - 1] });
-        }
-        out.push(Pvi { point: design.tangents.last().unwrap().1, curve_length: 0.0 });
-        return out;
+    design(data, start, end).unwrap_or_default().iter().flat_map(|run| run_pvis(run)).collect()
+}
+
+fn run_pvis(segments: &[Segment]) -> Vec<Pvi> {
+    let Some(first) = segments.first() else {
+        return Vec::new();
     };
     let at = |point: Vector2| Pvi { point, curve_length: 0.0 };
-    let mut out = vec![at(segments[0].start)];
+    let mut out = vec![at(first.start)];
     for (i, s) in segments.iter().enumerate() {
         match s.shape {
             Shape::Line { .. } => {
@@ -844,21 +786,6 @@ pub(super) fn pvis(data: &[u8], start: usize, end: usize) -> Vec<Pvi> {
         out.push(at(last.end));
     }
     out
-}
-
-fn segment_at(data: &[u8], pos: usize, end: usize) -> Option<(Vector2, Vector2)> {
-    let mut bits = Bits::new(data, pos, end);
-    let mut value = || bits.raw_double().filter(|v| v.is_finite() && (*v == 0.0 || v.abs() > 1e-6));
-    let a = Vector2::new(value()?, value()?);
-    let b = Vector2::new(value()?, value()?);
-    let plausible = a.x.abs() < 1e7
-        && b.x.abs() < 1e7
-        && a.y.abs() < 1e5
-        && b.y.abs() < 1e5
-        && b.x > a.x
-        && b.x - a.x < 1e5
-        && ((b.y - a.y) / (b.x - a.x)).abs() < 10.0;
-    plausible.then_some((a, b))
 }
 
 /// Whether a profile piece is a tangent or a vertical curve.
@@ -899,37 +826,192 @@ impl ProfileViewFrame {
     }
 }
 
-/// Range triple whose station span equals the frame width.
-pub(super) fn view_frame(
-    data: &[u8],
-    start: usize,
-    end: usize,
-    min: Vector2,
-    max: Vector2,
-) -> Option<ProfileViewFrame> {
-    let width = max.x - min.x;
-    let height = max.y - min.y;
-    (start..end).find_map(|pos| {
-        let mut bits = Bits::new(data, pos, end);
-        let mut point = || {
-            let x = bits.bit_double()?;
-            let y = bits.bit_double()?;
-            (bits.bit_double()? == 0.0).then_some(Vector2::new(x, y))
-        };
-        let a = point()?;
-        let b = point()?;
-        let c = point()?;
-        let fits = a == b
-            && c.y > a.y
-            && ((c.x - a.x) - width).abs() <= 1e-6 * width.max(1.0)
-            && height > 0.0;
-        fits.then(|| ProfileViewFrame {
-            origin: min,
-            station_min: a.x,
-            station_max: c.x,
-            elevation_min: a.y,
-            elevation_max: c.y,
-            vertical_scale: height / (c.y - a.y),
-        })
+/// A profile view's frame, read field by field:
+///
+/// ```text
+/// BL 80, 2 bits, BL, BL, BL version, then version 5: BL key count, keys
+/// (see alignment::key), BL 0, 121 bits; version 4: BL 0, 128 bits;
+/// 3BD origin, 9 BD (rotation), BD,
+/// RC n, n x 5 bits, BL m, m x record, 1 bit,
+/// 3BD origin, BL, BL, 3 x 3BD range (min, min, max), 3 x 3BD (a copy),
+/// BL, BL byte count + UTF-16 title, BL 0, 7 x BD, 6 x BL,
+/// 3BD origin, 4 x BD, BD vertical scale
+/// record: BL 0, BL, BD, BL, BD, 258 bits, BL n, n x BL, BL n, n x BL,
+///     BL index (1, 2, …), BD, BD
+/// ```
+// ponytail: the 121/128, 5-bit and 258-bit runs are skipped by length
+// (zero or constant in every sample).
+fn view_frame_fields(data: &[u8], start: usize, end: usize) -> Option<ProfileViewFrame> {
+    let mut bits = Bits::new(data, start, end);
+    (bits.bit_long()? == 80).then_some(())?;
+    bits.pos += 2;
+    bits.bit_long()?;
+    bits.bit_long()?;
+    match bits.bit_long()? {
+        5 => {
+            for _ in 0..bits.bit_long()? {
+                super::alignment::key(&mut bits)?;
+            }
+            (bits.bit_long()? == 0).then_some(())?;
+            bits.pos += 121;
+        }
+        // Civil 3D 2013: no keys.
+        4 => {
+            (bits.bit_long()? == 0).then_some(())?;
+            bits.pos += 128;
+        }
+        _ => return None,
+    }
+    let point = |bits: &mut Bits| -> Option<Vector2> {
+        let p = Vector2::new(bits.bit_double()?, bits.bit_double()?);
+        (p.x.is_finite() && p.y.is_finite() && bits.bit_double()? == 0.0).then_some(p)
+    };
+    let origin = point(&mut bits)?;
+    for _ in 0..10 {
+        bits.bit_double()?;
+    }
+    let items = usize::from(bits.bits_value(8)?);
+    bits.pos += 5 * items;
+    for _ in 0..bits.bit_long()? {
+        (bits.bit_long()? == 0).then_some(())?;
+        bits.bit_long()?;
+        bits.bit_double()?;
+        bits.bit_long()?;
+        bits.bit_double()?;
+        bits.pos += 258;
+        for _ in 0..2 {
+            for _ in 0..bits.bit_long()? {
+                bits.bit_long()?;
+            }
+        }
+        bits.bit_long()?;
+        bits.bit_double()?;
+        bits.bit_double()?;
+    }
+    bits.pos += 1;
+    (point(&mut bits)? == origin).then_some(())?;
+    bits.bit_long()?;
+    bits.bit_long()?;
+    let (a, b, c) = (point(&mut bits)?, point(&mut bits)?, point(&mut bits)?);
+    (a == b && c.x > a.x && c.y > a.y).then_some(())?;
+    for _ in 0..3 {
+        point(&mut bits)?;
+    }
+    bits.bit_long()?;
+    let title = usize::try_from(bits.bit_long()?).ok()?;
+    bits.pos += 8 * title;
+    (bits.bit_long()? == 0).then_some(())?;
+    for _ in 0..7 {
+        bits.bit_double()?;
+    }
+    for _ in 0..6 {
+        bits.bit_long()?;
+    }
+    (point(&mut bits)? == origin).then_some(())?;
+    for _ in 0..4 {
+        bits.bit_double()?;
+    }
+    let vertical_scale = bits.bit_double().filter(|v| v.is_finite() && *v > 0.0)?;
+    Some(ProfileViewFrame {
+        origin,
+        station_min: a.x,
+        station_max: c.x,
+        elevation_min: a.y,
+        elevation_max: c.y,
+        vertical_scale,
     })
+}
+
+/// Frame from the body: [`view_frame_fields`].
+pub(super) fn view_frame_stored(data: &[u8], start: usize, end: usize) -> Option<ProfileViewFrame> {
+    view_frame_fields(data, start, end)
+}
+
+/// Profile Locking settings of a profile, from the
+/// `AECC_NOTIFICATIONINFOS` object it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProfileLocking {
+    /// Anchor profile geometry points to alignment geometry points (false:
+    /// anchor the profile to the alignment's start).
+    pub anchor_to_geometry: bool,
+    /// Modify affected entities (false: delete them).
+    pub modify_affected: bool,
+    /// Notify which entities are affected.
+    pub notify: bool,
+    /// Ids of the profile entities waiting to be reported as affected by
+    /// an alignment edit.
+    pub affected: Vec<i32>,
+}
+
+/// After the common object data: 18 bits (the same in every sample),
+/// `BL n, n x BL entity id, B anchor, B modify, B notify`.
+pub(super) fn locking(data: &[u8], start: usize, end: usize) -> Option<ProfileLocking> {
+    let mut bits = Bits::new(data, start + 18, end);
+    let n = bits.bit_long()?;
+    if !(0..10_000).contains(&n) {
+        return None;
+    }
+    let affected = (0..n).map(|_| bits.bit_long()).collect::<Option<Vec<_>>>()?;
+    Some(ProfileLocking {
+        anchor_to_geometry: bits.bit()?,
+        modify_affected: bits.bit()?,
+        notify: bits.bit()?,
+        affected,
+    })
+}
+
+/// Design Criteria check boxes of a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProfileCriteria {
+    pub criteria_based_design: bool,
+    pub design_criteria_file: bool,
+    pub design_check_set: bool,
+}
+
+/// The last three of the 10 criteria bits before the entity list (see
+/// [`section`]).
+pub(super) fn criteria(data: &[u8], start: usize, end: usize) -> Option<ProfileCriteria> {
+    let (at, _) = section(data, start, end)?;
+    let mut bits = Bits::new(data, at + 7, end);
+    Some(ProfileCriteria {
+        criteria_based_design: bits.bit()?,
+        design_criteria_file: bits.bit()?,
+        design_check_set: bits.bit()?,
+    })
+}
+
+/// The minimum K values design criteria give a parabolic vertical curve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CurveMinimumK {
+    /// The curve entity's id.
+    pub id: i32,
+    /// Crest or sag, where the record says (a floating curve does not).
+    pub crest: Option<bool>,
+    /// Stopping sight distance; `None` without design criteria.
+    pub stopping_sight: Option<f64>,
+    /// Passing sight distance.
+    pub passing_sight: Option<f64>,
+    /// Most likely the headlight sight distance.
+    pub headlight_sight: Option<f64>,
+}
+
+/// The minimum K values of every parabola in the entity list (see
+/// [`record_list_at`]).
+pub(super) fn curve_minimum_k(data: &[u8], start: usize, end: usize) -> Vec<CurveMinimumK> {
+    chain(data, start, end)
+        .iter()
+        .filter_map(|r| {
+            let [stopping_sight, passing_sight, headlight_sight] = r.minimum_k?;
+            Some(CurveMinimumK {
+                id: r.id,
+                crest: r.crest,
+                stopping_sight,
+                passing_sight,
+                headlight_sight,
+            })
+        })
+        .collect()
 }

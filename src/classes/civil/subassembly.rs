@@ -110,13 +110,37 @@ fn indices(bits: &mut Bits, limit: usize) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// Shape from the first point list a valid link list follows, with codes
-/// from `strings`, the record's text stream, where they start two strings
-/// after the script assembly name.
-// ponytail: probes every bit offset; parse the class header once its fields
-// are known.
+/// Where the point list sits, read field by field: the class keys (see
+/// `alignment::class_keys`) and 121 bits, or a record without keys (tag
+/// `010010`, RC 0) and 120 bits; then 3BD origin, 9 BD (rotation), BD,
+/// 62 bits.
+// ponytail: the 120/121 and 62-bit runs are skipped by length (zero or
+// constant in every sample).
+fn shape_at(data: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut bits = Bits::new(data, start, end);
+    if super::alignment::class_header(&mut bits)? == super::alignment::KEYED {
+        bits = Bits::new(data, start, end);
+        super::alignment::class_keys(&mut bits)?;
+        bits.pos += 121;
+    } else {
+        (bits.bits_value(8)? == 0).then_some(())?;
+        bits.pos += 120;
+    }
+    for _ in 0..13 {
+        bits.bit_double()?;
+    }
+    Some(bits.pos + 62)
+}
+
+/// Shape from the point list, with codes from `strings`, the record's text
+/// stream, where they start two strings after the script assembly name.
 pub(super) fn find(data: &[u8], start: usize, end: usize, strings: &[String]) -> Option<SubassemblyShape> {
-    let (mut shape, points, links, areas) = (start..end).find_map(|pos| read_at(data, pos, end))?;
+    let (mut shape, points, links, areas) = match shape_at(data, start, end).and_then(|pos| read_at(data, pos, end)) {
+        Some(found) => found,
+        // debt: a header neither form matches (none in the samples) is
+        // searched for its point list.
+        None => (start..end).find_map(|pos| read_at(data, pos, end))?,
+    };
     let first = strings.iter().position(|s| s == "AeccStockSubassemblyScriptsRC.dll").map(|i| i + 2);
     let mut codes = first.map(|i| strings[i.min(strings.len())..].iter());
     let mut take = |counts: &[usize]| -> Vec<Vec<String>> {
@@ -190,23 +214,31 @@ fn attachment_points(data: &[u8], start: usize, end: usize) -> Vec<u32> {
     points
 }
 
-/// `bounds` is the proxy extents; the baseline point is the first `3BD`
-/// with z = 0 inside them.
-pub(super) fn assembly_layout(
-    data: &[u8],
-    start: usize,
-    end: usize,
-    handles: &[u64],
-    bounds: (Vector2, Vector2),
-) -> Option<AssemblyLayout> {
-    let (min, max) = bounds;
-    let origin = (start..end).find_map(|pos| {
-        let mut bits = Bits::new(data, pos, end);
-        let x = bits.bit_double()?;
-        let y = bits.bit_double()?;
-        let inside = x > min.x && x < max.x && y > min.y && y < max.y;
-        (inside && bits.bit_double()? == 0.0).then(|| Vector3::new(x, y, 0.0))
-    })?;
+/// The baseline point is a `3BD` after the class header
+/// (`BL 80, 0, 80, 80, 0`, two BLs, a flag BL): with flag 64 after the
+/// date-modified block (`BL, BL, BL 0x1600101F`, 64-bit FILETIME) and 131
+/// bits; with flag 128 after 98 bits.
+// ponytail: the 131 and 98 bits are skipped by length (constant in every
+// assembly seen); read them field by field once a drawing varies them.
+pub(super) fn assembly_layout(data: &[u8], start: usize, end: usize, handles: &[u64]) -> Option<AssemblyLayout> {
+    let mut bits = Bits::new(data, start, end);
+    for want in [80, 0, 80, 80, 0] {
+        (bits.bit_long()? == want).then_some(())?;
+    }
+    bits.bit_long()?;
+    bits.bit_long()?;
+    match bits.bit_long()? {
+        64 => {
+            bits.bit_long()?;
+            bits.bit_long()?;
+            (bits.bit_long()? == 0x1600_101F).then_some(())?;
+            bits.pos += 64 + 131;
+        }
+        128 => bits.pos += 98,
+        _ => return None,
+    }
+    let origin = Vector3::new(bits.bit_double()?, bits.bit_double()?, bits.bit_double()?);
+    [origin.x, origin.y, origin.z].iter().all(|v| v.is_finite()).then_some(())?;
     // Body handles: two nulls (one in Civil 3D 2013), the baseline style,
     // (subassembly, parent) pairs, then the drawing's Civil root.
     let style = handles.iter().take(3).position(|h| *h != 0)?;

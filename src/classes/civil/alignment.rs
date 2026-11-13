@@ -276,8 +276,143 @@ impl SpiralShape {
     }
 }
 
+/// One class key: `BL (type << 24 | id)`, then its value by type: 0x01,
+/// 0x0D BL; 0x02 BD; 0x03 one byte; 0x04, 0x12 nothing; 0x0B, 0x19 BL n,
+/// n x BL; 0x0C BL n, n x BD; 0x13, 0x16 64 bits.
+pub(super) fn key(bits: &mut Bits) -> Option<()> {
+    match bits.bit_long()? as u32 >> 24 {
+        0x01 | 0x0D => {
+            bits.bit_long()?;
+        }
+        0x02 => {
+            bits.bit_double()?;
+        }
+        0x03 => {
+            bits.bits_value(8)?;
+        }
+        0x04 | 0x12 => {}
+        0x0B | 0x19 => {
+            for _ in 0..bits.bit_long()? {
+                bits.bit_long()?;
+            }
+        }
+        0x0C => {
+            for _ in 0..bits.bit_long()? {
+                bits.bit_double()?;
+            }
+        }
+        0x13 | 0x16 => bits.pos += 64,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Class data alignments and profiles share, read up to their own fields:
+///
+/// ```text
+/// BL 80, 0, 80, 80, 0, BL, 6 bits (010101), RC key count, count x key,
+/// BL 0, 65 bits, BD, 7 bits
+/// ```
+///
+/// (keys: see [`key`]).
+///
+/// Keys seen: 0x0B001081 (geometry key, two BLs), 0x0D00D773 (re-save
+/// tag), 0x1600101F (date modified, FILETIME), 0x0109E0xx / 0x0409E0xx
+/// (Civil 3D 2013 properties), 0x0400FExx / 0x1200FFxx (profile flags).
+// ponytail: the 65 and 7-bit runs are skipped by length (constant layout
+// in every sample); name their fields once a drawing varies them.
+pub(super) fn read_keys(bits: &mut Bits) -> Option<()> {
+    class_keys(bits)?;
+    bits.pos += 65;
+    bits.bit_double()?;
+    bits.pos += 7;
+    Some(())
+}
+
+/// The class header and keys up to their closing `BL 0` (see
+/// [`read_keys`]).
+pub(super) fn class_keys(bits: &mut Bits) -> Option<()> {
+    (class_header(bits)? == KEYED).then_some(())?;
+    for _ in 0..bits.bits_value(8)? {
+        key(bits)?;
+    }
+    (bits.bit_long()? == 0).then_some(())
+}
+
+/// Tag of a class record that carries keys; `0b010010` (Civil 3D 2013
+/// records, labels) carries none.
+pub(super) const KEYED: u8 = 0b01_0101;
+
+/// `BL 80, 0, 80, 80, 0, BL`, then the 6-bit tag it returns.
+pub(super) fn class_header(bits: &mut Bits) -> Option<u8> {
+    for want in [80, 0, 80, 80, 0] {
+        (bits.bit_long()? == want).then_some(())?;
+    }
+    bits.bit_long()?;
+    bits.bits_value(6)
+}
+
+/// An alignment's own fields after [`read_keys`]: BL first element id, BD,
+/// BD start station, 7 criteria bits, BD track gauge, 1 bit, BL, then the
+/// element count.
+struct Section2 {
+    start_station: f64,
+    /// The 7 criteria bits after the start station.
+    criteria_at: usize,
+    count_at: usize,
+}
+
+fn section2(data: &[u8], start: usize, end: usize) -> Option<Section2> {
+    // Records re-saved by RECOVER/AUDIT have 8 bits more before the BD
+    // (2.1255 there instead of 2.25); the list that follows tells which.
+    // ponytail: the extra 8 bits are not named; one layout of each in the
+    // samples.
+    [65, 73].into_iter().find_map(|run| section2_with(data, start, end, run))
+}
+
+fn section2_with(data: &[u8], start: usize, end: usize, run: usize) -> Option<Section2> {
+    let mut bits = Bits::new(data, start, end);
+    class_keys(&mut bits)?;
+    bits.pos += run;
+    bits.bit_double()?;
+    bits.pos += 7;
+    bits.bit_long()?;
+    bits.bit_double()?;
+    let start_station = bits.bit_double()?;
+    let criteria_at = bits.pos;
+    bits.pos += 7;
+    // The track gauge (0 unless the superelevation type is cant), one bit.
+    bits.bit_double()?;
+    bits.bit()?;
+    bits.bit_long()?;
+    // The element list must follow: the RECOVER/AUDIT layout reads through
+    // these fields at the wrong places. A count of 0 must be followed by the
+    // interval block, the equations, speeds and type.
+    let mut count = Bits::new(data, bits.pos, end);
+    let listed = match count.bit_long()? {
+        0 => interval_block_end(data, count.pos, end)
+            .and_then(|pos| typed_at(data, pos, end, f64::MIN, f64::MAX, true))
+            .is_some(),
+        _ => element_list_at(data, bits.pos, end).is_some(),
+    };
+    listed.then_some(())?;
+    Some(Section2 { start_station, criteria_at, count_at: bits.pos })
+}
+
 /// Design elements found in a main stream, keyed by their own ids.
 pub(super) fn elements(data: &[u8], start: usize, end: usize) -> Vec<AlignmentElement> {
+    // The element list read by its grammar: count, records end to end.
+    if let Some(s) = section2(data, start, end) {
+        return element_list_at(data, s.count_at, end).unwrap_or_default();
+    }
+    // debt: records civil3drust wrote invalid: the list is found by trying
+    // positions.
+    if let Some(list) = (start..end).find_map(|pos| element_list_at(data, pos, end)) {
+        return list;
+    }
+    // debt: records some kinds still leave unread (free arcs through a
+    // point, compound spirals, the 2013 layout after the last record) are
+    // found by scanning for their headers.
     let mut out: Vec<AlignmentElement> = Vec::new();
     for pos in start..end {
         if !is_header(data, pos, end) {
@@ -303,6 +438,73 @@ fn is_header(data: &[u8], pos: usize, end: usize) -> bool {
     };
     (257..=280).contains(&element_type)
         && (matches!(bits.bit_short(), Some(0 | 2)) || header_type(data, pos, end).is_some_and(|t| matches!(t, 0x04 | 0x09 | 0x0D)))
+}
+
+/// One element record at `pos` read to its end: the record, then the
+/// fields some kinds keep after their geometry (spirals: `BD 0, 0, 1`, a
+/// spiral leaving its curve also its start point and direction as four
+/// RD before them; a placed spiral `BD 0, 1`; a free arc fitted to the
+/// curve after it `5 x BD 0, BL 1, BD 1`). A record that is not the last
+/// one ends where the next record starts; the last one is read without
+/// its optional fields.
+fn record_at(data: &[u8], pos: usize, end: usize, last: bool) -> Option<(AlignmentElement, usize)> {
+    if !is_header(data, pos, end) {
+        return None;
+    }
+    let member = member_body(data, pos, end);
+    let after_type = type_end(data, pos, end);
+    let mut bits = Bits::new(data, pos, end);
+    let element = read_element(&mut bits, member, after_type)?;
+    let at = bits.pos;
+    if last {
+        return Some((element, at));
+    }
+    tails(&element.kind).iter().find_map(|tail| {
+        let mut b = Bits::new(data, at, end);
+        (tail(&mut b) && is_header(data, b.pos, end)).then_some((element.clone(), b.pos))
+    })
+}
+
+type Tail = Box<dyn Fn(&mut Bits) -> bool>;
+
+/// The fields after an element record, by kind: spirals' BDs and a free
+/// arc's optional block.
+fn tails(kind: &AlignmentElementKind) -> Vec<Tail> {
+    fn bds(bits: &mut Bits, want: &[f64]) -> bool {
+        want.iter().all(|w| bits.bit_double() == Some(*w))
+    }
+    match kind {
+        AlignmentElementKind::SpiralIn { .. } | AlignmentElementKind::CompoundSpiral { .. } => {
+            vec![Box::new(|b: &mut Bits| bds(b, &[0.0, 0.0, 1.0]))]
+        }
+        AlignmentElementKind::SpiralOut { .. } => vec![Box::new(|b: &mut Bits| {
+            (0..4).all(|_| b.raw_double().is_some_and(f64::is_finite)) && bds(b, &[0.0, 0.0, 1.0])
+        })],
+        AlignmentElementKind::PlacedSpiral { .. } => vec![Box::new(|b: &mut Bits| bds(b, &[0.0, 1.0]))],
+        AlignmentElementKind::FreeArc { .. } => vec![
+            Box::new(|_: &mut Bits| true),
+            Box::new(|b: &mut Bits| bds(b, &[0.0; 5]) && b.bit_long() == Some(1) && bds(b, &[1.0])),
+        ],
+        _ => vec![Box::new(|_: &mut Bits| true)],
+    }
+}
+
+/// The element list at `pos`: `BL n`, then n records end to end whose
+/// IDs are distinct and whose links point inside the list.
+fn element_list_at(data: &[u8], pos: usize, end: usize) -> Option<Vec<AlignmentElement>> {
+    let mut bits = Bits::new(data, pos, end);
+    let n = usize::try_from(bits.bit_long()?).ok().filter(|n| (1..10_000).contains(n))?;
+    let mut at = bits.pos;
+    let mut out: Vec<AlignmentElement> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (element, next) = record_at(data, at, end, i + 1 == n)?;
+        out.push(element);
+        at = next;
+    }
+    let ids: Vec<i16> = out.iter().map(|e| e.id).collect();
+    let known = |id: i16| id == 0 || ids.contains(&id);
+    let distinct = ids.iter().enumerate().all(|(i, id)| *id > 0 && !ids[..i].contains(id));
+    (distinct && out.iter().all(|e| known(e.previous) && known(e.next))).then_some(out)
 }
 
 /// The header's type byte. The flag and type bytes start at bit 29 of the
@@ -607,9 +809,14 @@ fn read_element(bits: &mut Bits, member: Option<usize>, after_type: Option<usize
             first: bits.bit_double()?,
             second: None,
         },
-        (275, Some(1)) => AlignmentElementKind::WideningCompoundReverse {
-            radii: [bits.bit_double()?, bits.bit_double()?, bits.bit_double()?],
-        },
+        (275, Some(1)) => {
+            let radii = [bits.bit_double()?, bits.bit_double()?, bits.bit_double()?];
+            // The transition's length along the parent and a flag (1 on the
+            // transition in, 0 on the one out).
+            bits.bit_double()?;
+            bits.bit()?;
+            AlignmentElementKind::WideningCompoundReverse { radii }
+        }
         (261, Some(162)) => {
             bits.bit_long()?;
             AlignmentElementKind::LineSpiralInto {
@@ -905,8 +1112,48 @@ fn intersect(p: Vector2, u: Vector2, q: Vector2, v: Vector2) -> Option<Vector2> 
     Some(p + u * t)
 }
 
+thread_local! {
+    /// Pieces `walk` produced while a run was solved: first and last point
+    /// with what the element made them. Read back by [`pieces_by_kind`] so
+    /// a piece's kind comes from its element, not from its points.
+    static WALKED: std::cell::RefCell<Vec<(Vector2, Vector2, Piece, f64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes what an element made of the points it solved (see [`WALKED`]),
+/// with a curve's signed curvature (0 for the other kinds).
+fn made(points: &[Vector2], kind: Piece, curvature: f64) {
+    if let (Some(first), Some(last)) = (points.first(), points.last()) {
+        WALKED.with(|w| w.borrow_mut().push((*first, *last, kind, curvature)));
+    }
+}
+
+/// Moves the notes of points that were moved by `shift` with them.
+fn shift_notes(points: &[Vector2], shift: Vector2) {
+    WALKED.with(|w| {
+        for note in w.borrow_mut().iter_mut() {
+            if points.iter().any(|p| p.distance(&note.0) < 1e-12) && points.iter().any(|p| p.distance(&note.1) < 1e-12) {
+                note.0 = note.0 + shift;
+                note.1 = note.1 + shift;
+            }
+        }
+    });
+}
+
 /// Points along a curve whose curvature changes linearly from `k0` to `k1`.
 fn walk(start: Vector2, h: f64, k0: f64, k1: f64, length: f64) -> (Vec<Vector2>, f64) {
+    let (points, end) = walk_points(start, h, k0, k1, length);
+    let kind = if (k1 - k0).abs() > 1e-12 {
+        Piece::Spiral
+    } else if k0.abs() > 1e-12 {
+        Piece::Curve
+    } else {
+        Piece::Line
+    };
+    made(&points, kind, if kind == Piece::Curve { k0 } else { 0.0 });
+    (points, end)
+}
+
+fn walk_points(start: Vector2, h: f64, k0: f64, k1: f64, length: f64) -> (Vec<Vector2>, f64) {
     let n = ((length / STEP).ceil() as usize).clamp(2, 20000);
     let ds = length / n as f64;
     let mut points = Vec::with_capacity(n + 1);
@@ -1010,36 +1257,9 @@ pub enum AlignmentPiece {
 
 use AlignmentPiece as Piece;
 
-/// Signed curvature at the middle vertex of three.
-fn curvature_at(a: Vector2, b: Vector2, c: Vector2) -> f64 {
-    let (ab, bc, ca) = (a.distance(&b), b.distance(&c), c.distance(&a));
-    let area2 = cross(b - a, c - a);
-    if ab * bc * ca < 1e-12 {
-        0.0
-    } else {
-        2.0 * area2 / (ab * bc * ca)
-    }
-}
-
-fn piece_kind(points: &[Vector2]) -> Piece {
-    let n = points.len();
-    if n < 4 {
-        return Piece::Line;
-    }
-    let k0 = curvature_at(points[0], points[1], points[2]);
-    let k1 = curvature_at(points[n - 3], points[n - 2], points[n - 1]);
-    if k0.abs() < 1e-6 && k1.abs() < 1e-6 {
-        Piece::Line
-    } else if (k0 - k1).abs() <= 0.02 * k0.abs().max(k1.abs()) {
-        Piece::Curve
-    } else {
-        Piece::Spiral
-    }
-}
-
 /// `(start, end, kind)` index ranges of the pieces of a solved run. Every
 /// solved piece repeats its first point at the join.
-fn split(raw: &[Vector2]) -> Vec<(usize, usize, Piece)> {
+fn split_points(raw: &[Vector2]) -> Vec<(usize, usize)> {
     let mut joins = vec![0];
     for i in 1..raw.len() {
         if raw[i].distance(&raw[i - 1]) < 1e-9 {
@@ -1047,36 +1267,86 @@ fn split(raw: &[Vector2]) -> Vec<(usize, usize, Piece)> {
         }
     }
     joins.push(raw.len());
-    joins
-        .windows(2)
-        .filter(|w| w[1] > w[0] + 1)
-        .map(|w| (w[0], w[1], piece_kind(&raw[w[0]..w[1]])))
-        .collect()
+    joins.windows(2).filter(|w| w[1] > w[0] + 1).map(|w| (w[0], w[1])).collect()
 }
 
 /// Solved pieces of every run with their kind.
 pub(super) fn pieces_by_kind(elements: &[AlignmentElement]) -> Vec<(Piece, Vec<Vector2>)> {
-    raw_polylines(elements)
-        .iter()
-        .flat_map(|raw| {
-            split(raw)
-                .into_iter()
-                .map(|(a, b, kind)| (kind, raw[a..b].to_vec()))
-                .collect::<Vec<_>>()
-        })
+    pieces_with_curvature(elements).into_iter().map(|(kind, _, points)| (kind, points)).collect()
+}
+
+/// Solved pieces with the signed curvature a curve was solved with (0 for
+/// lines and spirals).
+pub(super) fn pieces_with_curvature(elements: &[AlignmentElement]) -> Vec<(Piece, f64, Vec<Vector2>)> {
+    let (raw, pieces) = solved_pieces(elements);
+    raw.iter()
+        .zip(pieces)
+        .flat_map(|(run, pieces)| pieces.into_iter().map(|(a, b, kind, k)| (kind, k, run[a..b].to_vec())).collect::<Vec<_>>())
         .collect()
+}
+
+/// Solve the elements, then split each run into pieces whose kind is the
+/// one their element made them (see [`WALKED`]); a piece no element
+/// walked (a fixed or floating line, a moved copy) keeps the kind its
+/// points show.
+fn solved_pieces(elements: &[AlignmentElement]) -> (Vec<Vec<Vector2>>, Vec<Vec<(usize, usize, Piece, f64)>>) {
+    WALKED.with(|w| w.borrow_mut().clear());
+    let raw = raw_polylines(elements);
+    let walked = WALKED.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    let same = |a: Vector2, b: Vector2| a.distance(&b) <= 1e-9 * (1.0 + a.x.abs().max(a.y.abs()));
+    let pieces = raw
+        .iter()
+        .map(|run| {
+            split_points(run)
+                .into_iter()
+                .map(|(a, b)| {
+                    let points = &run[a..b];
+                    let (first, last) = (points[0], points[points.len() - 1]);
+                    // The solved end can be followed by the element's stored
+                    // end, a hair away.
+                    let before_last = points[points.len().saturating_sub(2)];
+                    // Only lines are laid without a note: two points.
+                    let (kind, curvature) = walked
+                        .iter()
+                        .find(|(f, l, _, _)| same(*f, first) && (same(*l, last) || same(*l, before_last)))
+                        .map_or((Piece::Line, 0.0), |w| (w.2, w.3));
+                    (a, b, kind, curvature)
+                })
+                .collect()
+        })
+        .collect();
+    (raw, pieces)
+}
+
+/// Distance along a solved run to each of its points; a curve's chords
+/// are measured along its arc.
+fn run_distances(raw: &[Vector2], pieces: &[(usize, usize, Piece, f64)]) -> Vec<f64> {
+    // A curve's chords are measured along its arc, at the radius its
+    // element solved it with.
+    let mut radius = vec![None; raw.len()];
+    for &(a, b, kind, k) in pieces {
+        if kind == Piece::Curve && k.abs() > 1e-12 {
+            for r in &mut radius[a + 1..b] {
+                *r = Some(1.0 / k.abs());
+            }
+        }
+    }
+    let mut distance_to = vec![0.0; raw.len()];
+    for i in 1..raw.len() {
+        let chord = raw[i].distance(&raw[i - 1]);
+        let arc = radius[i].map_or(chord, |r: f64| 2.0 * r * (chord / (2.0 * r)).min(1.0).asin());
+        distance_to[i] = distance_to[i - 1] + arc;
+    }
+    distance_to
 }
 
 /// Geometry points along the first solved run.
 pub(super) fn geometry_points(elements: &[AlignmentElement]) -> Vec<GeometryPoint> {
-    let Some(raw) = raw_polylines(elements).into_iter().next() else {
+    let (runs, pieces) = solved_pieces(elements);
+    let (Some(raw), Some(pieces)) = (runs.into_iter().next(), pieces.into_iter().next()) else {
         return Vec::new();
     };
-    let pieces = split(&raw);
-    let mut distance_to = vec![0.0; raw.len()];
-    for i in 1..raw.len() {
-        distance_to[i] = distance_to[i - 1] + raw[i].distance(&raw[i - 1]);
-    }
+    let distance_to = run_distances(&raw, &pieces);
     let mut out = Vec::new();
     let mut push = |index: usize, name| {
         let index = index.min(raw.len() - 1);
@@ -1089,30 +1359,9 @@ pub(super) fn geometry_points(elements: &[AlignmentElement]) -> Vec<GeometryPoin
     if let Some(first) = pieces.first() {
         push(first.0, "BP");
     }
-    // Curvature at either end of a piece, from points a metre apart so a
-    // tiny closing segment does not count.
-    let at_end = |p: &[Vector2]| -> f64 {
-        let mut picked = vec![p[0]];
-        for q in &p[1..] {
-            if picked.len() == 3 {
-                break;
-            }
-            if q.distance(picked.last().unwrap()) >= 1.0 {
-                picked.push(*q);
-            }
-        }
-        if picked.len() < 3 {
-            return 0.0;
-        }
-        curvature_at(picked[0], picked[1], picked[2])
-    };
-    let ends = |(a, b, _): (usize, usize, Piece)| {
-        let p = &raw[a..b];
-        let reversed: Vec<Vector2> = p.iter().rev().copied().collect();
-        (at_end(p), -at_end(&reversed))
-    };
     for pair in pieces.windows(2) {
-        let (k0, k1) = (ends(pair[0]).1, ends(pair[1]).0);
+        // Curves turning opposite ways meet in a reverse curve.
+        let (k0, k1) = (pair[0].3, pair[1].3);
         let name = match (pair[0].2, pair[1].2) {
             (Piece::Line, Piece::Spiral) => "TS",
             (Piece::Spiral, Piece::Curve) => "SC",
@@ -1791,6 +2040,7 @@ fn solve_run(run: &[&AlignmentElement], out: &mut Vec<Vec<Vector2>>) {
                 let q: Vec<Vector2> = (0..=n)
                     .map(|j| *center + direction(a0 + TAU * j as f64 / n as f64) * *radius)
                     .collect();
+                made(&q, Piece::Curve, 1.0 / radius);
                 Some((
                     q,
                     State {
@@ -1802,6 +2052,8 @@ fn solve_run(run: &[&AlignmentElement], out: &mut Vec<Vec<Vector2>>) {
             }
             AlignmentElementKind::Points { points: q } => {
                 close(&mut points, &mut pending, q[0]);
+                // The record stores the points joined straight.
+                made(q, Piece::Line, 0.0);
                 let n = q.len();
                 Some((
                     q.clone(),
@@ -1897,6 +2149,7 @@ fn three_point_arc(a: Vector2, b: Vector2, c: Vector2) -> Option<(Vec<Vector2>, 
         heading: a0 + sweep + if ccw { PI / 2.0 } else { -PI / 2.0 },
         curvature: if ccw { 1.0 / radius } else { -1.0 / radius },
     };
+    made(&points, Piece::Curve, end.curvature);
     Some((points, end))
 }
 
@@ -1952,6 +2205,7 @@ fn spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape) -> (V
         heading: heading_at(length),
         curvature: if inward { k } else { 0.0 },
     };
+    made(&points, Piece::Spiral, 0.0);
     (points, end)
 }
 
@@ -2036,6 +2290,7 @@ fn offset_spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape
             heading: s.heading + end_angle,
             curvature: k,
         };
+        made(&points, Piece::Spiral, 0.0);
         (points, end)
     } else {
         // Travelled backwards from its curved end: the same curve turning
@@ -2051,6 +2306,7 @@ fn offset_spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape
             heading: s.heading - leave + std::f64::consts::PI,
             curvature: 0.0,
         };
+        made(&points, Piece::Spiral, 0.0);
         (points, end)
     }
 }
@@ -2386,6 +2642,7 @@ fn fitted_curve(
         let line = pending.take()?;
         points.push(line.start);
         points.push(ts);
+        shift_notes(&q, ts);
         let q: Vec<Vector2> = q.into_iter().map(|p| ts + p).collect();
         let end = State {
             point: *q.last().unwrap(),
@@ -2447,9 +2704,13 @@ fn reverse_curves(
     best.map(|(_, solved)| solved)
 }
 
-/// Start station: the BD after the header's `2.25` marker, 16 bits and three
-/// flags (`1 1 0`) later. Other flag layouts start at station 0.
+/// Start station: read from section 2 (see [`section2`]).
 pub(super) fn start_station(data: &[u8], start: usize, end: usize) -> f64 {
+    if let Some(s) = section2(data, start, end) {
+        return s.start_station;
+    }
+    // debt: records civil3drust wrote invalid; the BD after the `2.25`
+    // marker, 16 bits and three flags (`1 1 0`) later, found by scanning.
     let window = end.min(start + 4096);
     for pos in start..window {
         let mut bits = Bits::new(data, pos, end);
@@ -2466,6 +2727,51 @@ pub(super) fn start_station(data: &[u8], start: usize, end: usize) -> f64 {
         return 0.0;
     }
     0.0
+}
+
+/// Design Criteria and Constraint Editing check boxes of Alignment
+/// Properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AlignmentCriteria {
+    pub criteria_based_design: bool,
+    pub design_criteria_file: bool,
+    pub design_check_set: bool,
+    /// Always perform implied tangency constraint swapping.
+    pub swap_tangency: bool,
+    /// Lock all parameter constraints (the lock new elements get).
+    pub lock_parameters: bool,
+    /// Check for tangency between elements.
+    pub check_tangency: bool,
+}
+
+/// The check boxes: after the start station (see [`start_station`]) one
+/// bit, then criteria-based design, criteria file, check set, tangency
+/// swapping, parameter lock and tangency check.
+pub(super) fn criteria(data: &[u8], start: usize, end: usize) -> Option<AlignmentCriteria> {
+    let mut bits = if let Some(s) = section2(data, start, end) {
+        Bits::new(data, s.criteria_at, end)
+    } else {
+        // debt: records civil3drust wrote invalid, found by scanning for 2.25.
+        let window = end.min(start + 4096);
+        let pos = (start..window).find(|&pos| {
+            let mut bits = Bits::new(data, pos, end);
+            bits.bit_double() == Some(2.25) && bits.pos == pos + 66
+        })?;
+        let mut bits = Bits::new(data, pos + 66 + 16, end);
+        ((bits.bit()?, bits.bit()?, bits.bit()?) == (true, true, false)).then_some(())?;
+        bits.bit_double()?;
+        bits
+    };
+    bits.bit()?;
+    Some(AlignmentCriteria {
+        criteria_based_design: bits.bit()?,
+        design_criteria_file: bits.bit()?,
+        design_check_set: bits.bit()?,
+        swap_tangency: bits.bit()?,
+        lock_parameters: bits.bit()?,
+        check_tangency: bits.bit()?,
+    })
 }
 
 /// A station equation: past `raw` (the station the alignment would have
@@ -2497,6 +2803,63 @@ pub fn display_station(equations: &[StationEquation], raw: f64) -> f64 {
         .map_or(raw, |e| if e.increasing { e.ahead + (raw - e.raw) } else { e.ahead - (raw - e.raw) })
 }
 
+/// The end of the interval block at `pos` (see [`post_cache_starts`]).
+fn interval_block_end(data: &[u8], pos: usize, end: usize) -> Option<usize> {
+    let mut bits = Bits::new(data, pos, end);
+    for _ in 0..3 {
+        bits.bit_long()?;
+    }
+    let k = usize::try_from(bits.bit_long()?).ok()?;
+    // An interval takes at least 529 bits.
+    (k <= end.saturating_sub(bits.pos) / 529).then_some(())?;
+    for _ in 0..k {
+        bits.pos += 128;
+        bits.bit()?;
+        bits.bit_long()?;
+        for _ in 0..4 {
+            bits.bit_double()?;
+        }
+        for _ in 0..3 {
+            bits.bit_long()?;
+        }
+        bits.pos += 6 * 64;
+    }
+    (bits.pos < end).then_some(bits.pos)
+}
+
+/// Where the station equations start, read field by field: the element
+/// list (see [`section2`]), the last record's tail, then the interval block
+///
+/// ```text
+/// BL, BL, BL, BL n, n x { GUID, B, BL kind, BD, BD station,
+///     BD distance, BD length, BL element, BL before, BL after, 6 RD }
+/// ```
+///
+/// A free arc last has two tail forms; both positions are returned and the
+/// lists after them settle which one holds.
+fn post_cache_starts(data: &[u8], start: usize, end: usize) -> Option<Vec<usize>> {
+    let count_at = section2(data, start, end)?.count_at;
+    let mut bits = Bits::new(data, count_at, end);
+    let n = usize::try_from(bits.bit_long()?).ok().filter(|n| *n < 10_000)?;
+    let intervals = |pos: usize| interval_block_end(data, pos, end);
+    if n == 0 {
+        return intervals(bits.pos).map(|pos| vec![pos]);
+    }
+    let mut at = bits.pos;
+    for _ in 1..n {
+        at = record_at(data, at, end, false)?.1;
+    }
+    let (element, body_end) = record_at(data, at, end, true)?;
+    let ends: Vec<usize> = tails(&element.kind)
+        .iter()
+        .filter_map(|tail| {
+            let mut b = Bits::new(data, body_end, end);
+            tail(&mut b).then_some(b.pos).and_then(intervals)
+        })
+        .collect();
+    (!ends.is_empty()).then_some(ends)
+}
+
 /// The station equations and design speeds after an alignment's
 /// intervals: `BL k`, `k x { '00' 0xBE 0x04, BD raw, GUID, BD back,
 /// BD ahead, B increasing }`, then `BL 1, BL n`,
@@ -2511,9 +2874,31 @@ pub(super) fn equations_and_speeds(
     first: f64,
     last: f64,
 ) -> (Vec<StationEquation>, Vec<DesignSpeed>) {
+    match post_cache_starts(data, start, end) {
+        Some(at) => at.into_iter().find_map(|pos| post_cache_at(data, pos, end, first, last, true)),
+        // debt: records civil3drust wrote invalid (see `elements`) are
+        // probed for both lists.
+        None => (start..end).find_map(|pos| post_cache_at(data, pos, end, first, last, false)),
+    }
+    .map(|(equations, speeds, _)| (equations, speeds))
+    .unwrap_or_default()
+}
+
+/// The station equations and design speeds read at `pos`, and the bit
+/// after the speeds. `empty` also accepts a table with neither (an
+/// alignment whose start station was changed), which alone is too weak a
+/// pattern to search for.
+fn post_cache_at(
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    first: f64,
+    last: f64,
+    empty: bool,
+) -> Option<(Vec<StationEquation>, Vec<DesignSpeed>, usize)> {
     let slack = 1e-3 * (last - first).abs().max(1.0);
     let fits = |v: f64| v.is_finite() && v >= first - slack && v <= last + slack;
-    let read = |pos: usize| -> Option<(Vec<StationEquation>, Vec<DesignSpeed>)> {
+    let read = |pos: usize| -> Option<(Vec<StationEquation>, Vec<DesignSpeed>, usize)> {
         let mut bits = Bits::new(data, pos, end);
         let k = bits.bit_long()?;
         if !(0..=64).contains(&k) {
@@ -2536,13 +2921,15 @@ pub(super) fn equations_and_speeds(
         }
         (bits.bit_long()? == 1).then_some(())?;
         let n = bits.bit_long()?;
-        if !(0..=256).contains(&n) || (k == 0 && n == 0) {
+        if !(0..=256).contains(&n) || (k == 0 && n == 0 && !empty) {
             return None;
         }
         let mut speeds = Vec::new();
         for _ in 0..n {
             (bits.bit_long()? == 1).then_some(())?;
-            let station = bits.bit_double().filter(|v| fits(*v))?;
+            // A speed keeps its station when the start station moves later,
+            // so it may lie before the start.
+            let station = bits.bit_double().filter(|v| fits(*v) || (*v < first && *v >= first - (last - first) - slack))?;
             let speed = bits.bit_double().filter(|v| v.is_normal() && *v >= 1.0 && *v < 1000.0)?;
             bits.pos += 128;
             if bits.pos > end {
@@ -2553,18 +2940,277 @@ pub(super) fn equations_and_speeds(
         let ordered = |a: &[f64]| a.windows(2).all(|w| w[0] <= w[1]);
         (ordered(&equations.iter().map(|e| e.raw).collect::<Vec<_>>())
             && ordered(&speeds.iter().map(|s| s.station).collect::<Vec<_>>()))
-        .then_some((equations, speeds))
+        .then_some((equations, speeds, bits.pos))
     };
-    (start..end).find_map(read).unwrap_or_default()
+    read(pos)
+}
+
+/// What kind of alignment a record is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AlignmentType {
+    Centerline,
+    Offset,
+    /// A connected (curb return) alignment between two others.
+    CurbReturn,
+    Miscellaneous,
+    /// A value not seen in a sample (5 is most likely Rail).
+    Other(i32),
+}
+
+impl AlignmentType {
+    fn from_code(code: i32) -> Self {
+        match code {
+            1 => Self::Centerline,
+            2 => Self::Offset,
+            3 => Self::CurbReturn,
+            4 => Self::Miscellaneous,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// The alignment type and the bit after it: after the design speeds,
+/// `BD, BL 0, BL m, m x BD element id, BL type`.
+/// The type after the equations and speeds read at `pos` (see
+/// [`post_cache_at`]): `BD, BL 0, BL m, m x BD element id, BL type`,
+/// confirmed by what follows it.
+fn typed_at(data: &[u8], pos: usize, end: usize, first: f64, last: f64, empty: bool) -> Option<(AlignmentType, usize)> {
+    let (_, _, pos) = post_cache_at(data, pos, end, first, last, empty)?;
+    let mut bits = Bits::new(data, pos, end);
+    bits.bit_double()?;
+    // debt: some Civil 2013 records have a list here (count, element id
+    // pairs, then slope tables), not mapped; their type is not read.
+    (bits.bit_long()? == 0).then_some(())?;
+    let m = bits.bit_long()?;
+    if !(0..=10_000).contains(&m) {
+        return None;
+    }
+    for _ in 0..m {
+        bits.bit_double()?;
+    }
+    let code = bits.bit_long()?;
+    let kind = AlignmentType::from_code(code);
+    let after = bits.pos;
+    // What follows the type confirms it: a centerline's `BL 2, 2, 2`,
+    // an offset's block, a curb return's `BL 1|2, BL 1|2`.
+    let confirmed = match kind {
+        AlignmentType::Offset => offset_parameters(data, after, end).is_some(),
+        AlignmentType::CurbReturn => (0..2).all(|_| bits.bit_long().is_some_and(|v| (1..=2).contains(&v))),
+        _ => (0..3).all(|_| bits.bit_long() == Some(2)),
+    };
+    confirmed.then_some((kind, after))
+}
+
+pub(super) fn alignment_type(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<(AlignmentType, usize)> {
+    let typed = |pos: usize, empty: bool| typed_at(data, pos, end, first, last, empty);
+    match post_cache_starts(data, start, end) {
+        Some(at) => at.into_iter().find_map(|pos| typed(pos, true)),
+        // debt: records civil3drust wrote invalid are probed.
+        None => (start..end).find_map(|pos| typed(pos, false)).or_else(|| (start..end).find_map(|pos| typed(pos, true))),
+    }
+}
+
+/// A stretch of an offset alignment at one offset: the nominal offset or a
+/// widening.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OffsetRegion {
+    /// Negative to the left of the parent.
+    pub offset: f64,
+    /// Station range of the parent the stretch follows.
+    pub parent_start: f64,
+    pub parent_end: f64,
+    /// The stretch's own station range.
+    pub start: f64,
+    pub end: f64,
+    /// 2 at the nominal offset, 1 for a widening.
+    pub kind: i32,
+    /// Element ids as made (not renumbered later).
+    pub first_element: i32,
+    pub last_element: i32,
+}
+
+/// A widening transition: `kind` 1 linear, 2 curve-line-curve,
+/// 4 curve-curve-reverse curve, 5 curve-reverse curve.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WideningTransition {
+    pub kind: i32,
+    pub length: f64,
+    pub element: i32,
+    /// Curve radii for kinds 2, 4 and 5 (in the order the dialog lists
+    /// them); empty for a linear transition.
+    pub radii: Vec<f64>,
+}
+
+/// The parameters of an offset alignment.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OffsetParameters {
+    /// Follows its parent (false once made static).
+    pub dynamic: bool,
+    /// The parent was deleted.
+    pub parent_deleted: bool,
+    /// Nominal offset, negative to the left of the parent.
+    pub offset: f64,
+    /// On the left of the parent.
+    pub left: bool,
+    /// Start and end stations locked to the parent's start and end.
+    pub lock_start: bool,
+    pub lock_end: bool,
+    /// Station locking (false: geometry locking).
+    pub station_locking: bool,
+    pub regions: Vec<OffsetRegion>,
+    pub transitions: Vec<WideningTransition>,
+    /// For each parent element id, the offset elements that follow it.
+    pub element_map: Vec<(i32, Vec<i32>)>,
+    /// The parent's stations that anchor the ends of every region and
+    /// transition, each with the GUID of the parent interval there.
+    pub anchors: Vec<(f64, [u8; 16])>,
+}
+
+/// `BD offset, BD parent from, BD parent to, BD from, BD to, BL kind,
+/// BL first element, BL last element, BL 0 x 5, BL 3`.
+fn offset_region(bits: &mut Bits) -> Option<OffsetRegion> {
+    let mut v = [0.0; 5];
+    for x in &mut v {
+        *x = bits.bit_double().filter(|v| v.is_finite())?;
+    }
+    let (kind, first_element, last_element) = (bits.bit_long()?, bits.bit_long()?, bits.bit_long()?);
+    for want in [0, 0, 0, 0, 0, 3] {
+        (bits.bit_long()? == want).then_some(())?;
+    }
+    Some(OffsetRegion {
+        offset: v[0],
+        parent_start: v[1],
+        parent_end: v[2],
+        start: v[3],
+        end: v[4],
+        kind,
+        first_element,
+        last_element,
+    })
+}
+
+fn guid(bits: &mut Bits) -> Option<[u8; 16]> {
+    let mut g = [0u8; 16];
+    for b in &mut g {
+        *b = bits.raw_short_byte()?;
+    }
+    Some(g)
+}
+
+/// The offset block after an offset alignment's type (`pos`):
+///
+/// ```text
+/// BL update (1 dynamic, 2 static), BL 2, BL 1 (2: parent deleted),
+/// BD offset, BL side (1 left, 2 right), B lock start, B lock end,
+/// BL lock mode (1 geometry, 2 station), BL n, n x region,
+/// BL t, t x { BL kind, BD length, BL element, kind values },
+/// BL k, k x { BL parent element, BL -1, BL n, n x BL element },
+/// BL a, a x { BD parent station, GUID }
+/// ```
+pub(super) fn offset_parameters(data: &[u8], pos: usize, end: usize) -> Option<OffsetParameters> {
+    offset_block(data, pos, end).map(|(parameters, _)| parameters)
+}
+
+/// The offset parameters and the bit after them.
+fn offset_block(data: &[u8], pos: usize, end: usize) -> Option<(OffsetParameters, usize)> {
+    let mut bits = Bits::new(data, pos, end);
+    let head = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+    if !(1..=2).contains(&head[0]) || head[1] != 2 || !(1..=2).contains(&head[2]) {
+        return None;
+    }
+    let offset = bits.bit_double().filter(|v| v.is_finite())?;
+    let left = match bits.bit_long()? {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let (lock_start, lock_end) = (bits.bit()?, bits.bit()?);
+    let lock_mode = bits.bit_long()?;
+    let n = bits.bit_long()?;
+    if !(1..=2).contains(&lock_mode) || !(1..=1000).contains(&n) {
+        return None;
+    }
+    let regions = (0..n).map(|_| offset_region(&mut bits)).collect::<Option<Vec<_>>>()?;
+    let t = bits.bit_long()?;
+    if !(0..=1000).contains(&t) {
+        return None;
+    }
+    let mut transitions = Vec::new();
+    for _ in 0..t {
+        let kind = bits.bit_long()?;
+        let length = bits.bit_double()?;
+        let element = bits.bit_long()?;
+        let radii = match kind {
+            // BD 0, BD 0, BL 2, BD 0.
+            1 => {
+                bits.bit_double()?;
+                bits.bit_double()?;
+                bits.bit_long()?;
+                bits.bit_double()?;
+                Vec::new()
+            }
+            // BD 0, then the radii.
+            2 | 4 => {
+                bits.bit_double()?;
+                (0..if kind == 2 { 2 } else { 3 }).map(|_| bits.bit_double()).collect::<Option<Vec<_>>>()?
+            }
+            // BD 0, B, BD radius.
+            5 => {
+                bits.bit_double()?;
+                bits.bit()?;
+                vec![bits.bit_double()?]
+            }
+            _ => return None,
+        };
+        transitions.push(WideningTransition { kind, length, element, radii });
+    }
+    let k = bits.bit_long()?;
+    if !(0..=10_000).contains(&k) {
+        return None;
+    }
+    let mut element_map = Vec::new();
+    for _ in 0..k {
+        let parent = bits.bit_long()?;
+        bits.bit_long()?;
+        let count = bits.bit_long()?;
+        if !(0..=10_000).contains(&count) {
+            return None;
+        }
+        element_map.push((parent, (0..count).map(|_| bits.bit_long()).collect::<Option<Vec<_>>>()?));
+    }
+    let a = bits.bit_long()?;
+    if !(0..=10_000).contains(&a) {
+        return None;
+    }
+    let anchors = (0..a)
+        .map(|_| Some((bits.bit_double()?, guid(&mut bits)?)))
+        .collect::<Option<Vec<_>>>()?;
+    let parameters = OffsetParameters {
+        dynamic: head[0] == 1,
+        parent_deleted: head[2] == 2,
+        offset,
+        left,
+        lock_start,
+        lock_end,
+        station_locking: lock_mode == 2,
+        regions,
+        transitions,
+        element_map,
+        anchors,
+    };
+    Some((parameters, bits.pos))
 }
 
 /// Bits that follow each mask range's stations.
 const MASK_TAIL_BITS: usize = 257;
 
-/// Station ranges an alignment hides (its masking): `BL n` four times, then
-/// `n` x `{ BD from, BD to, 257 bits }`. Ranges lie within `first..=last`.
-// ponytail: found by probing bit offsets for a list whose every range fits
-// the alignment; parse the records before it once their layout is known.
+/// Station ranges an alignment hides (its masking): after the type,
+/// `BL 2` three times, `BL n`, then `n` x `{ BD from, BD to, 257 bits }`.
+/// Ranges lie within `first..=last`.
 pub(super) fn masked_ranges(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Vec<(f64, f64)> {
     let slack = 1e-3 * (last - first).abs().max(1.0);
     let fits = |v: f64| v.is_finite() && v >= first - slack && v <= last + slack;
@@ -2599,7 +3245,25 @@ pub(super) fn masked_ranges(data: &[u8], start: usize, end: usize, first: f64, l
         }
         Some(out)
     };
-    // The list sits near the end of the body; the last one that parses wins.
+    // After the type of a centerline (or miscellaneous) alignment come
+    // `BL 2, 2, 2` and the list (see `read`).
+    if let Some((kind, after)) = post_cache_starts(data, start, end)
+        .and_then(|at| at.into_iter().find_map(|pos| typed_at(data, pos, end, first, last, true)))
+    {
+        // Offset and curb-return records end with their parameters: no list.
+        if matches!(kind, AlignmentType::Offset | AlignmentType::CurbReturn) {
+            return Vec::new();
+        }
+        let mut bits = Bits::new(data, after, end);
+        let count = (0..3).all(|_| bits.bit_long() == Some(2)).then(|| bits.bit_long()).flatten();
+        return match count {
+            Some(0) => Vec::new(),
+            _ => read(after).unwrap_or_default(),
+        };
+    }
+    // debt: records whose type is not read (Civil 2013 records with the
+    // list before the type, records civil3drust wrote invalid): the last
+    // list that parses near the end of the body wins.
     (start..end).rev().find_map(read).unwrap_or_default()
 }
 
@@ -2689,6 +3353,7 @@ fn parallel_spiral(
         })
         .collect();
     let last = *moved.last()?;
+    made(&moved, Piece::Spiral, 0.0);
     Some((
         moved,
         State {
@@ -2772,6 +3437,7 @@ fn slide_between_lines(
     let (q, end) = pieces(begin, &parts);
     let shift = u * (-cross(end.point - b, v) / den);
     close(points, pending, line.start + shift);
+    shift_notes(&q, shift);
     Some((
         q.into_iter().map(|p| p + shift).collect(),
         State {
