@@ -203,6 +203,12 @@ pub struct HeaderVariables {
     /// Independent current view/drafting state from an R12 header.
     #[cfg_attr(feature = "serde", serde(default))]
     pub legacy: Option<LegacyHeaderState>,
+    /// The `$DIM…` header variables a DXF file carried. `None` when the header
+    /// was read from a DWG or made new: every dimension variable is then the
+    /// drawing's own. A dimension variable a DXF left out keeps its default
+    /// here, and stands for the current dimension style's value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dxf_dim_variables: Option<std::collections::BTreeSet<String>>,
     // ==================== Version-specific Flags ====================
     /// REQUIREDVERSIONS (R2013+) - Bit coded required versions
     pub required_versions: i64,
@@ -861,6 +867,7 @@ impl Default for HeaderVariables {
     fn default() -> Self {
         Self {
             legacy: None,
+            dxf_dim_variables: None,
             // Version-specific flags
             required_versions: 0,
             acad_maintenance_version: 0,
@@ -953,9 +960,9 @@ impl Default for HeaderVariables {
             dim_text_fill: 0,
             dim_text_fill_color: Color::ByBlock,
             dim_text_direction: false,
-            dim_alt_mzf: 0.0,
+            dim_alt_mzf: 100.0,
             dim_alt_mzs: String::new(),
-            dim_mzf: 0.0,
+            dim_mzf: 100.0,
             dim_mzs: String::new(),
             cast_shadow: 0,
             ucs_ortho_origins: [Vector3::ZERO; 6],
@@ -3923,11 +3930,18 @@ impl CadDocument {
 
         // Determine the next *Paper_Space block name.
         // ACAD uses: *Paper_Space, *Paper_Space0, *Paper_Space1, …
-        let ps_count = self
-            .block_records
-            .iter()
-            .filter(|br| br.is_paper_space())
-            .count();
+        // A new layout goes after every existing tab. Counting the layouts
+        // would repeat a tab order once one before the last was deleted.
+        let tab_order = self
+            .objects
+            .values()
+            .filter_map(|obj| match obj {
+                ObjectType::Layout(l) => Some(l.tab_order),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let block_name = if self.block_records.get("*Paper_Space").is_none() {
             "*Paper_Space".to_string()
         } else {
@@ -3949,7 +3963,7 @@ impl CadDocument {
         let mut layout = crate::objects::Layout::new(name);
         layout.handle = layout_handle;
         layout.owner = self.header.acad_layout_dict_handle;
-        layout.tab_order = ps_count as i16 + 1;
+        layout.tab_order = tab_order;
         layout.block_record = br_handle;
 
         // Link block record → layout

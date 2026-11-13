@@ -276,35 +276,83 @@ impl SpiralShape {
     }
 }
 
-/// One class key: `BL (type << 24 | id)`, then its value by type: 0x01,
-/// 0x0D BL; 0x02 BD; 0x03 one byte; 0x04, 0x12 nothing; 0x0B, 0x19 BL n,
-/// n x BL; 0x0C BL n, n x BD; 0x13, 0x16 64 bits.
-pub(super) fn key(bits: &mut Bits) -> Option<()> {
-    match bits.bit_long()? as u32 >> 24 {
-        0x01 | 0x0D => {
-            bits.bit_long()?;
-        }
-        0x02 => {
-            bits.bit_double()?;
-        }
-        0x03 => {
-            bits.bits_value(8)?;
-        }
-        0x04 | 0x12 => {}
+/// The value of one class key, by the key's type byte.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum KeyValue {
+    /// 0x04; 0x0F, 0x10 and 0x12 take a reference from the handle stream.
+    None,
+    /// 0x01, 0x0D: BL.
+    Long(i32),
+    /// 0x02: BD.
+    Double(f64),
+    /// 0x03: one byte.
+    Byte(u8),
+    /// 0x09: three BD.
+    Vector([f64; 3]),
+    /// 0x0B, 0x19: BL n, n x BL.
+    Longs(Vec<i32>),
+    /// 0x0C: BL n, n x BD.
+    Doubles(Vec<f64>),
+    /// 0x0E: CMC (BS index, BL color, RC flags); the color word.
+    Color(u32),
+    /// 0x13, 0x16 (a FILETIME): 64 raw bits.
+    Raw(u64),
+    /// 0x18: BL byte count, UTF-16LE text.
+    Text(String),
+}
+
+impl KeyValue {
+    /// Whether the key takes a reference from the handle stream.
+    pub(super) fn has_reference(key: u32) -> bool {
+        matches!(key >> 24, 0x0F | 0x10 | 0x12)
+    }
+}
+
+/// One class key: `BL (type << 24 | id)`, then its value (see [`KeyValue`]).
+pub(super) fn read_key(bits: &mut Bits) -> Option<(u32, KeyValue)> {
+    let key = bits.bit_long()? as u32;
+    // A list holds at least two bits per value.
+    let count = |bits: &mut Bits| usize::try_from(bits.bit_long()?).ok().filter(|n| *n <= bits.remaining() / 2);
+    let value = match key >> 24 {
+        0x01 | 0x0D => KeyValue::Long(bits.bit_long()?),
+        0x02 => KeyValue::Double(bits.bit_double()?),
+        0x03 => KeyValue::Byte(bits.bits_value(8)?),
+        0x04 | 0x0F | 0x10 | 0x12 => KeyValue::None,
+        0x09 => KeyValue::Vector([bits.bit_double()?, bits.bit_double()?, bits.bit_double()?]),
         0x0B | 0x19 => {
-            for _ in 0..bits.bit_long()? {
-                bits.bit_long()?;
-            }
+            let n = count(bits)?;
+            KeyValue::Longs((0..n).map(|_| bits.bit_long()).collect::<Option<_>>()?)
         }
         0x0C => {
-            for _ in 0..bits.bit_long()? {
-                bits.bit_double()?;
-            }
+            let n = count(bits)?;
+            KeyValue::Doubles((0..n).map(|_| bits.bit_double()).collect::<Option<_>>()?)
         }
-        0x13 | 0x16 => bits.pos += 64,
+        0x0E => {
+            bits.bit_short()?;
+            let color = bits.bit_long()? as u32;
+            bits.bits_value(8)?;
+            KeyValue::Color(color)
+        }
+        0x13 | 0x16 => {
+            let low = bits.raw_long()? as u32;
+            let high = bits.raw_long()? as u32;
+            KeyValue::Raw(u64::from(high) << 32 | u64::from(low))
+        }
+        0x18 => {
+            let bytes = usize::try_from(bits.bit_long()?).ok().filter(|n| n % 2 == 0 && n * 8 <= bits.remaining())?;
+            let units = (0..bytes / 2)
+                .map(|_| Some(u16::from_le_bytes([bits.bits_value(8)?, bits.bits_value(8)?])))
+                .collect::<Option<Vec<_>>>()?;
+            KeyValue::Text(String::from_utf16_lossy(&units))
+        }
         _ => return None,
-    }
-    Some(())
+    };
+    Some((key, value))
+}
+
+/// One class key read past (see [`read_key`]).
+pub(super) fn key(bits: &mut Bits) -> Option<()> {
+    read_key(bits).map(|_| ())
 }
 
 /// Class data alignments and profiles share, read up to their own fields:
@@ -405,28 +453,7 @@ pub(super) fn elements(data: &[u8], start: usize, end: usize) -> Vec<AlignmentEl
     if let Some(s) = section2(data, start, end) {
         return element_list_at(data, s.count_at, end).unwrap_or_default();
     }
-    // debt: records civil3drust wrote invalid: the list is found by trying
-    // positions.
-    if let Some(list) = (start..end).find_map(|pos| element_list_at(data, pos, end)) {
-        return list;
-    }
-    // debt: records some kinds still leave unread (free arcs through a
-    // point, compound spirals, the 2013 layout after the last record) are
-    // found by scanning for their headers.
-    let mut out: Vec<AlignmentElement> = Vec::new();
-    for pos in start..end {
-        if !is_header(data, pos, end) {
-            continue;
-        }
-        let member = member_body(data, pos, end);
-        let after_type = type_end(data, pos, end);
-        if let Some(element) = read_element(&mut Bits::new(data, pos, end), member, after_type) {
-            if element.id > 0 && !out.iter().any(|e| e.id == element.id) {
-                out.push(element);
-            }
-        }
-    }
-    out
+    Vec::new()
 }
 
 /// `BL type` (raw, 257..=280) followed by `BS 2`, or `BS 0` in some
@@ -2709,23 +2736,6 @@ pub(super) fn start_station(data: &[u8], start: usize, end: usize) -> f64 {
     if let Some(s) = section2(data, start, end) {
         return s.start_station;
     }
-    // debt: records civil3drust wrote invalid; the BD after the `2.25`
-    // marker, 16 bits and three flags (`1 1 0`) later, found by scanning.
-    let window = end.min(start + 4096);
-    for pos in start..window {
-        let mut bits = Bits::new(data, pos, end);
-        if bits.bit_double() != Some(2.25) || bits.pos != pos + 66 {
-            continue;
-        }
-        bits.pos += 16;
-        let flags = (bits.bit(), bits.bit(), bits.bit());
-        if flags == (Some(true), Some(true), Some(false)) {
-            if let Some(station) = bits.bit_double().filter(|v| v.is_finite() && v.abs() < 1e7) {
-                return station;
-            }
-        }
-        return 0.0;
-    }
     0.0
 }
 
@@ -2749,20 +2759,7 @@ pub struct AlignmentCriteria {
 /// bit, then criteria-based design, criteria file, check set, tangency
 /// swapping, parameter lock and tangency check.
 pub(super) fn criteria(data: &[u8], start: usize, end: usize) -> Option<AlignmentCriteria> {
-    let mut bits = if let Some(s) = section2(data, start, end) {
-        Bits::new(data, s.criteria_at, end)
-    } else {
-        // debt: records civil3drust wrote invalid, found by scanning for 2.25.
-        let window = end.min(start + 4096);
-        let pos = (start..window).find(|&pos| {
-            let mut bits = Bits::new(data, pos, end);
-            bits.bit_double() == Some(2.25) && bits.pos == pos + 66
-        })?;
-        let mut bits = Bits::new(data, pos + 66 + 16, end);
-        ((bits.bit()?, bits.bit()?, bits.bit()?) == (true, true, false)).then_some(())?;
-        bits.bit_double()?;
-        bits
-    };
+    let mut bits = Bits::new(data, section2(data, start, end)?.criteria_at, end);
     bits.bit()?;
     Some(AlignmentCriteria {
         criteria_based_design: bits.bit()?,
@@ -2874,13 +2871,9 @@ pub(super) fn equations_and_speeds(
     first: f64,
     last: f64,
 ) -> (Vec<StationEquation>, Vec<DesignSpeed>) {
-    match post_cache_starts(data, start, end) {
-        Some(at) => at.into_iter().find_map(|pos| post_cache_at(data, pos, end, first, last, true)),
-        // debt: records civil3drust wrote invalid (see `elements`) are
-        // probed for both lists.
-        None => (start..end).find_map(|pos| post_cache_at(data, pos, end, first, last, false)),
-    }
-    .map(|(equations, speeds, _)| (equations, speeds))
+    post_cache_starts(data, start, end)
+        .and_then(|at| at.into_iter().find_map(|pos| post_cache_at(data, pos, end, first, last, true)))
+        .map(|(equations, speeds, _)| (equations, speeds))
     .unwrap_or_default()
 }
 
@@ -3004,11 +2997,7 @@ fn typed_at(data: &[u8], pos: usize, end: usize, first: f64, last: f64, empty: b
 
 pub(super) fn alignment_type(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<(AlignmentType, usize)> {
     let typed = |pos: usize, empty: bool| typed_at(data, pos, end, first, last, empty);
-    match post_cache_starts(data, start, end) {
-        Some(at) => at.into_iter().find_map(|pos| typed(pos, true)),
-        // debt: records civil3drust wrote invalid are probed.
-        None => (start..end).find_map(|pos| typed(pos, false)).or_else(|| (start..end).find_map(|pos| typed(pos, true))),
-    }
+    post_cache_starts(data, start, end)?.into_iter().find_map(|pos| typed(pos, true))
 }
 
 /// A stretch of an offset alignment at one offset: the nominal offset or a
@@ -3261,9 +3250,11 @@ pub(super) fn masked_ranges(data: &[u8], start: usize, end: usize, first: f64, l
             _ => read(after).unwrap_or_default(),
         };
     }
-    // debt: records whose type is not read (Civil 2013 records with the
-    // list before the type, records civil3drust wrote invalid): the last
-    // list that parses near the end of the body wins.
+    if post_cache_starts(data, start, end).is_none() {
+        return Vec::new();
+    }
+    // debt: Civil 2013 records with the list before the type (type not
+    // read): the last list that parses near the end of the body wins.
     (start..end).rev().find_map(read).unwrap_or_default()
 }
 

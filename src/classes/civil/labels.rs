@@ -37,6 +37,83 @@ pub(super) fn marked_stations(data: &[u8], start: usize, end: usize) -> Vec<f64>
     stations
 }
 
+/// The labels of an alignment label group read by their fields: a 293-bit
+/// header, `BL n`, `n` labels. A label is a key block (`BL k`, `k` keys; a
+/// station label's station is key 0x0200D020, the first label holds the
+/// group's settings), 44 bits, a key list (`BL k`, `k` keys without values),
+/// `BL`, `BL m` and `m` items: `BL x3, BL mask`, then for mask 0x0CC04E08
+/// 18 bits, for mask 0x0CC00208 (a dragged label) 7 bits, `BD`, `BD`, 5
+/// bits. Returns the station keys' values and the bit after the labels.
+// ponytail: the header, the 44 bits and the item bits around the BDs are
+// skipped by length (constant in every sample); name them once a drawing
+// varies them.
+fn group_labels(data: &[u8], start: usize, end: usize) -> Option<(Vec<f64>, usize)> {
+    const HEADER: usize = 293;
+    const STATION: u32 = 0x0200_D020;
+    let mut bits = Bits::new(data, start + HEADER, end);
+    let n = bits.bit_long()?;
+    let mut stations = Vec::new();
+    for _ in 0..n {
+        for _ in 0..bits.bit_long()? {
+            if let (STATION, super::alignment::KeyValue::Double(station)) = super::alignment::read_key(&mut bits)? {
+                stations.push(station);
+            }
+        }
+        bits.skip(44)?;
+        for _ in 0..bits.bit_long()? {
+            bits.bit_long()?;
+        }
+        bits.bit_long()?;
+        for _ in 0..bits.bit_long()? {
+            for _ in 0..3 {
+                bits.bit_long()?;
+            }
+            match bits.bit_long()? as u32 {
+                0x0CC0_4E08 => bits.skip(18)?,
+                0x0CC0_0208 => {
+                    bits.skip(7)?;
+                    bits.bit_double()?;
+                    bits.bit_double()?;
+                    bits.skip(5)?;
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some((stations, bits.pos))
+}
+
+/// Stations of a station or minor station label group: its labels (see
+/// [`group_labels`]), then a 294-bit trailer.
+pub(super) fn group_stations(data: &[u8], start: usize, end: usize) -> Option<Vec<f64>> {
+    let (stations, at) = group_labels(data, start, end)?;
+    (end - at == 294).then_some(stations)
+}
+
+/// Geometry point kinds a geometry point label group lists, read after its
+/// labels (see [`group_labels`]): a key block, `BL` x5, `BD, BD`, 7
+/// bits, `BL count`, `count` x `BL` (the low byte is the kind: 1 the
+/// alignment's beginning, 2 its end, 3 and up the points between), then 19
+/// bits.
+// ponytail: the 7 and 19 bits are skipped by length (constant in every
+// sample).
+pub(super) fn group_point_kinds(data: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
+    let (_, at) = group_labels(data, start, end)?;
+    let mut bits = Bits::new(data, at, end);
+    for _ in 0..bits.bit_long()? {
+        super::alignment::read_key(&mut bits)?;
+    }
+    for _ in 0..5 {
+        bits.bit_long()?;
+    }
+    bits.bit_double()?;
+    bits.bit_double()?;
+    bits.skip(7)?;
+    let count = bits.bit_long()?;
+    let kinds = (0..count).map(|_| bits.bit_long().map(|v| (v & 0xFF) as u8)).collect::<Option<Vec<_>>>()?;
+    (bits.remaining() == 19).then_some(kinds)
+}
+
 /// Bits before each geometry point kind a label group labels (groups
 /// written from Civil 3D 2018 on).
 const POINT_KIND_MARKER: &[u8] = b"0011001101010010011111111110100100000001";
@@ -359,9 +436,6 @@ fn full_double(data: &[u8], pos: usize, end: usize) -> Option<f64> {
     (bits.pos == pos + 66 && value.is_finite()).then_some(value)
 }
 
-/// Every field of a text component sits at a fixed distance from this BD.
-const COMPONENT_MARKER: f64 = 156_679.000_488_281_22;
-
 /// A plotted size: zero, or a short decimal well under a drawing unit.
 fn plotted_size(v: f64) -> bool {
     v == 0.0 || ((1e-6..0.1).contains(&v.abs()) && ((v * 1e6).round() - v * 1e6).abs() < 1e-3)
@@ -373,6 +447,71 @@ fn plotted_size(v: f64) -> bool {
 // overrides. Read them in order once those are decoded.
 fn offsets(data: &[u8], from: usize, end: usize) -> Option<(f64, f64, f64, usize)> {
     offsets_within(data, from, end.min(from + 600))
+}
+
+/// The general block up to its fields: 12 flag bits, 32 bits more when
+/// flag 4 is clear, then the anchor point (4 bits) and 20 bits. Returns
+/// the anchor point.
+fn general_head(bits: &mut Bits) -> Option<u8> {
+    bits.bits_value(4)?;
+    if bits.bits_value(8)? & 0x80 == 0 {
+        bits.skip(32)?;
+    }
+    let point = bits.bits_value(4)?;
+    bits.skip(20)?;
+    Some(point)
+}
+
+/// X offset, y offset and border gap read by their fields: the general
+/// head (see [`general_head`]), `1000`, 6 BL, B, BD x, BD, BD y, BD, B,
+/// BD gap. Also returns the bit after the gap.
+fn general_offsets(data: &[u8], at: usize, end: usize) -> Option<(f64, f64, f64, usize)> {
+    let mut bits = Bits::new(data, at, end);
+    general_head(&mut bits)?;
+    (bits.bits_value(4)? == 0b1000).then_some(())?;
+    for _ in 0..6 {
+        bits.bit_long()?;
+    }
+    bits.bit()?;
+    let x = bits.bit_double()?;
+    bits.bit_double()?;
+    let y = bits.bit_double()?;
+    bits.bit_double()?;
+    bits.bit()?;
+    let gap = bits.bit_double()?;
+    Some((x, y, gap, bits.pos))
+}
+
+/// A `CMC` color: BS, BL with the color method in its top byte, RC.
+fn color(bits: &mut Bits) -> Option<()> {
+    bits.bit_short()?;
+    let rgb = bits.bit_long()? as u32;
+    matches!(rgb >> 24, 0xC0..=0xC3 | 0xC8).then_some(())?;
+    bits.raw_short_byte().map(|_| ())
+}
+
+/// Where the content string starts, read on from the gap: 4 bits, BD,
+/// color, BL, color, BL, BL, color, BL, BL, BL, `BL n`, `n` BLs, BL, BL
+/// (63, 0 in text components).
+fn content_at(data: &[u8], pos: usize, end: usize) -> Option<usize> {
+    let mut bits = Bits::new(data, pos, end);
+    bits.skip(4)?;
+    bits.bit_double()?;
+    color(&mut bits)?;
+    bits.bit_long()?;
+    color(&mut bits)?;
+    bits.bit_long()?;
+    bits.bit_long()?;
+    color(&mut bits)?;
+    for _ in 0..3 {
+        bits.bit_long()?;
+    }
+    let n = bits.bit_long()?;
+    (0..=64).contains(&n).then_some(())?;
+    for _ in 0..n + 2 {
+        bits.bit_long()?;
+    }
+    Some(bits.pos)
 }
 
 /// X offset, y offset and border gap, with where the block starts.
@@ -416,49 +555,53 @@ pub(super) fn line_component(data: &[u8], start: usize, end: usize) -> Option<(f
 }
 
 pub(super) fn text_component(data: &[u8], start: usize, end: usize) -> Option<LabelText> {
-    // The content is the longest format string; rotation and attachment
-    // follow it.
-    let (content, after) = inline_strings_at(data, start, end)
-        .into_iter()
-        .max_by_key(|(s, _)| (s.contains("<["), s.len()))?;
+    // After the style's component lists: `BL, 2 bits, BD height, BL, BL
+    // color`, then the component itself: `BL type tag, BL, BL, BL`, then its
+    // general block. A height of 1.0 (a drawing unit) is the unset one.
+    let head = super::style::class_data(data, start, end).and_then(|at| {
+        let mut bits = Bits::new(data, at, end);
+        bits.bit_long()?;
+        bits.pos += 2;
+        let height = bits.bit_double()?;
+        for _ in 0..6 {
+            bits.bit_long()?;
+        }
+        Some(((0.0..1.0).contains(&height).then_some(height).filter(|v| *v > 0.0), bits.pos))
+    });
+    let height = head.and_then(|(height, _)| height);
+    let general = head.map(|(_, at)| at);
+    let fields = general.and_then(|at| general_offsets(data, at, end));
+    // The content string, then rotation and attachment.
+    let (content, after) = fields
+        .and_then(|(.., pos)| content_at(data, pos, end))
+        .and_then(|pos| string_at(data, pos, end))
+        .or_else(|| {
+            // debt: components the fields above do not read (8 of 1929 in
+            // the samples, component tag 0x0022001F) take the longest
+            // format string.
+            inline_strings_at(data, start, end)
+                .into_iter()
+                .max_by_key(|(s, _)| (s.contains("<["), s.len()))
+        })?;
     let mut bits = Bits::new(data, after, end);
     let rotation = bits.bit_double().filter(|v| v.abs() <= 10.0).unwrap_or(0.0);
     bits.bit_double();
     let attachment = bits.bit_short().and_then(|v| u8::try_from(v).ok()).filter(|v| *v <= 8).unwrap_or(6);
-    let marker = (start..end)
-        .find(|&pos| full_double(data, pos, end).is_some_and(|v| (v - COMPONENT_MARKER).abs() < 1e-6));
-    let plotted = |v: f64| (v.abs() > 1e-6 && v.abs() < 1.0).then_some(v);
-    // Components written without the marker keep the same block; it is then
-    // the first one in the record.
-    let block = match marker {
-        Some(m) => offsets(data, m + 82, end),
-        None => offsets_within(data, start, end),
-    };
-    let (x_offset, y_offset, gap) = block.map_or((0.0, 0.0, 0.0), |(x, y, gap, _)| (x, y, gap));
-    // The height ends 68 bits before the marker; without one it starts 211
-    // bits before the offset block.
-    let height = marker
-        .and_then(|m| m.checked_sub(68))
-        .or_else(|| block.and_then(|(.., block_at)| block_at.checked_sub(211)))
-        .and_then(|p| full_double(data, p, end))
-        .and_then(plotted)
-        .filter(|v| *v > 0.0);
-    // A 16-bit header after the marker ends with the anchor point, when the
-    // component's settings block (opening 1011) follows it directly.
-    // ponytail: only that short header form is read; longer ones leave it
-    // unknown until their fields are decoded.
-    let anchor_point = marker.and_then(|m| {
-        let mut bits = Bits::new(data, m + 82, end);
-        let mut read = |n: usize| -> Option<u8> {
-            let mut v = 0u8;
-            for _ in 0..n {
-                v = (v << 1) | u8::from(bits.bit()?);
-            }
-            Some(v)
-        };
-        read(12)?;
-        let point = read(4)?;
-        (read(4)? == 0b1011).then_some(point)
+    let (x_offset, y_offset, gap) = fields
+        .map(|(x, y, gap, _)| (x, y, gap))
+        .or_else(|| {
+            // debt: components whose general block does not read (none in
+            // the samples) are found by probing.
+            general.and_then(|at| offsets(data, at, end).map(|(x, y, gap, _)| (x, y, gap)))
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+    // The anchor point, when the component's settings block (opening
+    // 1011) follows it.
+    let anchor_point = general.and_then(|at| {
+        let mut bits = Bits::new(data, at, end);
+        let point = general_head(&mut bits)?;
+        bits.pos -= 20;
+        (bits.bits_value(4)? == 0b1011).then_some(point)
     });
     Some(LabelText {
         content: parse_format(&content),

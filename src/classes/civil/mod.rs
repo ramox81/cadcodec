@@ -446,6 +446,13 @@ impl ArchEntityData {
         // intervals) are only read through their record marker.
         self.main_stream()
             .map(|(data, start, end)| {
+                if matches!(self.dxf_name.as_str(), "AECC_ALIGNMENT_STATION_LABEL_GROUP" | "AECC_ALIGNMENT_MINOR_STATION_LABEL_GROUP") {
+                    if let Some(stations) = labels::group_stations(data, start, end) {
+                        return stations;
+                    }
+                }
+                // debt: other label group classes are searched for their
+                // stations.
                 let marked = labels::marked_stations(data, start, end);
                 if marked.len() >= 2 { marked } else { labels::stations(data, start, end) }
             })
@@ -453,15 +460,17 @@ impl ArchEntityData {
     }
 
     /// Geometry point kinds a geometry point label group
-    /// (`AECC_ALIGNMENT_GEOMPOINT_LABEL_GROUP`) is limited to: `1` the
-    /// alignment's beginning, `2` its end. Empty when the group does not
-    /// list them (every point is labelled).
+    /// (`AECC_ALIGNMENT_GEOMPOINT_LABEL_GROUP`) labels: `1` the alignment's
+    /// beginning, `2` its end, `3` and up the geometry points between.
     pub fn label_geometry_point_kinds(&self) -> Vec<u8> {
         if self.dxf_name != "AECC_ALIGNMENT_GEOMPOINT_LABEL_GROUP" {
             return Vec::new();
         }
         self.main_stream()
-            .map(|(data, start, end)| labels::geometry_point_kinds(data, start, end))
+            .map(|(data, start, end)| {
+                // debt: groups whose labels do not read are searched.
+                labels::group_point_kinds(data, start, end).unwrap_or_else(|| labels::geometry_point_kinds(data, start, end))
+            })
             .unwrap_or_default()
     }
 
@@ -910,8 +919,8 @@ impl ArchObject {
     /// style class defines them: every component of the plan view, then the
     /// model view and the other view directions.
     ///
-    /// `is_layer` tells layer handles apart, which places each component's
-    /// layer and linetype among the style's references.
+    /// `is_layer` tells layer handles apart; only styles with an unmapped
+    /// block before their component lists need it.
     pub fn display_components(&self, is_layer: impl Fn(u64) -> bool) -> Vec<DisplayComponent> {
         if self.civil_kind() != Some(CivilObjectKind::Style) {
             return Vec::new();
@@ -948,7 +957,7 @@ impl ArchObject {
             return None;
         }
         let (data, start, end) = self.main_stream()?;
-        style::keyed(&style::keyed_doubles(data, start, end), style::BAND_HEIGHT.0, style::BAND_HEIGHT.1).filter(|v| *v > 0.0)
+        style::setting(data, start, end, style::BAND_HEIGHT).filter(|v| *v > 0.0)
     }
 
     /// Block and plotted size of a Civil 3D label tick style.
