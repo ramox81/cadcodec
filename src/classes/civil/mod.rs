@@ -11,10 +11,14 @@ mod alignment;
 mod bits;
 mod cogo;
 mod corridor;
+mod grading;
+mod intersection;
 mod labels;
 mod network;
+mod parameters;
 mod profile;
 mod sample_lines;
+mod section;
 mod style;
 mod subassembly;
 mod tin;
@@ -25,10 +29,14 @@ pub use alignment::{
     StationEquation,
 };
 pub use cogo::CogoPoint;
+pub use grading::{CriteriaValue, GradingCriteria};
+pub use intersection::IntersectionLayout;
 pub use labels::{parse_format, property, LabelPart, LabelText};
-pub use network::PartField;
+pub use network::{PartField, PressurePipe};
+pub use parameters::{Parameter, ParameterValue};
 pub use profile::{CurveMinimumK, ProfileCriteria, ProfileLocking, ProfilePiece, ProfileViewFrame, Pvi};
 pub use sample_lines::SampleLines;
+pub use section::{MassHaulViewFrame, SectionGeometry, SectionViewFrame};
 pub use style::{DisplayComponent, Marker, ViewAxes, ViewAxis};
 pub use subassembly::{AssemblyLayout, Attachment, SubassemblyShape};
 pub use topology::{Topology, TopologyVertex};
@@ -196,7 +204,8 @@ pub fn object_kind_of(dxf_name: &str) -> Option<CivilObjectKind> {
         CivilObjectKind::Settings
     } else if name.starts_with("AECC_LABEL_") || name.ends_with("_TABLE_STYLE") {
         CivilObjectKind::LabelStyle
-    } else if name.contains("_STYLE") {
+    } else if name.contains("_STYLE") && name != "AECC_FEATURE_STYLE" {
+        // (AECC_FEATURE_STYLE is a site container, no display components.)
         CivilObjectKind::Style
     } else {
         CivilObjectKind::Other
@@ -689,6 +698,18 @@ impl ArchEntityData {
             .unwrap_or_default()
     }
 
+    /// Input parameters of a subassembly with their current
+    /// values, in the order the record stores them (integers, doubles,
+    /// strings).
+    pub fn subassembly_parameters(&self) -> Option<Vec<Parameter>> {
+        if self.civil_kind() != Some(CivilKind::Subassembly) {
+            return None;
+        }
+        let strings = self.decode().strings;
+        let (data, start, end) = self.main_stream()?;
+        subassembly::parameters(data, start, end, &strings)
+    }
+
     /// Cross-section shape a Civil 3D subassembly last generated, in its
     /// own (offset, elevation) frame.
     pub fn subassembly_shape(&self) -> Option<SubassemblyShape> {
@@ -781,6 +802,90 @@ impl ArchEntityData {
         cogo::entity_number(data, start, end)
     }
 
+    /// Points of a Civil 3D section (`AECC_SECTION`, `AECC_SECTION_CORRIDOR`)
+    /// in its (offset, elevation) frame, with the point pairs it links.
+    pub fn section_geometry(&self) -> Option<SectionGeometry> {
+        if !matches!(self.dxf_name.as_str(), "AECC_SECTION" | "AECC_SECTION_CORRIDOR") {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        section::geometry(data, start, end)
+    }
+
+    /// Frame of a Civil 3D section view (`AECC_GRAPH_SECTION_VIEW`): where it
+    /// draws offsets and elevations.
+    pub fn section_view_frame(&self) -> Option<SectionViewFrame> {
+        if self.dxf_name != "AECC_GRAPH_SECTION_VIEW" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        section::view_frame(data, start, end)
+    }
+
+    /// Balance curve of a Civil 3D mass haul line (`AECC_MASSHAULLINE`):
+    /// (station, cumulative volume) pairs; place them with the frame of the
+    /// mass haul view that shows the line.
+    pub fn mass_haul_points(&self) -> Vec<crate::types::Vector2> {
+        if self.dxf_name != "AECC_MASSHAULLINE" {
+            return Vec::new();
+        }
+        self.main_stream()
+            .and_then(|(data, start, end)| section::mass_haul_points(data, start, end))
+            .unwrap_or_default()
+    }
+
+    /// Frame of a Civil 3D mass haul view (`AECC_MASS_HAUL_VIEW`): where it
+    /// draws stations and volumes.
+    pub fn mass_haul_view_frame(&self) -> Option<MassHaulViewFrame> {
+        if self.dxf_name != "AECC_MASS_HAUL_VIEW" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        section::mass_haul_view_frame(data, start, end)
+    }
+
+    /// Insertion point of a Civil 3D pressure fitting or appurtenance
+    /// (`AECC_FITTING`, `AECC_APPURTENANCE`), stored like a structure's.
+    pub fn pressure_part_position(&self) -> Option<crate::types::Vector3> {
+        if !matches!(self.dxf_name.as_str(), "AECC_FITTING" | "AECC_APPURTENANCE") {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        network::structure_at(data, start, end)
+    }
+
+    /// Rotation (radians, about Z) of a Civil 3D structure, pressure fitting
+    /// or appurtenance (`AECC_STRUCTURE`, `AECC_FITTING`,
+    /// `AECC_APPURTENANCE`).
+    pub fn network_part_rotation(&self) -> Option<f64> {
+        if !matches!(self.dxf_name.as_str(), "AECC_STRUCTURE" | "AECC_FITTING" | "AECC_APPURTENANCE") {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        network::part_rotation(data, start, end)
+    }
+
+    /// Ends, bulge and joint sizes of a Civil 3D pressure pipe
+    /// (`AECC_PRESSUREPIPE`).
+    pub fn pressure_pipe(&self) -> Option<PressurePipe> {
+        if self.dxf_name != "AECC_PRESSUREPIPE" {
+            return None;
+        }
+        let handles = self.decode().handles;
+        let (data, start, end) = self.main_stream()?;
+        network::pressure_pipe(data, start, end, &handles)
+    }
+
+    /// Road stations and region angles of a Civil 3D intersection
+    /// (`AECC_INTERSECTION`).
+    pub fn intersection_layout(&self) -> Option<IntersectionLayout> {
+        if self.dxf_name != "AECC_INTERSECTION" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        intersection::layout(data, start, end)
+    }
+
     /// Start and end of a Civil 3D pipe (`AECC_PIPE`), as stored.
     pub fn pipe_ends(&self) -> Option<(crate::types::Vector3, crate::types::Vector3)> {
         if self.dxf_name != "AECC_PIPE" {
@@ -790,14 +895,31 @@ impl ArchEntityData {
         network::pipe_ends(data, start, end)
     }
 
-    /// Insertion point of a Civil 3D structure (`AECC_STRUCTURE`), found
-    /// inside the extents its cached preview records.
-    // debt: located through the cache extents; no drawing at hand has a
-    // structure to work out the record's field order from.
+    /// Number fields of the part data a Civil 3D pipe (`AECC_PIPE`) keeps
+    /// itself: flow coefficients, minimum curve radius and the like.
+    pub fn pipe_part_fields(&self) -> Vec<PartField> {
+        if self.dxf_name != "AECC_PIPE" {
+            return Vec::new();
+        }
+        let strings = self.decode().strings;
+        self.main_stream()
+            .map(|(data, start, end)| network::pipe_fields(data, start, end, &strings))
+            .unwrap_or_default()
+    }
+
+    /// Insertion point of a Civil 3D structure (`AECC_STRUCTURE`); a record
+    /// laid out otherwise is searched inside the extents its cached preview
+    /// records.
     pub fn structure_position(&self) -> Option<crate::types::Vector3> {
         if self.dxf_name != "AECC_STRUCTURE" {
             return None;
         }
+        let (data, start, end) = self.main_stream()?;
+        if let Some(p) = network::structure_at(data, start, end) {
+            return Some(p);
+        }
+        // debt: a record the field reader rejects is still located through
+        // the cache extents; replace once such a record's layout is known.
         let mut min = [f64::INFINITY; 2];
         let mut max = [f64::NEG_INFINITY; 2];
         for p in self.profiles.iter().flatten() {
@@ -805,7 +927,6 @@ impl ArchEntityData {
             max = [max[0].max(p.x), max[1].max(p.y)];
         }
         (min[0] <= max[0]).then_some(())?;
-        let (data, start, end) = self.main_stream()?;
         network::structure_position(data, start, end, min, max)
     }
 
@@ -869,6 +990,16 @@ impl ArchObject {
             .unwrap_or_default()
     }
 
+    /// Numbers of the points a Civil 3D point group (`AECC_POINT_PG`) holds.
+    pub fn point_group_numbers(&self) -> Vec<u32> {
+        if self.dxf_name != "AECC_POINT_PG" {
+            return Vec::new();
+        }
+        self.main_stream()
+            .and_then(|(data, start, end)| cogo::group_numbers(data, start, end))
+            .unwrap_or_default()
+    }
+
     /// Site topology a site container or alignment companion
     /// (`AECC_FEATURE_STYLE`) keeps: edges through nodes with the faces on
     /// their sides.
@@ -892,6 +1023,17 @@ impl ArchObject {
             return Vec::new();
         };
         refs[..site].iter().copied().filter(|h| *h != 0).collect()
+    }
+
+    /// Target and projection settings of a Civil 3D grading criteria
+    /// (`AECC_GRADING_CRITERIA`).
+    pub fn grading_criteria(&self) -> Option<GradingCriteria> {
+        if self.dxf_name != "AECC_GRADING_CRITERIA" {
+            return None;
+        }
+        let handles = self.decode().handles;
+        let (data, start, end) = self.main_stream()?;
+        grading::criteria(data, start, end, &handles)
     }
 
     /// Profile Locking settings kept in a profile's

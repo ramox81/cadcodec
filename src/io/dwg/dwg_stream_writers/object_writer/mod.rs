@@ -57,7 +57,8 @@ pub(crate) fn paper_space_block_handle(document: &CadDocument) -> Handle {
 }
 
 /// Reserve the bare paper-space name for the active record without colliding
-/// with other layouts. Anonymous names retain their native ordinal encoding.
+/// with other layouts. An anonymous name is stored bare (`*U`), as AutoCAD
+/// stores it in the BLOCK_HEADER; the BLOCK marker keeps the number.
 fn dwg_block_name<'a>(
     document: &'a CadDocument,
     record: &'a BlockRecord,
@@ -1027,12 +1028,15 @@ impl<'a> DwgObjectWriter<'a> {
             .iter()
             .map(|s| s.clone())
             .collect();
+        let shape_files = crate::io::dwg::dwg_writer::unnamed_shape_styles(self.document);
         for style in &entries {
-            self.write_text_style(style);
+            self.write_text_style(style, shape_files.contains(&style.handle));
         }
     }
 
-    fn write_text_style(&mut self, style: &crate::tables::TextStyle) {
+    /// `as_shape_file`: an unnamed STYLE that linetype shape segments draw
+    /// from, written with the shape-file flag (#370).
+    fn write_text_style(&mut self, style: &crate::tables::TextStyle, as_shape_file: bool) {
         let mut eed: Vec<(u64, Vec<u8>)> = self
             .annotative_eed_block_for_handle(style.handle, style.annotative)
             .into_iter()
@@ -1066,7 +1070,7 @@ impl<'a> DwgObjectWriter<'a> {
         self.write_xref_dependant_bit_value(style.xref_dependent);
 
         // Shape file flag
-        self.writer.write_bit(style.is_shape_file);
+        self.writer.write_bit(style.is_shape_file || as_shape_file);
         // Vertical flag
         self.writer.write_bit(style.is_vertical);
 
@@ -2479,11 +2483,15 @@ impl<'a> DwgObjectWriter<'a> {
             &common.edge_visual_style_handle,
         );
 
-        self.writer.write_variable_text(dwg_block_name(
-            self.document,
-            record,
-            self.paper_space_block_handle,
-        ));
+        // An anonymous header stores the bare name (`*U`); its marker keeps the
+        // number (`*U2`), as AutoCAD writes them, so readers that name a
+        // definition after its marker can tell the definitions apart.
+        let marker_name = if record.flags.anonymous && record.name.starts_with('*') {
+            record.name.as_str()
+        } else {
+            dwg_block_name(self.document, record, self.paper_space_block_handle)
+        };
+        self.writer.write_variable_text(marker_name);
 
         self.register_object(common.handle);
     }

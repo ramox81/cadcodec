@@ -824,13 +824,39 @@ pub fn read_layout_print_config(reader: &mut DwgMergedReader) -> ExtendedEntityD
     })
 }
 
-pub fn read_proxy_entity(
+/// Fields of a proxy entity or object (ACAD_PROXY_ENTITY, ACAD_PROXY_OBJECT)
+/// that come before its data.
+pub(crate) struct ProxyFields {
+    pub class_id: i32,
+    pub dxf_subclass: String,
+    pub version: i32,
+    pub dwg_version: i32,
+    pub maintenance_version: i32,
+    pub from_dxf: bool,
+}
+
+/// Reads the fields of a proxy record before its data (ODA specification
+/// 20.4.90). From R2000 they are the class number (DXF 91), the R2004+ class
+/// name, the data format (DXF 95; version and maintenance version apart from
+/// R2018) and the origin bit (DXF 70). R13 and R14 store the record type
+/// (DXF 90, 498 or 499) and the class number: their data has no format of its
+/// own and no origin bit, so these are left 0 and `false`.
+pub(crate) fn read_proxy_fields(
     reader: &mut DwgMergedReader,
     version: DwgVersion,
     dxf_version: DxfVersion,
-    proxy_data: Vec<u8>,
-    current_handle: u64,
-) -> ExtendedEntityData {
+) -> ProxyFields {
+    if !version.r2000_plus() {
+        let _record_type = reader.read_bit_long();
+        return ProxyFields {
+            class_id: reader.read_bit_long(),
+            dxf_subclass: String::new(),
+            version: 0,
+            dwg_version: 0,
+            maintenance_version: 0,
+            from_dxf: false,
+        };
+    }
     let class_id = reader.read_bit_long();
     let dxf_subclass = if dxf_version > DxfVersion::AC1015 {
         reader.read_variable_text()
@@ -845,11 +871,31 @@ pub fn read_proxy_entity(
         let combined = reader.read_bit_long();
         (combined, combined & 0xffff, combined >> 16)
     };
-    let from_dxf = if version.r2000_plus() {
-        reader.read_bit()
-    } else {
-        false
-    };
+    ProxyFields {
+        class_id,
+        dxf_subclass,
+        version: version_value,
+        dwg_version,
+        maintenance_version,
+        from_dxf: reader.read_bit(),
+    }
+}
+
+pub fn read_proxy_entity(
+    reader: &mut DwgMergedReader,
+    version: DwgVersion,
+    dxf_version: DxfVersion,
+    proxy_data: Vec<u8>,
+    current_handle: u64,
+) -> ExtendedEntityData {
+    let ProxyFields {
+        class_id,
+        dxf_subclass,
+        version: version_value,
+        dwg_version,
+        maintenance_version,
+        from_dxf,
+    } = read_proxy_fields(reader, version, dxf_version);
     let (payload, text_payload, object_ids) = read_proxy_payload(reader, current_handle);
     if let Some(envelope) =
         crate::objects::semantic_property::decode_registered_class_envelope(&payload)
@@ -3643,11 +3689,11 @@ fn read_cell_style(reader: &mut DwgMergedReader) -> Option<CellStyle> {
     for _ in 0..nborders {
         let edge = reader.read_bit_long() as u32;
         if matches!(edge, 1 | 2 | 4 | 8 | 0x10 | 0x20) {
-            style.applied_border_edges |= CellEdgeFlags::from_bits_retain(edge);
+            style.applied_border_edges |= CellEdgeFlags::from_grid_line_type(edge);
             let border = read_border(reader);
             match edge {
                 1 => style.top_border = border,
-                2 => style.right_border = border,
+                0x20 => style.right_border = border,
                 4 => style.bottom_border = border,
                 8 => style.left_border = border,
                 _ => style.additional_borders.push((edge, border)),
@@ -3971,7 +4017,7 @@ fn read_table_cell_data(
                 border.line_weight = crate::types::LineWeight::from_value(reader.read_bit_short());
             }
             if flags & (0x4000 << edge) != 0 {
-                border.invisible = reader.read_bit_short() == 0;
+                border.invisible = reader.read_bit_short() != 0;
             }
         }
         cell.style = Some(style);
@@ -6223,7 +6269,9 @@ fn read_wire(reader: &mut DwgMergedReader, wide_color: bool) -> Wire {
         y_axis = reader.read_3bit_double();
         z_axis = reader.read_3bit_double();
         translation = reader.read_3bit_double();
-        scale = reader.read_3bit_double();
+        // The scale is one BD (uniform scale), not a 3BD.
+        let uniform = reader.read_bit_double();
+        scale = Vector3::new(uniform, uniform, uniform);
         has_rotation = reader.read_bit();
         has_reflection = reader.read_bit();
         has_shear = reader.read_bit();
@@ -6274,6 +6322,81 @@ mod tests {
         let data = writer.merge();
         let hsb = writer.handle_start_bits();
         DwgMergedReader::new(data, dxf, hsb)
+    }
+
+    /// Writes one wire the way the DWG format defines it: the transform's
+    /// scale is a single BD (uniform scale), not a 3BD. Built from raw
+    /// primitives so it does not depend on `ObjectWriter`.
+    fn write_spec_wire(
+        w: &mut DwgMergedWriter,
+        acis_index: i32,
+        points: &[Vector3],
+        transform: Option<(Vector3, Vector3, Vector3, Vector3, f64, [bool; 3])>,
+    ) {
+        w.write_byte(1); // wire type
+        w.write_bit_long(-7); // selection marker
+        w.write_bit_short(5); // colour
+        w.write_bit_long(acis_index);
+        w.write_bit_long(points.len() as i32);
+        for p in points {
+            w.write_3bit_double(*p);
+        }
+        match transform {
+            None => w.write_bit(false),
+            Some((x, y, z, t, scale, flags)) => {
+                w.write_bit(true);
+                w.write_3bit_double(x);
+                w.write_3bit_double(y);
+                w.write_3bit_double(z);
+                w.write_3bit_double(t);
+                w.write_bit_double(scale); // one BD, not a 3BD
+                for flag in flags {
+                    w.write_bit(flag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wire_transform_scale_is_one_bit_double_and_the_next_wire_stays_in_sync() {
+        let dwg = DwgVersion::AC24;
+        let dxf = DxfVersion::AC1032;
+        let (x, y, z) = (
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, -1.0, 0.0),
+            Vector3::UNIT_Z,
+        );
+        let t = Vector3::new(10.5, -20.25, 30.125);
+        let first_points = [Vector3::new(1.0, 2.0, 3.0), Vector3::new(4.0, 5.0, 6.0)];
+        let second_points = [Vector3::new(7.0, 8.0, 9.0)];
+        let mut reader = make_reader(dwg, dxf, |w| {
+            write_spec_wire(
+                w,
+                3,
+                &first_points,
+                Some((x, y, z, t, 2.5, [true, false, true])),
+            );
+            write_spec_wire(w, 4, &second_points, None);
+        });
+
+        let first = read_wire(&mut reader, false);
+        assert_eq!(first.acis_index, 3);
+        assert_eq!(first.selection_marker, -7);
+        assert_eq!(first.points, first_points.to_vec());
+        assert!(first.has_transform);
+        assert_eq!((first.x_axis, first.y_axis, first.z_axis), (x, y, z));
+        assert_eq!(first.translation, t);
+        assert_eq!(first.scale, Vector3::new(2.5, 2.5, 2.5));
+        assert!(first.has_rotation);
+        assert!(!first.has_reflection);
+        assert!(first.has_shear);
+
+        let second = read_wire(&mut reader, false);
+        assert_eq!(second.acis_index, 4);
+        assert_eq!(second.selection_marker, -7);
+        assert_eq!(second.points, second_points.to_vec());
+        assert!(!second.has_transform);
+        reader.check_error().expect("both wires decode cleanly");
     }
 
     #[test]
@@ -6895,9 +7018,9 @@ mod tests {
         ] {
             let mut reader = legacy_cell(dwg, dxf, flags, 0, |w| {
                 w.write_bit_double(2.5);
-                w.write_bit_short(0); // top: invisible
-                w.write_bit_short(1); // right: visible
-                w.write_bit_short(0); // left: invisible
+                w.write_bit_short(1); // top: invisible
+                w.write_bit_short(0); // right: visible
+                w.write_bit_short(1); // left: invisible
             });
             let style = read_legacy_cell(&mut reader, dwg, dxf);
             assert_eq!(style.override_flags, flags);
@@ -6965,7 +7088,7 @@ mod tests {
         ] {
             let mut reader = legacy_cell(dwg, dxf, flags, 0x04, |w| {
                 w.write_bit_double(1.25);
-                w.write_bit_short(0); // right: invisible
+                w.write_bit_short(1); // right: invisible
             });
             let style = read_legacy_cell(&mut reader, dwg, dxf);
             assert_eq!(style.text_height, 1.25);

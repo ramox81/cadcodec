@@ -524,18 +524,24 @@ impl fmt::Display for SatToken {
                         if index != 0 {
                             write!(f, " ")?;
                         }
-                        write!(f, "{}", value)?;
+                        write!(f, "{}", super::writer::format_float(*value))?;
                     }
                     Ok(())
+                } else if let Some(value) = self.as_float().filter(|_| matches!(*tag, 0x05 | 0x06))
+                {
+                    // The ACIS number form, as `SatWriter` writes `SatToken::Float`.
+                    write!(f, "{}", super::writer::format_float(value))
                 } else if let Some(value) = self.as_integer() {
-                    write!(f, "{}", value)
-                } else if let Some(value) = self.as_float() {
                     write!(f, "{}", value)
                 } else if let Some(value) =
                     sab_string_bytes(*tag, data).and_then(|bytes| std::str::from_utf8(bytes).ok())
                 {
                     if matches!(*tag, 0x0D | 0x0E) {
                         write!(f, "{}", value)
+                    } else if *tag == 0x12 {
+                        // An ASM literal string is the record's own fields
+                        // (a `transform` body), not a counted string.
+                        write!(f, "{}", value.trim_end())
                     } else {
                         write!(f, "@{} {}", value.len(), value)
                     }

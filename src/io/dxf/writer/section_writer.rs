@@ -864,6 +864,25 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.write_header_variable("$SURFTYPE", |w| w.write_i16(70, hdr.surface_type))?;
         self.write_header_variable("$SURFU", |w| w.write_i16(70, hdr.surface_u_density))?;
         self.write_header_variable("$SURFV", |w| w.write_i16(70, hdr.surface_v_density))?;
+        // USERI1-5 / USERR1-5, in the reference header order (before $WORLDVIEW).
+        for (name, value) in [
+            ("$USERI1", hdr.user_int1),
+            ("$USERI2", hdr.user_int2),
+            ("$USERI3", hdr.user_int3),
+            ("$USERI4", hdr.user_int4),
+            ("$USERI5", hdr.user_int5),
+        ] {
+            self.write_header_variable(name, |w| w.write_i16(70, value))?;
+        }
+        for (name, value) in [
+            ("$USERR1", hdr.user_real1),
+            ("$USERR2", hdr.user_real2),
+            ("$USERR3", hdr.user_real3),
+            ("$USERR4", hdr.user_real4),
+            ("$USERR5", hdr.user_real5),
+        ] {
+            self.write_header_variable(name, |w| w.write_double(40, value))?;
+        }
         self.write_header_variable("$WORLDVIEW", |w| {
             w.write_i16(70, if hdr.world_view { 1 } else { 0 })
         })?;
@@ -4739,7 +4758,11 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         let flags = crate::io::dxf::spline_flags::write(spline);
         self.writer.write_i16(70, flags)?;
 
-        let clamped = spline.clamp_periodic_cubic();
+        // A fit-point spline also gets its knots and control points: most
+        // readers evaluate the curve from those alone.
+        let clamped = spline
+            .clamp_periodic_cubic()
+            .or_else(|| spline.interpolate_fit_cubic());
         let (control_points, knots, weights) = clamped.as_ref().map_or(
             (&spline.control_points, &spline.knots, &spline.weights),
             |value| (&value.points, &value.knots, &value.weights),
@@ -5189,6 +5212,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
 
         if !path.flags.is_polyline() {
             self.writer.write_i32(93, path.edges.len() as i32)?;
+        } else if path.edges.is_empty() {
+            // A polyline path with no vertices (a DWG can hold one) still needs
+            // its header, or 97 follows 92 and the DXF is refused.
+            self.writer.write_i16(72, 0)?;
+            self.writer.write_i16(73, 0)?;
+            self.writer.write_i32(93, 0)?;
         }
 
         for edge in &path.edges {
@@ -9516,6 +9545,9 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                     self.writer.write_i32(91, reference.identifier)?;
                     self.writer.write_point3d(10, reference.first_point)?;
                     self.writer.write_point3d(11, reference.second_point)?;
+                    self.writer.write_handle(331, reference.subentity_object)?;
+                    self.writer.write_i32(73, reference.subentity_type)?;
+                    self.writer.write_i32(92, reference.subentity_index)?;
                 }
             }
             DataObjectData::BreakPointRef => {
@@ -11384,7 +11416,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             (table::CellEdgeFlags::LEFT, &style.left_border),
         ] {
             if style.applied_border_edges.contains(edge) {
-                borders.push((edge.bits(), border));
+                borders.push((edge.grid_line_type(), border));
             }
         }
         borders.extend(
@@ -11842,8 +11874,14 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     fn write_table_cells(&mut self, table: &table::Table) -> Result<()> {
         let merged_ranges = table.canonical_merged_ranges();
         let index = table::MergedCellIndex::new(table, &merged_ranges);
+        // Below R2010 a cell follows the legacy layout of the DWG cell.
+        let legacy = self.dxf_version < DxfVersion::AC1024;
         for (row_index, row) in table.rows.iter().enumerate() {
             for (column_index, cell) in row.cells.iter().enumerate() {
+                let legacy_cell = legacy
+                    .then(|| table.legacy_layout_cell(row_index, column_index))
+                    .flatten();
+                let cell = legacy_cell.as_deref().unwrap_or(cell);
                 let merged_range = index
                     .first(row_index, column_index)
                     .and_then(|i| merged_ranges.get(i));
@@ -11886,11 +11924,16 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         self.writer.write_i16(176, merge_height as i16)?;
         // AutoCAD takes a cell override only when its legacy bit is set in the
         // cell override flag (91, 177 before R2007). Legacy bits read from DXF
-        // are in `cell.flag` already.
-        let overrides = cell
-            .style
-            .as_ref()
-            .map_or(0, |s| s.property_override_bits());
+        // are in `cell.flag` already. Below R2010 the cell is in the legacy
+        // layout and its style holds the legacy word.
+        let legacy = self.dxf_version < DxfVersion::AC1024;
+        let overrides = cell.style.as_ref().map_or(0, |s| {
+            if legacy {
+                s.legacy_override_flags()
+            } else {
+                s.property_override_bits()
+            }
+        });
         if self.dxf_version >= DxfVersion::AC1021 {
             self.writer.write_i32(91, cell.flag | overrides)?;
             self.writer.write_i32(92, cell.state.bits() as i32)?;
@@ -11954,10 +11997,15 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             }
         }
 
-        // Cell style: only the overridden properties when the cell says which.
-        // A style with no stored override bits writes everything (below);
-        // the property-flag bits then only add to the cell flag above.
-        if let Some(style) = cell.style.as_ref().filter(|s| s.override_flags != 0) {
+        // Cell style: only the overridden properties when the cell says which
+        // (always below R2010). A style with no stored override bits writes
+        // everything (below); the property-flag bits then only add to the
+        // cell flag above.
+        if let Some(style) = cell
+            .style
+            .as_ref()
+            .filter(|s| legacy || s.override_flags != 0)
+        {
             let f = style.legacy_override_flags();
             if f & 0x01 != 0 {
                 self.writer.write_i16(170, style.alignment as i16)?;
@@ -11996,7 +12044,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                         .write_i16(weight_code, border.line_weight.value())?;
                 }
                 if f & (0x4000 << i) != 0 {
-                    self.writer.write_bool(visibility_code, !border.invisible)?;
+                    self.writer.write_bool(visibility_code, border.invisible)?;
                 }
             }
         } else if let Some(ref style) = cell.style {
@@ -12018,7 +12066,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 self.write_table_cell_color(color_code, border.color)?;
                 self.writer
                     .write_i16(weight_code, border.line_weight.value())?;
-                self.writer.write_bool(visibility_code, !border.invisible)?;
+                self.writer.write_bool(visibility_code, border.invisible)?;
             }
         }
 

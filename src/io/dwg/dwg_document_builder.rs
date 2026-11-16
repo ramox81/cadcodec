@@ -6724,36 +6724,18 @@ impl DwgDocumentBuilder {
                     }
                 }
                 OBJ_PROXY_OBJECT => {
-                    let class_id = reader.read_bit_long();
-                    let dxf_subclass = if self.obj_reader.dxf_version()
-                        > crate::types::DxfVersion::AC1015
-                    {
-                        reader.read_variable_text()
-                    } else {
-                        String::new()
-                    };
-                    let (version, dwg_version, maintenance_version) = if self
-                        .obj_reader
-                        .version()
-                        .r2018_plus(self.obj_reader.dxf_version())
-                    {
-                        let dwg_version = reader.read_bit_long();
-                        let maintenance_version = reader.read_bit_long();
-                        (
-                            (maintenance_version << 16)
-                                | (dwg_version & 0xffff),
-                            dwg_version,
-                            maintenance_version,
-                        )
-                    } else {
-                        let version = reader.read_bit_long();
-                        (version, version & 0xffff, version >> 16)
-                    };
-                    let from_dxf = if self.obj_reader.version().r2000_plus() {
-                        reader.read_bit()
-                    } else {
-                        false
-                    };
+                    let entities::ProxyFields {
+                        class_id,
+                        dxf_subclass,
+                        version,
+                        dwg_version,
+                        maintenance_version,
+                        from_dxf,
+                    } = entities::read_proxy_fields(
+                        &mut reader,
+                        self.obj_reader.version(),
+                        self.obj_reader.dxf_version(),
+                    );
                     let object_data_bits = reader.main_remaining_bits() as u32;
                     let mut object_data =
                         vec![0u8; object_data_bits.div_ceil(8) as usize];
@@ -8647,6 +8629,43 @@ mod tests {
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ]
+        );
+    }
+
+    /// An unnamed ordinary STYLE that complex linetypes draw shapes from is
+    /// the shape-file style behind them, stored without its shape-file flag;
+    /// the read names that role instead of reporting a bare unnamed style
+    /// (#311). The DWG writer writes such a style with the flag (#370), so
+    /// the document is checked as a file from another writer reads.
+    #[test]
+    fn unnamed_style_names_the_linetypes_that_use_it() {
+        use crate::tables::linetype::LineTypeComplexContent;
+        use crate::tables::{LineType, LineTypeComplexData, LineTypeElement, TextStyle};
+        let mut document = CadDocument::new();
+        let mut style = TextStyle::new("");
+        style.font_file = "ltypeshp.shx".into();
+        style.handle = Handle::new(0x500);
+        document.text_styles.add_allow_duplicate(style);
+        let mut linetype = LineType::new("ZIGZAG");
+        let mut dash = LineTypeElement::dash(0.0);
+        dash.complex = Some(LineTypeComplexData {
+            content: LineTypeComplexContent::Shape { shape_number: 131 },
+            style_handle: Handle::new(0x500),
+            ..LineTypeComplexData::default()
+        });
+        linetype.elements.push(dash);
+        document.line_types.add(linetype).unwrap();
+
+        let mut diagnostics = Vec::new();
+        source_state_diagnostics(&document, &mut diagnostics);
+        let message = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "unnamed-text-style")
+            .map(|diagnostic| diagnostic.message.as_str())
+            .expect("the unnamed style is reported");
+        assert!(
+            message.contains("ZIGZAG") && message.contains("ltypeshp.shx"),
+            "{message}"
         );
     }
 }
