@@ -226,6 +226,9 @@ pub enum StackingType {
     Diagonal = 1,
     /// Stacked limit (no line): `\S<num>^<den>;`
     Limit = 2,
+    /// Decimal stack, the halves lined up on their decimal points:
+    /// `\S<num>~.<den>;` (the character after `~` is the decimal point).
+    Decimal = 3,
 }
 
 impl StackingType {
@@ -235,6 +238,7 @@ impl StackingType {
             '/' => StackingType::Horizontal,
             '#' => StackingType::Diagonal,
             '^' => StackingType::Limit,
+            '~' => StackingType::Decimal,
             _ => StackingType::Horizontal,
         }
     }
@@ -261,7 +265,9 @@ impl StackingData {
         match self.stacking_type {
             StackingType::Horizontal => format!("{}/{}", self.numerator, self.denominator),
             StackingType::Diagonal => format!("{}/{}", self.numerator, self.denominator),
-            StackingType::Limit => format!("{} {}", self.numerator, self.denominator),
+            StackingType::Limit | StackingType::Decimal => {
+                format!("{} {}", self.numerator, self.denominator)
+            }
         }
     }
 }
@@ -311,9 +317,10 @@ impl ParagraphProperties {
     }
 }
 
-/// Line spacing mode from `se` (exact) or `sm` (multiple) inside `\p...;`.
+/// Line spacing mode from `se` (exact), `sa` (at least) or `sm` (multiple)
+/// inside `\p...;`.
 ///
-/// Neither value is a distance. Both are factors of the default line pitch,
+/// None of the values is a distance. All are factors of the default line pitch,
 /// [`DEFAULT_PITCH_FACTOR`](Self::DEFAULT_PITCH_FACTOR) × text height. They
 /// differ in where a line's baseline sits in its slot (see
 /// [`baseline_offset`](Self::baseline_offset)).
@@ -328,6 +335,9 @@ pub enum MTextLineSpacing {
     Exact(f64),
     /// Multiple spacing factor `sm<n>`: pitch `n` × 5/3 × text height.
     Multiple(f64),
+    /// At-least spacing factor `sa<n>`: pitch `n` × 5/3 × text height, or
+    /// more where a line holds taller text.
+    AtLeast(f64),
 }
 
 impl MTextLineSpacing {
@@ -339,7 +349,7 @@ impl MTextLineSpacing {
     pub fn line_pitch(&self, text_height: f64, entity_factor: f64) -> f64 {
         let factor = match *self {
             Self::Default => entity_factor,
-            Self::Exact(factor) | Self::Multiple(factor) => factor,
+            Self::Exact(factor) | Self::Multiple(factor) | Self::AtLeast(factor) => factor,
         };
         factor * Self::DEFAULT_PITCH_FACTOR * text_height
     }
@@ -351,7 +361,7 @@ impl MTextLineSpacing {
     pub fn baseline_offset(&self, text_height: f64) -> f64 {
         match *self {
             Self::Exact(factor) => factor * text_height,
-            Self::Default | Self::Multiple(_) => text_height,
+            Self::Default | Self::Multiple(_) | Self::AtLeast(_) => text_height,
         }
     }
 }
@@ -1041,6 +1051,9 @@ impl MTextDocument {
                         MTextLineSpacing::Multiple(v) => {
                             write!(result, ",sm{}", v).ok();
                         }
+                        MTextLineSpacing::AtLeast(v) => {
+                            write!(result, ",sa{}", v).ok();
+                        }
                     }
                 }
                 if !para_props.tab_stops.is_empty() {
@@ -1073,9 +1086,10 @@ impl MTextDocument {
 
                 if let Some(ref stack) = span.stacking {
                     let sep = match stack.stacking_type {
-                        StackingType::Horizontal => '/',
-                        StackingType::Diagonal => '#',
-                        StackingType::Limit => '^',
+                        StackingType::Horizontal => "/",
+                        StackingType::Diagonal => "#",
+                        StackingType::Limit => "^",
+                        StackingType::Decimal => "~.",
                     };
                     write!(
                         result,

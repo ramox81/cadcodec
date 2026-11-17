@@ -858,7 +858,8 @@ impl MTextParser {
     }
 
     /// Parse stacking: \S{numerator}/{denominator};
-    /// Separators: / (horizontal), # (diagonal), ^ (limit)
+    /// Separators: / (horizontal), # (diagonal), ^ (limit), ~ (decimal, with
+    /// the decimal point after it)
     fn parse_stacking_code(&mut self) {
         let expr = self.parse_semicolon_value();
 
@@ -873,11 +874,14 @@ impl MTextParser {
 
         while i < chars.len() {
             let ch = chars[i];
-            if !found_sep && matches!(ch, '/' | '#' | '^') {
+            if !found_sep && matches!(ch, '/' | '#' | '^' | '~') {
                 found_sep = true;
                 stacking_type = StackingType::from_char(ch);
                 if ch == '^' && i + 1 < chars.len() && chars[i + 1] == ' ' {
                     i += 1; // ^ may be followed by space
+                }
+                if ch == '~' && i + 1 < chars.len() && matches!(chars[i + 1], '.' | ',') {
+                    i += 1; // the decimal point the halves line up on
                 }
             } else if found_sep {
                 denominator.push(ch);
@@ -1006,8 +1010,8 @@ impl MTextParser {
                     i += 1;
                 }
             } else if ch == 's' && i + 1 < chars.len() {
-                // Line spacing: s* (entity default), se<n> (exact), or
-                // sm<n> (multiple).
+                // Line spacing: s* (entity default), se<n> (exact), sa<n>
+                // (at least) or sm<n> (multiple).
                 let sub = chars[i + 1];
                 if sub == '*' {
                     self.current_paragraph.properties.line_spacing =
@@ -1018,7 +1022,7 @@ impl MTextParser {
                     }
                     continue;
                 }
-                if sub == 'e' || sub == 'm' {
+                if sub == 'e' || sub == 'm' || sub == 'a' {
                     let start = i + 2;
                     let mut k = start;
                     while k < chars.len()
@@ -1027,11 +1031,11 @@ impl MTextParser {
                         k += 1;
                     }
                     if let Ok(v) = chars[start..k].iter().collect::<String>().parse::<f64>() {
-                        self.current_paragraph.properties.line_spacing = if sub == 'e' {
-                            Some(MTextLineSpacing::Exact(v))
-                        } else {
-                            Some(MTextLineSpacing::Multiple(v))
-                        };
+                        self.current_paragraph.properties.line_spacing = Some(match sub {
+                            'e' => MTextLineSpacing::Exact(v),
+                            'a' => MTextLineSpacing::AtLeast(v),
+                            _ => MTextLineSpacing::Multiple(v),
+                        });
                     }
                     i = k;
                     if i < chars.len() && chars[i] == ',' {
@@ -1040,6 +1044,14 @@ impl MTextParser {
                     continue;
                 }
                 i += 1;
+            } else if ch == 't' && chars.get(i + 1) == Some(&'z') {
+                // `tz` clears the tab stops; kept as the one stop at 0 that
+                // `t0` reads as.
+                self.current_paragraph.properties.tab_stops = vec![TabStop::Left(0.0)];
+                i += 2;
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                }
             } else if ch == 't' && i + 1 < chars.len() {
                 // Tab stops: comma-separated, each optionally prefixed by
                 // `c`/`r`/`D` (center/right/decimal); no prefix = left.
