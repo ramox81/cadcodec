@@ -505,13 +505,25 @@ fn write_feature_line(doc: &mut CadDocument, common: EntityCommon, name: &str, e
 /// members, and the site must be one this crate writes. It takes the
 /// feature line style the site's container uses.
 pub fn add_feature_line(doc: &mut CadDocument, site: Handle, name: &str, points: &[crate::types::Vector3], layer: Option<&str>) -> Result<Handle, DxfError> {
+    add_feature_line_with_arcs(doc, site, name, points, &vec![0.0; points.len().saturating_sub(1)], layer)
+}
+
+/// [`add_feature_line`] with arcs: `bulges[i]` is the bulge of the
+/// segment from `points[i]` to `points[i + 1]` (0 for a straight segment;
+/// positive counterclockwise, the tangent of a quarter of the arc's
+/// angle), as a polyline stores it. The elevations are those of the
+/// points.
+pub fn add_feature_line_with_arcs(doc: &mut CadDocument, site: Handle, name: &str, points: &[crate::types::Vector3], bulges: &[f64], layer: Option<&str>) -> Result<Handle, DxfError> {
     if points.len() < 2 || points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite()) || points.windows(2).any(|w| w[0].x == w[1].x && w[0].y == w[1].y) {
         return Err(invalid("a feature line needs two or more finite points, apart in plan"));
+    }
+    if bulges.len() + 1 != points.len() || bulges.iter().any(|b| !b.is_finite()) {
+        return Err(invalid("a feature line needs one finite bulge per segment"));
     }
     if name.is_empty() {
         return Err(invalid("a feature line needs a name"));
     }
-    let path: Vec<PathPoint> = points.iter().map(|p| (Vector2::new(p.x, p.y), None)).collect();
+    let path: Vec<PathPoint> = points.iter().enumerate().map(|(i, p)| (Vector2::new(p.x, p.y), bulges.get(i).copied().filter(|b| *b != 0.0))).collect();
     let layer = layer.unwrap_or("0");
     let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
     let (container, mut members, line_style) = members_of(doc, site)?;
@@ -659,5 +671,24 @@ mod tests {
         // The alignment keeps its member number (2) as its edge id.
         let (w, _) = super::super::alignment::rewritable(&back, a, |_| None).unwrap();
         assert_eq!(w.edge, 2);
+    }
+
+    #[test]
+    fn feature_lines_keep_their_arcs() {
+        let p = crate::types::Vector3::new;
+        let mut doc = drawing();
+        let s = add_site(&mut doc, "Site 1", "").unwrap();
+        let pts = [p(0.0, 0.0, 10.0), p(50.0, 0.0, 10.0), p(100.0, 0.0, 14.0), p(150.0, 20.0, 12.0)];
+        assert!(add_feature_line_with_arcs(&mut doc, s, "X", &pts, &[0.0, 0.5], None).is_err());
+        assert!(add_feature_line_with_arcs(&mut doc, s, "X", &pts, &[0.0, f64::NAN, 0.0], None).is_err());
+        let f = add_feature_line_with_arcs(&mut doc, s, "FLA", &pts, &[0.0, 0.5, -0.3], None).unwrap();
+        let path = std::env::temp_dir().join(format!("civil-fl-arcs-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let mut back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (_, members, _) = members_of(&mut back, s).unwrap();
+        let m = members.iter().find(|m| m.handle == f.value()).unwrap();
+        assert_eq!(m.path.iter().map(|p| p.1).collect::<Vec<_>>(), vec![None, Some(0.5), Some(-0.3), None]);
+        assert_eq!(m.elevations, vec![10.0, 10.0, 14.0, 12.0]);
     }
 }
