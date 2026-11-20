@@ -80,7 +80,7 @@ fn default_style(doc: &CadDocument) -> Option<u64> {
 
 /// The identifier a profile record stores before its last 107 bits, a
 /// version-4 GUID (the alignment lists its profiles by it).
-fn identifier(doc: &CadDocument, profile: u64) -> Option<[u8; 16]> {
+pub(super) fn identifier(doc: &CadDocument, profile: u64) -> Option<[u8; 16]> {
     let EntityType::Extended(x) = doc.get_entity(Handle::new(profile))? else { return None };
     let ExtendedEntityData::Arch(a) = &x.data else { return None };
     (a.dxf_name == "AECC_PROFILE").then_some(())?;
@@ -100,7 +100,7 @@ fn identifier(doc: &CadDocument, profile: u64) -> Option<[u8; 16]> {
 /// the version in the high nibble of byte 7, the variant in byte 8). The
 /// application stops while it opens a drawing whose profile identifiers
 /// are not of this form.
-fn new_identifier(seed: u64) -> [u8; 16] {
+pub(super) fn new_identifier(seed: u64) -> [u8; 16] {
     use std::hash::{BuildHasher, Hasher};
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let half = |salt: u64| {

@@ -114,18 +114,22 @@ pub(super) enum Value {
     Reference(Shared),
     /// Type 0x0E: a color, `BS 0, BL method and value, RC 0`.
     Color(u32),
-    /// Type 0x0D.
+    /// Types 1 and 0x0D.
     Long(i32),
     /// Type 2.
     Double(f64),
     /// Type 3.
     Byte(u8),
+    /// Type 9: `3BD`.
+    Point([f64; 3]),
+    /// Type 0x18: `BL` byte count, UTF-16 with its terminator.
+    Wide(&'static str),
     /// Type 0x16: a FILETIME, written as the time of writing.
     Time,
 }
 
 /// Current time as a FILETIME (100 ns since 1601-01-01).
-fn file_time() -> u64 {
+pub(super) fn file_time() -> u64 {
     let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() / 100).unwrap_or(0);
     (unix + 116_444_736_000_000_000) as u64
 }
@@ -230,6 +234,17 @@ pub(super) fn style(doc: &mut CadDocument, handle: Handle, owner: Handle, st: St
                     Value::Long(v) => w.write_bit_long(*v),
                     Value::Double(v) => w.write_bit_double(*v),
                     Value::Byte(v) => byte(w, *v),
+                    Value::Point(p) => {
+                        for v in p {
+                            w.write_bit_double(*v);
+                        }
+                    }
+                    Value::Wide(t) => {
+                        let mut bytes: Vec<u8> = t.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                        bytes.extend([0, 0]);
+                        w.write_bit_long(bytes.len() as i32);
+                        w.write_bytes(&bytes);
+                    }
                     Value::Time => w.write_bytes(&now),
                 }
             }
@@ -276,7 +291,7 @@ pub(super) fn style(doc: &mut CadDocument, handle: Handle, owner: Handle, st: St
 
 /// The settings every style of the samples starts its keys with or ends
 /// them with: two keys without value and the dates.
-const POINT_STYLE_KEYS: [(u32, Value); 4] = [(0x0400_1008, Value::Text("")), (0x0400_1010, Value::Text("")), (0x1600_101F, Value::Time), (0x1600_101E, Value::Time)];
+pub(super) const POINT_STYLE_KEYS: [(u32, Value); 4] = [(0x0400_1008, Value::Text("")), (0x0400_1010, Value::Text("")), (0x1600_101F, Value::Time), (0x1600_101E, Value::Time)];
 
 /// A point style (`AECC_POINT_STYLE`): the components of the
 /// application's default style (marker and label in plan and model,
@@ -307,7 +322,7 @@ fn point_style(doc: &mut CadDocument, handle: Handle, owner: Handle, id: i32, ch
 }
 
 /// The CMC color word: method byte high, value low.
-fn color_word(c: Color) -> u32 {
+pub(super) fn color_word(c: Color) -> u32 {
     match c {
         Color::ByLayer => 0xC000_0000,
         Color::ByBlock => 0xC100_0000,
@@ -339,14 +354,19 @@ pub(super) fn ensure_point_tree(doc: &mut CadDocument) -> Result<bool, DxfError>
     node(doc, "AECC_USER_DEFINED_ATTRIBUTE_CLASSIFICATION", classification, class, KEY_CLASSIFICATION as u32, &[], Tail::Tree, Vec::new(), texts("", false, &[], &[]))?;
 
     node(doc, "AECC_ROOT_SETTINGS_NODE", settings, root, KEY_SETTINGS as u32, &[(TEXT_POINTS, points)], Tail::Settings, vec![soft_pointer(0)], texts("", false, &["AeccPoints"], &[]))?;
-    // The points settings end with the default label style (none: the
-    // application gives points its own label styles) and point style.
+    // The points settings end with the default label style (written
+    // below, with the label styles) and point style.
     node(doc, "AECC_SETTINGS_NODE", points, settings, TEXT_POINTS, &[(TEXT_CREATE_POINTS, create)], Tail::Settings, vec![soft_pointer(0), soft_pointer(style.value())], texts("AeccPoints", true, &["AeccCreatePoints"], &[]))?;
     node(doc, "AECC_SETTINGS_NODE", create, points, TEXT_CREATE_POINTS, &[], Tail::Settings, Vec::new(), texts("AeccCreatePoints", true, &[], &[]))?;
 
     set_root_entry(doc, KEY_STYLES, styles)?;
     set_root_entry(doc, KEY_CLASSES, classes)?;
     set_root_entry(doc, KEY_SETTINGS, settings)?;
+    // With the default label styles the points settings name the default
+    // point label style, which new points take.
+    super::labels::ensure_label_styles(doc)?;
+    let label = super::labels::default_label_style(doc, super::labels::POINT_LABELS).ok_or_else(|| invalid("the point label styles were not written"))?;
+    node(doc, "AECC_SETTINGS_NODE", points, settings, TEXT_POINTS, &[(TEXT_CREATE_POINTS, create)], Tail::Settings, vec![soft_pointer(label), soft_pointer(style.value())], texts("AeccPoints", true, &["AeccCreatePoints"], &[]))?;
     Ok(true)
 }
 
