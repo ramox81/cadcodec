@@ -16,6 +16,7 @@ mod corridor;
 mod grading;
 mod intersection;
 mod labels;
+mod label_style;
 mod network;
 mod parameters;
 mod profile;
@@ -24,26 +25,33 @@ mod section;
 mod style;
 mod subassembly;
 mod tin;
+mod survey;
+mod parcel_segments;
 mod topology;
+mod view_frames;
 
 pub use alignment::{
-    display_station, AlignmentCriteria, AlignmentElement, AlignmentType, OffsetParameters, OffsetRegion, WideningTransition, AlignmentElementKind, AlignmentPiece, DesignSpeed, GeometryPoint, SpiralShape,
-    StationEquation,
-};
-pub use cogo::CogoPoint;
-pub use create::{add_assembly, add_pkt_subassembly, add_pkt_subassembly_on, PktSource, add_alignment, add_alignment_with_curves, VertexCurve, add_corridor, add_cogo_point, add_intersection, add_point_group, add_point_group_query, add_profile, add_profile_with_curves, VerticalCurve, add_profile_view, add_profile_view_with_range, add_sample_line, add_sample_line_group, add_sections, add_section_view, add_site, add_alignment_on_site, add_feature_line, add_parcel, add_feature_line_vertices, FeatureLineVertex, add_tin_surface, cogo_points, ensure_civil, remove_cogo_point, set_cogo_point, set_cogo_point_name, set_point_group, set_point_group_query, Comparison, PointQuery, add_lot_line, add_pipe, add_pipe_network, add_pipe_of_family, add_structure, add_structure_of_family, connect_pipe, network_part_families, add_pressure_appurtenance, add_pressure_arc_pipe, add_pressure_cross, add_pressure_fitting, add_pressure_network, add_pressure_part, add_pressure_pipe, add_pressure_pipe_of_size, add_pressure_tee, connect_pressure_parts, pressure_part_descriptions};
+    display_station, AlignmentAnchor, AlignmentCriteria, AlignmentElement, AlignmentType, OffsetParameters, OffsetRegion, WideningTransition, AlignmentElementKind, AlignmentPiece, DesignSpeed, GeometryPoint, SpiralShape,
+    StationEquation, CriticalStationData, SuperelevationCurveData, SuperelevationView};
+pub use cogo::{CogoPoint, PointGroupClassification, PointGroupOverrides, PropertyValue, UserProperty};
+pub use create::{add_tin_surface_with, add_assembly, add_pkt_subassembly, add_pkt_subassembly_on, PktSource, add_alignment, add_alignment_with_curves, add_offset_alignment, add_offset_alignment_with_widenings, Widening, add_alignment_of_kind, add_design_speeds, add_station_equations, add_superelevation, CriticalStation, CriticalStationKind, SuperelevationCurve, AlignmentKind, VertexCurve, add_corridor, add_corridor_with, add_cogo_point, add_intersection, add_point_group, add_point_group_query, add_profile, add_profile_entities, add_profile_with_curves, add_surface_profile, ProfileEntity, VerticalCurve, add_profile_view, add_profile_view_with_bands, add_profile_view_with_range, BandKind, BandStagger, ProfileViewBand, add_sample_line, add_sample_line_through, add_sample_line_group, add_sections, add_section_view, add_site, add_alignment_on_site, add_feature_line, add_parcel, add_feature_line_vertices, FeatureLineVertex, add_tin_surface, cogo_points, ensure_civil, remove_cogo_point, set_cogo_point, set_cogo_point_name, set_point_group, set_point_group_overrides, set_point_group_query, Comparison, PointAttribute, PointQuery, QueryConstant, QueryExpression, add_lot_line, add_pipe, add_pipe_network, add_pipe_of_family, add_structure, add_structure_of_family, connect_pipe, network_part_families, add_pressure_appurtenance, add_pressure_arc_pipe, add_pressure_cross, add_pressure_fitting, add_pressure_network, add_pressure_part, add_pressure_pipe, add_pressure_pipe_of_size, add_pressure_tee, connect_pressure_parts, pressure_part_descriptions, add_profile_view_style, add_profile_view_with_style, add_offset_profile, add_section_view_group, add_profile_view_style_with, set_feature_line_vertices, set_cogo_point_label_style, add_label_style, add_point_label_style, label_style, LabelStyle, add_intersection_with, IntersectionOffsets, add_curb_return, add_curb_return_with, CurbReturnCurve, add_point_choice_property, add_point_property, add_point_property_classification, point_properties, set_cogo_point_property};
+pub use corridor::{CorridorBaseline, CorridorBoundary, CorridorDefinition, CorridorRegion, CorridorSurfaceDefinition, CurveStations, RegionFrequency, RegionTarget, TargetCurveStations, TargetKind};
 pub use grading::{CriteriaValue, GradingCriteria};
 pub use intersection::IntersectionLayout;
 pub use labels::{parse_format, property, LabelPart, LabelText};
+pub use label_style::{LabelArrowComponent, LabelBlockComponent, LabelBorder, LabelDraggedState, LabelIteratorComponent, LabelLeader, LabelLineComponent, LabelStyleSettings, LabelTextComponent, LabelTickComponent};
 pub use network::{PartField, PressurePipe, PressurePort};
 pub use parameters::{Parameter, ParameterValue};
-pub use profile::{CurveMinimumK, ProfileCriteria, ProfileLocking, ProfilePiece, ProfileViewFrame, Pvi};
-pub use sample_lines::SampleLines;
+pub use profile::{CurveMinimumK, OffsetProfile, ProfileCriteria, ProfileLocking, ProfilePiece, ProfileViewFrame, Pvi};
+pub use parcel_segments::ParcelSegmentGeometry;
+pub use sample_lines::{SampleLines, SectionViewGroupPlot};
 pub use section::{MassHaulViewFrame, SectionGeometry, SectionViewFrame};
-pub use style::{DisplayComponent, Marker, ViewAxes, ViewAxis};
+pub use style::{DisplayComponent, Marker, ProfileViewAxisStyle, ProfileViewAxisTitle, ProfileViewGrid, ProfileViewGridLines, ProfileViewStyleSettings, ProfileViewTicks, ProfileViewTitle, ViewAxes, ViewAxis};
 pub use subassembly::{AssemblyLayout, Attachment, SubassemblyShape};
+pub use survey::SurveyFigure;
+pub use view_frames::{MatchLine, SheetGeometry, ViewFrame, ViewFrameGeometry};
 pub use topology::{Topology, TopologyVertex};
-pub use tin::{TinSurface, TinTriangle, TinVertex};
+pub use tin::{TinBoundaryType, TinBreaklineType, TinDefinition, TinLines, TinOperation, TinSurface, TinTriangle, TinVertex};
 
 use super::arch::{ArchEntityData, ArchObject};
 pub(crate) use network::connector_count as network_connector_count;
@@ -223,6 +231,16 @@ impl ArchEntityData {
         kind_of(&self.dxf_name)
     }
 
+    /// The triangulation a TIN surface's snapshot keeps; `None` without a
+    /// snapshot.
+    pub fn tin_snapshot(&self) -> Option<TinSurface> {
+        if self.civil_kind() != Some(CivilKind::TinSurface) {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        tin::snapshot(data, start, end)
+    }
+
     /// Triangulation stored by a Civil 3D TIN surface.
     ///
     /// `None` for other classes or when the body has no readable
@@ -233,6 +251,32 @@ impl ArchEntityData {
         }
         let (data, start, end) = self.main_stream()?;
         tin::find(data, start, end)
+    }
+
+    /// Definitions of a TIN surface in build order, with their
+    /// texts (before the surface name) and source objects (the references
+    /// after the hard owner), and whether the surface
+    /// rebuilds itself when a source changes.
+    pub fn tin_definitions(&self) -> Option<(Vec<TinDefinition>, bool)> {
+        if self.civil_kind() != Some(CivilKind::TinSurface) {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        let found = tin::definitions(data, start, end)?;
+        let strings = self.decode().strings;
+        let refs = self.typed_handles();
+        let mut text = 2;
+        let mut source = refs.iter().position(|r| r.1 == 3)? + 1;
+        let mut list = found.list;
+        for d in &mut list {
+            let n = d.text_count();
+            d.texts = strings.get(text..text + n)?.to_vec();
+            text += n;
+            let n = d.source_count();
+            d.sources = refs.get(source..source + n)?.iter().map(|r| r.0).collect();
+            source += n;
+        }
+        Some((list, found.auto_rebuild))
     }
 
     /// Design elements of a Civil 3D alignment.
@@ -300,6 +344,26 @@ impl ArchEntityData {
     /// Design speeds of a Civil 3D alignment, in station order.
     pub fn alignment_design_speeds(&self) -> Vec<DesignSpeed> {
         self.alignment_equations_and_speeds().1
+    }
+
+    /// The superelevation curves of an alignment whose superelevation block
+    /// has the plain form this crate writes (critical stations with their
+    /// cross slopes, no curve settings); an empty list without a block,
+    /// `None` for another form.
+    pub fn alignment_superelevation(&self) -> Option<Vec<SuperelevationCurveData>> {
+        let (first, last) = self.alignment_station_range()?;
+        let (data, start, end) = self.main_stream()?;
+        alignment::superelevation_curves(data, start, end, first, last)
+    }
+
+    /// [`Self::alignment_station_equations`] and
+    /// [`Self::alignment_design_speeds`] with the identifiers of their
+    /// anchors.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn alignment_timing_with_ids(&self) -> Option<(Vec<(StationEquation, [u8; 16])>, Vec<(DesignSpeed, [u8; 16])>)> {
+        let (first, last) = self.alignment_station_range()?;
+        let (data, start, end) = self.main_stream()?;
+        alignment::equations_and_speeds_with_ids(data, start, end, first, last)
     }
 
     fn alignment_equations_and_speeds(&self) -> (Vec<StationEquation>, Vec<DesignSpeed>) {
@@ -397,9 +461,22 @@ impl ArchEntityData {
         self.decode().strings.into_iter().find(|s| s.trim_start().starts_with('{'))
     }
 
+    /// The track gauge of a rail alignment (0 for the other types).
+    pub fn alignment_track_gauge(&self) -> Option<f64> {
+        let (data, start, end) = self.main_stream()?;
+        alignment::track_gauge(data, start, end)
+    }
+
     /// What kind of alignment this is (Alignment Properties' type).
     pub fn alignment_type(&self) -> Option<AlignmentType> {
         self.alignment_type_at().map(|(t, _)| t)
+    }
+
+    /// The station anchors of an alignment (see [`AlignmentAnchor`]), in
+    /// the order stored (by identifier).
+    pub fn alignment_anchors(&self) -> Option<Vec<AlignmentAnchor>> {
+        let (data, start, end) = self.main_stream()?;
+        alignment::anchors(data, start, end)
     }
 
     /// Offset, side, locking, regions, widenings and parent anchors of an
@@ -519,6 +596,16 @@ impl ArchEntityData {
         self.main_stream()
             .map(|(data, start, end)| labels::entity_refs(data, start, end))
             .unwrap_or_default()
+    }
+
+    /// The section view group plots of a sample line group that lists its
+    /// lines (see [`SectionViewGroupPlot`]).
+    pub fn section_view_group_plots(&self) -> Option<Vec<SectionViewGroupPlot>> {
+        if self.civil_kind() != Some(CivilKind::SampleLineGroup) {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        sample_lines::group_plots(data, start, end)
     }
 
     /// Sample lines a Civil 3D sample line group generates.
@@ -644,6 +731,18 @@ impl ArchEntityData {
         self.main_stream()
             .map(|(data, start, end)| profile::curve_minimum_k(data, start, end))
             .unwrap_or_default()
+    }
+
+    /// An offset profile's source, slope, offset and entity map (`None` for
+    /// other profiles).
+    pub fn profile_offset(&self) -> Option<OffsetProfile> {
+        if self.civil_kind() != Some(CivilKind::Profile) {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        let mut o = profile::offset_profile(data, start, end)?;
+        o.source = self.typed_handles().get(15)?.0;
+        Some(o)
     }
 
     /// The alignment's name: its fourth string, or for a data shortcut (the
@@ -957,6 +1056,107 @@ impl ArchEntityData {
         network::pipe_ends(data, start, end)
     }
 
+    /// The part definition (`AECC_NETWORK_PART_DEF`) a Civil 3D pipe or
+    /// structure applies. Sizes the record does not keep itself live
+    /// there: a pipe's `PipeInnerDiameter` (inches), a structure's
+    /// `StructInnerDiameter`. A pipe's inverts are its ends lowered by
+    /// half of its inner diameter in drawing units (inch / 12 per foot).
+    pub fn pipe_part_definition(&self) -> Option<u64> {
+        if !matches!(self.dxf_name.as_str(), "AECC_PIPE" | "AECC_STRUCTURE") {
+            return None;
+        }
+        network::part_definition(&self.typed_handles())
+    }
+
+    /// A survey figure (`AECC_SVFIGURE`): its name and the name of the
+    /// survey site it belongs to.
+    pub fn survey_figure(&self) -> Option<survey::SurveyFigure> {
+        if self.dxf_name != "AECC_SVFIGURE" {
+            return None;
+        }
+        survey::figure(&self.decode().strings)
+    }
+
+    /// Name of a survey network (`AECC_SVNETWORK`).
+    pub fn survey_network_name(&self) -> Option<String> {
+        if self.dxf_name != "AECC_SVNETWORK" {
+            return None;
+        }
+        survey::network_name(&self.decode().strings)
+    }
+
+    /// A sheet (`AECC_SHEET`) a plan production run creates: its label and
+    /// its frame's view frame group.
+    pub fn sheet(&self) -> Option<view_frames::Sheet> {
+        if self.dxf_name != "AECC_SHEET" {
+            return None;
+        }
+        let strings = self.decode().strings;
+        view_frames::sheet(&strings, &self.typed_handles())
+    }
+
+    /// A superelevation diagram view (`AECC_SUPERELEVATION_DIAGRAM_VIEW`)
+    /// of an alignment: its name and the alignment it shows.
+    pub fn superelevation_view(&self) -> Option<alignment::SuperelevationView> {
+        if self.dxf_name != "AECC_SUPERELEVATION_DIAGRAM_VIEW" {
+            return None;
+        }
+        let strings = self.decode().strings;
+        alignment::superelevation_view(&strings, &self.typed_handles())
+    }
+
+    /// Station of a Civil 3D sample line (`AECC_SAMPLE_LINE`).
+    pub fn sample_line_station(&self) -> Option<f64> {
+        if self.dxf_name != "AECC_SAMPLE_LINE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        sample_lines::sample_line_station(data, start, end)
+    }
+
+    /// A view frame (`AECC_VIEWFRAME`) of a plan production run: its name,
+    /// its view frame group and the match lines on its sides.
+    pub fn view_frame(&self) -> Option<view_frames::ViewFrame> {
+        if self.dxf_name != "AECC_VIEWFRAME" {
+            return None;
+        }
+        let strings = self.decode().strings;
+        view_frames::view_frame(&strings, &self.typed_handles())
+    }
+
+    /// The frame rectangle a view frame (`AECC_VIEWFRAME`) record keeps in
+    /// its graphic-image section: the four corners of the frame rotated to
+    /// the alignment; see [`view_frames::ViewFrameGeometry`].
+    pub fn view_frame_geometry(&self) -> Option<view_frames::ViewFrameGeometry> {
+        if self.dxf_name != "AECC_VIEWFRAME" {
+            return None;
+        }
+        let graphic = super::arch::decode::entity_graphic_data(self)?;
+        let (data, start, end) = self.main_stream()?;
+        view_frames::view_frame_geometry(data, start, end, &graphic)
+    }
+
+    /// The rectangles a sheet (`AECC_SHEET`) record keeps in its
+    /// graphic-image section; see [`view_frames::SheetGeometry`].
+    pub fn sheet_geometry(&self) -> Option<view_frames::SheetGeometry> {
+        if self.dxf_name != "AECC_SHEET" {
+            return None;
+        }
+        let graphic = super::arch::decode::entity_graphic_data(self)?;
+        let (data, start, end) = self.main_stream()?;
+        view_frames::sheet_geometry(data, start, end, &graphic)
+    }
+
+    /// A match line (`AECC_MATCHLINE`) between two view frames: its name,
+    /// its view frame group and the frames on its sides.
+    pub fn match_line(&self) -> Option<view_frames::MatchLine> {
+        if self.dxf_name != "AECC_MATCHLINE" {
+            return None;
+        }
+        let strings = self.decode().strings;
+        view_frames::match_line(&strings, &self.typed_handles())
+    }
+
     /// Number fields of the part data a Civil 3D pipe (`AECC_PIPE`) keeps
     /// itself: flow coefficients, minimum curve radius and the like.
     pub fn pipe_part_fields(&self) -> Vec<PartField> {
@@ -1014,6 +1214,19 @@ impl ArchEntityData {
             .unwrap_or_default()
     }
 
+    /// What a corridor defines: settings, surfaces, baselines with
+    /// their regions, frequencies, targets and added stations. Names and
+    /// references are filled for a corridor that holds no built station.
+    pub fn corridor_definition(&self) -> Option<CorridorDefinition> {
+        if self.civil_kind() != Some(CivilKind::Corridor) {
+            return None;
+        }
+        let refs: Vec<u64> = self.typed_handles().iter().map(|r| r.0).collect();
+        let strings = self.decode().strings;
+        let (data, start, end) = self.main_stream()?;
+        corridor::definition(data, start, end, &strings, &refs)
+    }
+
     /// Feature lines of a Civil 3D corridor grouped by point code, in the
     /// order of the corridor's code list (the feature line styles its body
     /// references follow the same order).
@@ -1033,6 +1246,18 @@ impl ArchEntityData {
         let len = usize::try_from(reader.main_remaining_bits()).ok()?;
         Some((self.raw_dwg_data.as_deref()?, start, start + len))
     }
+
+    /// Geometry a Civil 3D parcel segment (`AECC_PARCEL_SEGMENT`, the
+    /// application's lot line) record holds; see
+    /// [`parcel_segments::ParcelSegmentGeometry`].
+    pub fn parcel_segment_geometry(&self) -> Option<ParcelSegmentGeometry> {
+        if self.dxf_name != "AECC_PARCEL_SEGMENT" {
+            return None;
+        }
+        let graphic = super::arch::decode::entity_graphic_data(self)?;
+        let (data, start, end) = self.main_stream()?;
+        parcel_segments::geometry(&data, start, end, &graphic)
+    }
 }
 
 impl ArchObject {
@@ -1050,6 +1275,28 @@ impl ArchObject {
         self.main_stream()
             .map(|(data, start, end)| cogo::points(data, start, end, &decoded.handles, &decoded.strings))
             .unwrap_or_default()
+    }
+
+    /// User-defined point property an `AECC_USER_DEFINED_ATTRIBUTE` record
+    /// defines.
+    pub fn user_property(&self) -> Option<UserProperty> {
+        if self.dxf_name != "AECC_USER_DEFINED_ATTRIBUTE" {
+            return None;
+        }
+        let strings = self.decode().strings;
+        let (data, start, end) = self.main_stream()?;
+        cogo::user_property(data, start, end, &strings)
+    }
+
+    /// What a point group (`AECC_POINT_PG`) of the recent form overrides
+    /// in its points.
+    pub fn point_group_overrides(&self) -> Option<PointGroupOverrides> {
+        if self.dxf_name != "AECC_POINT_PG" {
+            return None;
+        }
+        let d = self.decode();
+        let (data, start, end) = self.main_stream()?;
+        cogo::group_overrides(data, start, end, &d.handles, &d.strings)
     }
 
     /// Numbers of the points a Civil 3D point group (`AECC_POINT_PG`) holds.
@@ -1185,6 +1432,17 @@ impl ArchObject {
         style::view_axes(data, start, end)
     }
 
+    /// The settings of a profile view style: the graph's title,
+    /// exaggeration and direction, its grid and its four axes (see
+    /// [`ProfileViewStyleSettings`]); text styles as handles.
+    pub fn profile_view_style_settings(&self) -> Option<ProfileViewStyleSettings> {
+        if self.dxf_name != "AECC_PROFILE_VIEW_STYLE" {
+            return None;
+        }
+        let (data, start, end) = self.main_stream()?;
+        style::view_style_settings(data, start, end, &self.decode().handles)
+    }
+
     /// Point style of a Civil 3D marker style (`AECC_ROADWAYMARKER_STYLE`).
     pub fn marker(&self) -> Option<Marker> {
         if self.dxf_name != "AECC_ROADWAYMARKER_STYLE" && self.dxf_name != "AECC_POINT_STYLE" {
@@ -1231,6 +1489,132 @@ impl ArchObject {
         }
         let entries = strings[first..].chunks(4).zip(&groups[defaults..]).map(|(c, group)| (c[0].clone(), group[1])).collect();
         (groups[..defaults].iter().map(|g| g[1]).collect(), entries)
+    }
+
+    /// The class data fields of a label collector (`collector`) or text
+    /// component style, the index of its own reference and its texts
+    /// after the key texts.
+    pub(in crate::classes::civil) fn label_fields(&self, collector: bool) -> Option<(label_style::LabelFields, usize, usize)> {
+        let iterator = match self.dxf_name.as_str() {
+            "AECC_LABEL_COLLECTOR_STYLE" if collector => None,
+            "AECC_LABEL_TEXT_STYLE" if !collector => None,
+            "AECC_LABEL_TEXT_ITERATOR_STYLE" if !collector => Some(false),
+            "AECC_LABEL_TEXT_ITERATOR_CURVE_OR_SPIRAL_STYLE" if !collector => Some(true),
+            _ => return None,
+        };
+        let (data, start, end) = self.main_stream()?;
+        let (class, own_ref, text_keys) = style::class_layout(data, start, end)?;
+        let fields = match iterator {
+            Some(curve) => label_style::LabelFields::read_iterator(data, class, end, curve)?,
+            None => label_style::LabelFields::read(data, class, end, collector)?,
+        };
+        Some((fields, own_ref, text_keys))
+    }
+
+    /// Settings of a label style (`AECC_LABEL_COLLECTOR_STYLE`):
+    /// visibility, layer, text style, behavior, plan readability, leader
+    /// and dragged state, each `Some` when the style overrides the label
+    /// style defaults.
+    pub fn label_style_settings(&self) -> Option<LabelStyleSettings> {
+        let (fields, own, _) = self.label_fields(true)?;
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own).map(|r| r.0).collect();
+        Some(fields.settings(&refs))
+    }
+
+    /// Text components a label style lists (their handles), in order.
+    pub fn label_style_components(&self) -> Vec<u64> {
+        let Some((_, own, _)) = self.label_fields(true) else {
+            return Vec::new();
+        };
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own + label_style::BASE_REFS).map(|r| r.0).collect();
+        // Three lists of the components and a closing null reference.
+        let n = refs.len().saturating_sub(1) / 3;
+        refs[..n].to_vec()
+    }
+
+    /// The fields of a line (`line`) or block component and where its
+    /// references and texts start.
+    pub(in crate::classes::civil) fn label_component_fields(&self, line: bool) -> Option<(label_style::LabelFields, usize, usize)> {
+        (self.dxf_name == if line { "AECC_LABEL_RADIAL_LINE_STYLE" } else { "AECC_LABEL_BLOCK_STYLE" }).then_some(())?;
+        let (data, start, end) = self.main_stream()?;
+        let (class, own_ref, text_keys) = style::class_layout(data, start, end)?;
+        Some((label_style::LabelFields::read_component(data, class, end, line)?, own_ref, text_keys))
+    }
+
+    /// Id and name (under a text id) of a label style component.
+    fn label_component_head(&self) -> Option<(u32, Option<String>)> {
+        let (data, start, end) = self.main_stream()?;
+        let mut b = bits::Bits::new(data, start, end);
+        b.bit_short()?;
+        let id = b.bit_long()? as u32;
+        Some((id, (id & 0x8000_0000 != 0).then(|| self.decode().strings.first().cloned()).flatten()))
+    }
+
+    /// The fields of a tick (`tick`) or direction arrow component.
+    pub(in crate::classes::civil) fn label_mark_fields(&self, tick: bool) -> Option<(label_style::LabelFields, usize, usize)> {
+        (self.dxf_name == if tick { "AECC_LABEL_TICK_STYLE" } else { "AECC_LABEL_VECTOR_ARROW_STYLE" }).then_some(())?;
+        let (data, start, end) = self.main_stream()?;
+        let (class, own_ref, text_keys) = style::class_layout(data, start, end)?;
+        Some((label_style::LabelFields::read_mark(data, class, end, tick)?, own_ref, text_keys))
+    }
+
+    /// A label style's tick component (`AECC_LABEL_TICK_STYLE`).
+    pub fn label_tick_component(&self) -> Option<LabelTickComponent> {
+        let (fields, own, _) = self.label_mark_fields(true)?;
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own).map(|r| r.0).collect();
+        let (id, name) = self.label_component_head()?;
+        fields.tick_component(id, name, &refs)
+    }
+
+    /// A label style's direction arrow component
+    /// (`AECC_LABEL_VECTOR_ARROW_STYLE`).
+    pub fn label_arrow_component(&self) -> Option<LabelArrowComponent> {
+        let (fields, _, _) = self.label_mark_fields(false)?;
+        let (id, name) = self.label_component_head()?;
+        fields.arrow_component(id, name)
+    }
+
+    /// A label style's line component (`AECC_LABEL_RADIAL_LINE_STYLE`).
+    pub fn label_line_component(&self) -> Option<LabelLineComponent> {
+        let (fields, own, _) = self.label_component_fields(true)?;
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own).map(|r| r.0).collect();
+        let (id, name) = self.label_component_head()?;
+        fields.line_component(id, name, &refs)
+    }
+
+    /// A label style's block component (`AECC_LABEL_BLOCK_STYLE`).
+    pub fn label_block_component(&self) -> Option<LabelBlockComponent> {
+        let (fields, own, _) = self.label_component_fields(false)?;
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own).map(|r| r.0).collect();
+        let (id, name) = self.label_component_head()?;
+        fields.block_component(id, name, &refs)
+    }
+
+    /// A label style's text iterator component
+    /// (`AECC_LABEL_TEXT_ITERATOR_STYLE`,
+    /// `AECC_LABEL_TEXT_ITERATOR_CURVE_OR_SPIRAL_STYLE`).
+    pub fn label_iterator_component(&self) -> Option<LabelIteratorComponent> {
+        self.dxf_name.starts_with("AECC_LABEL_TEXT_ITERATOR").then_some(())?;
+        let (iterates, spiral_contents) = self.label_fields(false)?.0.iterator()?;
+        Some(LabelIteratorComponent { text: self.label_text_component()?, iterates, spiral_contents })
+    }
+
+    /// A label style's text component (`AECC_LABEL_TEXT_STYLE`; the text
+    /// settings of an iterator).
+    pub fn label_text_component(&self) -> Option<LabelTextComponent> {
+        let (fields, own, text_keys) = self.label_fields(false)?;
+        let refs: Vec<u64> = self.typed_handles().into_iter().skip(own).map(|r| r.0).collect();
+        let (data, start, end) = self.main_stream()?;
+        let mut b = bits::Bits::new(data, start, end);
+        b.bit_short()?;
+        let id = b.bit_long()? as u32;
+        let strings = self.decode().strings;
+        let text_id = |id: u32| id & 0x8000_0000 != 0;
+        let own_texts = if text_id(id) { 2 } else { 1 };
+        let name = text_id(id).then(|| strings.first().cloned()).flatten();
+        let anchor = fields.text_component(id, None, &refs, None)?.anchor_component;
+        let anchor_name = text_id(anchor).then(|| strings.get(own_texts + text_keys).cloned()).flatten();
+        fields.text_component(id, name, &refs, anchor_name)
     }
 
     /// `(minor, major)` contour intervals of a Civil 3D surface style.

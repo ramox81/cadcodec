@@ -207,6 +207,217 @@ the codes Crown, ETW, ETW_Datum and Crown_Datum (at station 0 ETW (4,
 -0.12) right and (-3.5, -0.07) left), as in a drawing the application had
 opened (E-PK1).
 
+## 2d. Label style settings
+
+A label style (`AECC_LABEL_COLLECTOR_STYLE`) and its text components
+(`AECC_LABEL_TEXT_STYLE`) follow the style layout of §2a with no display
+components; their settings are class data fields after the component
+lists, not keys. Both open with the same base fields (the other component
+kinds, lines, arrows and text iterators, too):
+
+```text
+BL height set, BL, BD height, BL, BL kind
+BL mask A, BL mask B
+BL, BL, B label visible, B visible, B background mask, B,
+BL anchor component id, BL anchor (low byte: 4 + anchor point)
+BL orientation, BL insert, BL, BL, BL plan readable, BD readable bias,
+B flip anchors, BD x offset, BD, BD y offset, BD, B border visible,
+BD gap, B leader visible, B, B leader spline, B, BD arrowhead size,
+CMC text color, BL text lineweight, CMC border color,
+BL border lineweight, BL border type, CMC leader color,
+BL leader lineweight, BL leader attachment, BL, BL n, n x BL key,
+BL mask C
+```
+
+The keys are listed only by the collectors of gravity network part
+labels (pipe and structure labels in plan and profile, pipe labels in
+sections and crossing profiles; their texts end with "<ALL>", "<ALL>"):
+0x0405D122 and 0x0405D123 for a pipe, 0x0405D120 and 0x0405D121 for a
+structure. Pressure pipe, fitting and appurtenance labels list none.
+
+(CMC: `BS 0`, the color word, `RC 0`.) A collector goes on with its
+dragged state, a text component with its text:
+
+```text
+collector:  B, B, B, B stacked, BD text height, B border visible, BD gap,
+            BS border type, B background mask, B leader justification,
+            CMC color, BL lineweight, BL n,
+            n x { BL, BD, BL, 9 bits, BL, BL, BL, BL, B, BL },
+            BL, BD max text width
+text:       BL, BL bytes + UTF-16 contents, BD angle, BL, BL attachment,
+            BL, B, BD max width, BD
+```
+
+A style overrides a setting of the label style defaults by its mask bit;
+with the bit clear the stored value is a leftover and the defaults' value
+applies (the default point style stores a readable bias of 0 and shows
+110°). Mask A: 0x1 visibility, 0x2 orientation, 0x4 plan readable, 0x8
+insert option, 0x100 leader visibility, 0x800 leader shape, 0x2000
+arrowhead size, 0x4000 arrowhead style, 0x100000 text color (component),
+0x200000 layer, 0x800000 text lineweight (component), 0x08000000 leader
+color, 0x10000000 leader linetype, 0x20000000 leader lineweight. Mask B:
+0x2 leader attachment, 0x8 readable bias, 0x10 flip anchors. Mask C
+(dragged state): 0x1 display type, 0x2 text height, 0x4 border
+visibility, 0x8 gap, 0x10 color, 0x20 linetype, 0x40 lineweight, 0x80
+leader justification, 0x100 border type, 0x200 background mask, 0x400
+maximum text width. The text style has no bit of its own (it is set in
+every sample; a null reference takes the defaults' style). A text
+component's other values (contents, offsets, angle, attachment, anchor,
+border) have no mask; its height counts as set when the first BL is 1.
+
+The base references: own (soft), text style, owner style, arrowhead
+block, layer, -, border linetype, leader linetype, dragged state linetype;
+a collector then lists its components three times (hard pointers, hard
+owners, soft pointers) and a null reference. Texts: the record's own (an
+empty one, or the name and an empty one under a text id), one per text
+key (users, the class name `AeccDbCogoPoint` and the like), then a text
+component's anchor component name when that component sits under a text
+id.
+
+Enumerations: orientation 0 object, 1 view, 2 world; insert 0 none, 1
+top, 2 bottom; attachment and anchor point 0 top left to 8 bottom right;
+leader attachment 2 middle, 3 middle of the bottom line; border type 0
+rectangular, 1 rounded.
+
+Components added or removed (LC00 to LC05: a text, line or block
+component added to the default point label style, its first or last
+text component removed) change the collector only in its component
+lists and its entry list (`BL n` entries, the same 74 bits for each but
+their number 1..n, then `BL n`); the other components stay as they are.
+An added text component is a text id (the application's own counter,
+0x800006A7 here) with the name and an empty text, its fields those of the
+style's other text components but `t5` 5, contents "Label Text", the
+labelled object's location as anchor (anchor word 0x0800B200; an anchor
+point gives 0x0800B1xx), middle center attachment, no offsets; it comes
+after the others. The application adds text, line and block components to
+a point label style (ticks, reference texts, direction arrows and text
+iterators are refused there).
+
+Line (`AECC_LABEL_RADIAL_LINE_STYLE`) and block (`AECC_LABEL_BLOCK_STYLE`)
+components share the base fields: visibility, color and lineweight in
+the text color and lineweight fields (mask A bits as for text), a line's
+linetype in the sixth reference (mask A 0x400000), a block's offsets in
+the base offsets; then (LL01-LL16, BB01-BB10: one setting of a new line
+or block changed per save):
+
+```text
+line:   BL end anchor component, B use end anchor, BL end anchor word,
+        BD start x offset, BD, BD start y offset, BD, BD end x offset,
+        BD, BD end y offset, BD, BD fixed length, BD, BD angle, BD,
+        BL length type (0 fixed, 1 percent), BD percent length, BL 0
+block:  BL 0, BD rotation, BD, BD height, BL 0,
+        BL attachment (9 insertion point, 0 top left ... 8 bottom right)
+tick:   the block's fields, then BL 1, BL 0, B align with object
+arrow:  BL 0, BL fixed length (1) or minimum length (0), BD length, BD,
+        BD arrowhead size, BD, BD rotation, BL 0
+```
+
+The start offsets count when mask C has 0x1 (x) and 0x2 (y) set; a
+block's block is its tenth reference. A new line has fixed length 1/12
+and percent length 1, a new block height 1/120. The editor adds a line
+under a text id from its counter (0x800006A7, 0x800006A8: LC06) with its
+name and empty texts, a block under a plain id counting from 0xA71 (its
+name is "B" and the id less 0xA70) without texts; both have the
+references of a new component (null but the border linetype, the owner
+too) and the head of the style's other components.
+
+Tick (`AECC_LABEL_TICK_STYLE`: station labels) and direction arrow
+(`AECC_LABEL_VECTOR_ARROW_STYLE`: line labels) components have the same
+base fields: color and lineweight in the text color and lineweight
+fields, an arrow's offsets in the base offsets (TA000 to TA013: one
+setting of a new tick and arrow changed per save); a tick's block is its
+ninth reference (TB001, its class data unchanged). The editor adds both
+under text ids from its counter (0x800001A2, 0x800001A5) with the name,
+an empty text and the users, with the references of a new component; the
+arrows of the application's line label styles are under a plain id
+(0xCD7) with no name. A new tick is 1/120 high and aligned with the
+object, a new arrow at least 1/40 long with a 1/120 arrowhead.
+
+Text iterators (`AECC_LABEL_TEXT_ITERATOR_STYLE`: an intersection's
+roads; `AECC_LABEL_TEXT_ITERATOR_CURVE_OR_SPIRAL_STYLE`: an alignment's
+curves and spirals) are text components with, after the text fields,
+`BL` what they label each of (0x1907A000 intersecting roads, 0x1900D752
+curves and spirals) and for curves and spirals `BL` 1, `BL` 0 and the
+spirals' text (`BL` bytes + UTF-16; the contents are the curves' text).
+Every iterator of LS000, IT001 to IT005 reads (spirals' text, curves'
+text, a road iterator's text and height changed per save). The API adds
+none (`AddComponent` with the iterator type: "The method doesn't support
+this operation", also in the styles that have one, IT001), so a copy
+keeps or removes them only (`LabelStyle::iterators`; the text settings
+and spirals' text written as edited, a new one refused). E-IT1 (LS000's
+point of intersection label style with its iterator's curves' and
+spirals' texts, height and color changed, its intersection label style
+without its iterator) opens with AUDIT 0 and the API lists the written
+values and the remaining text component.
+
+Reference text components cannot be sampled: `AddComponent` refuses the
+reference text type in every collection tried (point, alignment major station, curve,
+spiral, station offset and line, profile major station, parcel line:
+"The method doesn't support this operation") and no style of the
+template or of the sample drawings has one (no reference text class
+among their label style components), so their record is unknown.
+
+Samples: LS001-LS040 (one setting of the default point label style
+changed per save), LT001-LT035 (bits back to their defaults, colors,
+linetypes, layer, text style, arrowhead style, anchor component and
+point, enumerations stepped twice). Every collector and text component of the application's style tree reads
+(631 records, HB0, N02, N07, P10, LC00). Collectors of drawings saved by
+older releases (texts naming an older user, e.g. pn2, q7) fail in the
+dragged state in 23 of about 300: their text height, gap and border type
+fields hold 32-bit words that look like memory addresses (0x1FFF18A8),
+not values. E-NL1 (N02 with a copy of each gravity network part label style:
+pipe, structure, section pipe and crossing profile pipe, and of the
+pressure pipe label style; dragged text height and border, orientation,
+leader color, the first component's height changed and a text component
+added): AUDIT 0; the API lists the five copies with the written values.
+
+Writing: `add_label_style` copies a label style of the drawing and its
+components with the settings and text component values given;
+`add_point_label_style` does so from the default point label style. A
+copy is a new text id in the source's collection with its name; its
+records equal the source's apart from the head and the changed fields
+(an application copy of "Standard" is the same, L03). The copy leaves out
+the text components `edit` removes and adds the new ones it pushes
+(`LabelStyle::new_text_component`, id 0) after the others, under text ids
+from 0x80050001; a component anchored to a removed one is refused.
+E-LC1 (OP00 with LSX: the description component removed, T9 added with
+other contents and offset; LSY: only the elevation component kept, A1 and
+A2 added) opens with AUDIT 0 and the API lists the components with the
+written values; T9's properties equal the application's added T9 (LC01)
+apart from dates and users. Line and block components keep their number
+in a copy; their values are written as edited (`LabelStyle::lines`,
+`LabelStyle::blocks`); a copy leaves out those `edit` removes and adds
+those it pushes with id 0 (`LabelStyle::new_line_component`,
+`new_block_component`) after the others: lines under text ids from
+0x80050001 (after the copy's new text components), blocks from one above
+the style's highest block id (at least 0xA71). E-LB1 (OP00's point label
+style with two lines and a block added) and E-LB2 (LC06's, its first
+line and block removed, a block added) open with AUDIT 0 and the API
+lists the components with the written values (the blocks named B1, B2,
+B3 after their ids). Tick and arrow components are kept, removed and
+added the same way (`LabelStyle::ticks`, `LabelStyle::arrows`,
+`new_tick_component`, `new_arrow_component`; added ones under the text
+ids after the lines). E-TA1 (LS000's major station label style with a
+tick added, its line label style with an arrow added), E-TA2 (TA015's:
+the editor's tick removed and a tick added, the template arrow's length,
+rotation and length type changed) and E-TA3 (TB000's: the editor's tick
+and an added one with a block) open with AUDIT 0 and the API lists the
+components with the written values and block name. E-LC2 (LC04's style copied with its line's angle,
+start x and end y offsets, lengths, percent length type, color and
+visibility changed) and E-LC3 (LC05's block: height, rotation, x offset,
+attachment, lineweight) open with AUDIT 0 and the API lists the written
+values. Every line component of HB0 (33) and OP00 (5) reads. E-LS1 (new
+drawing, three points, LS1 with every collector setting and the first
+component's text, border and anchor changed, LS2 with the second
+component's height and color): opens with AUDIT 0, the API lists LS1 and
+LS2 with exactly the written values. E-LS2 (an application drawing with
+a copy of each of its 206 leaf label styles, orientation and the first
+text component's x offset changed): AUDIT 0; the API shows the copies of
+53 label style kinds (alignment, profile, surface, parcel, section,
+section view, profile view, point, sample line, match line, view frame,
+intersection, catchment, projection and general labels) with the written
+values.
+
 ## 3. COGO points
 
 ### Defaults looked up in the tree
@@ -243,11 +454,18 @@ BL 0
 BL j, j × { BL number, BL text id }   named points
 BL j, j × { BL text id, BL number }   the same keyed by name
 BL k, k × { BL number, BL text id }
-13 × BL 0
+13 × slot: BL e, e × { BL key | 0x40000000, BL c, c × { BL number, value } }
 handles: n × point style (hard pointer), m × label style (hard pointer),
          class node (soft pointer)
-strings: "", then the raw description of the k points in order
+strings: "", the names twice, the raw description of the k points in
+         order, then each slot entry's property key text and its texts
 ```
+
+The slots hold user-defined property values (below) by kind: 4 doubles
+(BD), 5 booleans (one bit), 6 texts (each value a text after the key
+text), 7 whole numbers (BL); the other slots are empty in every sample.
+An entry lists the points holding a value, in database order; a point
+without a value of a property has none (it shows the default).
 
 Text ids are `0x80000000 | n`; the application numbers texts per session
 and accepts ids a writer numbers itself. The writer gives
@@ -273,16 +491,37 @@ The ids are stored by hash bucket (id mod 8), a new id last in its bucket;
 
 ```text
 BS 0x04BE, BL id, BL 0, BL 0 (no override lists, no keys),
-BL 0 written in its one-byte form, 5 bits 00000, 6 bits 100000,
-BL serial, BL count, count × RL number,
+BL flags written in its one-byte form (1 raw description overridden,
+  2 elevation overridden),
+5 bits: label style overridden, point style overridden, 0, 0, locked,
+6 bits 100000, BL serial, BL count, count × RL number,
 2 bits 00, BD 0, 3BD extents min, 3BD extents max,
-164 bits (the same in `_All Points` and every named group of WP01, WP08,
-WP10 and WG01: the group's override settings, not mapped field by field)
+BD fixed elevation, BL raw description text id (0: none),
+BL classification (87 none, 0xEA7 all, a text id: the classification
+  named by the text),
+150 bits (six BL 0, then constant bits; the same in every group sampled)
 handles (hard pointers): label style, point style, inner query, database,
          group node, create-points settings node, 0, 0
 strings: `_All Points`: "", "AeccImpAllPointsPG"
          named group: name, description, "AeccImpPG"
+         then the raw description and the classification name, when set
 ```
+
+Samples PG01-PG07 (one change each from a group `G` of PG00b): point
+style and label style overridden (the overriding styles are the group's
+first two references), elevation overridden (0, then 5), raw
+description overridden ("", then "XY": the text gets an id and follows
+the group's texts), points locked, classifications applied: all, then
+C1. Older releases' groups store other flags (0x48, 0x4A) and no serial;
+`ArchObject::point_group_overrides()` reads the recent form,
+`set_point_group_overrides(doc, group, overrides)` writes it (override
+texts take ids from `0x80040001`) and every rewrite of a group's members
+keeps them. Written from PG00b each record equals the application's bit
+for bit but for the text ids; E-PG1 (every override on G, the
+classification C1) and E-PG2 (a new drawing, group of points 2 and 3
+with elevation 7.5, raw description "ZZ" and all classifications, then
+a point added) open without recovery, AUDIT 0, and the programming
+interface reads each override as written.
 
 `_All Points` has id 33, serial 0, no label style, and always the extents
 pair (1e20, 1e20, 1e20) / (-1e20, -1e20, -1e20); a named group stores the
@@ -372,6 +611,48 @@ texts:     ["AND"], part: ["NOT", ""], "PARENS", "", ORs, leaves; a range
            leaves and the range text
 ```
 
+Custom queries (`PointQuery::Custom`: a `QueryExpression` of
+comparisons joined by AND and OR, parentheses and a leading NOT) are
+stored without generated parentheses (PQ01 to PQ03: 25 queries over
+number, elevation, raw and full description and name):
+
+```text
+head:    BS 0x04BE, BL text id, BL 0, BL 0, 5 bits 01010,
+         BL k comparisons (byte form), 7 zero bits
+records: per comparison, in the order of the query text: the attribute's
+         header, its number bit, opens parentheses, closes parentheses,
+         byte comparison code, byte joint (0 first, 1 AND, 3 OR, 2 a NOT
+         opening the query or its first group), 7 zero bits
+leaves:  per comparison, in the same order: header, number bit, BL
+         attribute id, the constant (BL number, BD elevation, none for a
+         pattern), 7 zero bits but after the last
+texts:   "Point Group Query - <name>", "", the k constants, then the
+         expression's nodes in pre-order: "AeccQueryNodeAND" / "OR",
+         "NOT" and "PARENS" each with an empty text, a comparison as in
+         the standard queries (a pattern repeated after its leaf)
+```
+
+The tree the texts list is the one the application reads from the text:
+NOT before AND before OR, left to right (`a OR b AND c` is `a OR (b AND
+c)`; `a AND b AND c` is `(a AND b) AND c`). The application refuses `AND
+NOT` and `OR NOT` ("Unsupported property name found") and other
+operators ("Invalid operator found"); a query opening with two
+parentheses gets an extra record and an empty constant (PQ02 D4): the
+application keeps each parenthesis beyond one per comparison as a
+comparison with an empty text, and lists such queries so itself (PQ04:
+`((PointNumber>=2))` reads back as `(''  (PointNumber>=2)  '')`, a
+comparison closing two parentheses gains a trailing `''`); they are
+neither read nor written; names are kept in lower case; the custom query
+names are PointNumber, PointElevation, RawDescription, FullDescription and
+Name. The writer puts an OR under an AND or NOT and an AND under a NOT in
+parentheses and refuses a NOT elsewhere and a comparison opening or
+closing two parentheses; every query of PQ01 to PQ03 reads and is written
+back bit for bit. E-PQ1 (a new drawing, six points, seven custom groups:
+parentheses, a leading NOT before a comparison and a group, an OR put in
+parentheses, name, raw and full description patterns, precedence without
+parentheses) opens with AUDIT 0; the application lists the queries as
+written and, updated, the same members.
+
 Point names live in the point database: after the label style list,
 `BL 0`, the names by number `BL j, j x {BL number, BL text id}`, the same
 keyed by text `BL j, j x {BL text id, BL number}`, then the descriptions;
@@ -380,6 +661,80 @@ descriptions share the text ids. `set_cogo_point_name` names a point
 (names are unique, case ignored). A drawing written with named points and
 groups of every kind above (E-Q5) opens with AUDIT 0; the application
 lists the queries as its own and the same members.
+
+### User-defined properties
+
+Samples UD01, UD02, UE01-UE15 (one change each from two points): a
+classification, a property of each kind (double, whole number, text,
+boolean), a second classification, bounds and a description, values on
+one and on two points, two kinds on two points.
+
+A classification (`AECC_USER_DEFINED_ATTRIBUTE_CLASSIFICATION`) is a
+child of the COGO point class node, keyed by a text id of its name; its
+children are its properties. A property (`AECC_USER_DEFINED_ATTRIBUTE`,
+owner its classification):
+
+```text
+BS 0x04BE, BL key, BL 0, BL 0, 3 bits 010
+BL key, default (whole BL, double BD, boolean RC, text: none, choice:
+  BL index), BL key
+B use default, B bounded
+[bounded: BL code << 24 | 0x400000 if inclusive, lower, the same for upper]
+[enumeration: BL n choices]
+BL 0x4000806B, 3 bits 010
+handles: hard pointer to itself
+strings: key, "", key, [text default], key, the type-info class name
+         (AeccAttributeTypeInfoInt, ...Double, ...Bool, ...String,
+         ...UserDefinedEnum), [the n choices], name, description,
+         classification name
+```
+
+`key` is `0x80000000 | code << 24 | serial`: code 1 whole number, 2
+double, 3 boolean, 4 text, 13 enumeration (UE20, UE21: choices A, B, C;
+a point's value and the default are choice indexes, stored like whole
+numbers, in slot 7 of the database); the serial counts the properties of a kind
+over the drawing (a second double in another classification is
+`0x82000002`). Its text is 32 hexadecimal digits of the property's
+identifier (as the application prints it) and the name. Whole numbers,
+doubles and booleans are bounded (by default the full range inclusive,
+±1e24 for doubles, booleans 0 and 1 without the inclusive flag); texts
+are not. The word after the bounds is `0x4000806B` in every record read
+back from a file (a property made in the session it was saved in can
+hold another value; it reads the same).
+
+The class node lists, after its children:
+
+```text
+BL 0, B has properties,
+  [BL n, n × { BL key, default (as in the property) }, B 0],
+BL m, m × BL key             the users of each key: the point database
+                             (before the definition, while a point holds
+                             a value) and the property's record
+handles: children, m × soft pointer (the users), hard owner 0
+strings: own name, "", the children's names, each property's key text
+         (and its text default), each user's key text, "AeccDbCogoPoint"
+```
+
+`add_point_property_classification(doc, name)`, `add_point_property(doc,
+classification, name, description, default, use_default, bounds)` (it
+returns the key text) and `set_cogo_point_property(doc, point, key,
+value)` write these; every point edit rewrites the slots from the values
+read back (they were dropped before) and lists the database as a user of
+the keys some point holds. `point_properties(doc)` and
+`ArchObject::user_property()` read the definitions, `CogoPoint::properties`
+the values.
+
+A classification written with a key in a lower bucket (key mod 8) than
+`Unclassified` (`0xEA6`), so stored before it, opens with errors once it
+holds a property; the writer keys classifications `0x80030007 + 8i`. A
+boolean value written as a byte in the database opened with errors (the
+definitions and the class node do store booleans as bytes).
+
+| written | result |
+|---|---|
+| E-UD1: a new drawing, two points, classifications C1 and C2, properties P1 double, I1 whole number ("whole"), S1 text ("ab"), B1 boolean (no default), Q1 double 0 (exclusive) to 10 ("dd"); values P1 2.25 and 4.5, I1 7, S1 "xy", B1 false, Q1 9 | opens without recovery, AUDIT 0; the programming interface reads every definition (bounds, defaults, descriptions) and value as written; saved again it reads back the same |
+| E-UD2: the same on an application drawing with two points | the same |
+| E-UD5: one value on an application property; E-UD8: a property in an application classification | the same; the database and class node equal the application's bit for bit but for session text ids |
 
 ### Edits
 
@@ -442,7 +797,8 @@ BL n, the lines then the arcs:
   spiral-curve-spiral: BL 260, the arc's head with BL 0 (fitted between
         two lines) and no B, BS id, BS previous id, BS next id, BL 256
         (spiral definition), BD spiral in, BD radius, BD spiral out
-BL 0 x 4 (intervals), BL 0 (equations), BL 1, BL 0 (design speeds)
+BL 0 x 4 (no anchors, see below), BL 0 (equations), BL 1, BL 0 (design
+speeds)
 BD 100 (station increment), BL 0 (no superelevation), BL 0, BL 1
 (centerline), BL 2, 2, 2, 0, 3, B 0, BS 0x04BE
 handles: soft pointer 0, companion (hard pointer, twice), soft pointer 0,
@@ -499,13 +855,273 @@ bulge differ from the application's in the last bits. An alignment that refers t
 while it opens the drawing (A1); a companion without its topology is
 refused (`Errors Found`, A6).
 
+### Alignment types
+
+`add_alignment_of_kind(doc, name, vertices, curves, kind, layer)` writes a
+centerline, utility or rail alignment (`AlignmentKind`); the record
+differs only in its type word (1 centerline, 4 utility, 5 rail) and, for
+a rail alignment, the track gauge in the BD after the 7 criteria bits and
+one more `BL 0` after the mask count (`BL 5, BL 2, 2, 2, 0, 0, 3`; AT11 to
+AT13). The reader returns the gauge (`alignment_track_gauge`) and reads
+type 5 as `AlignmentType::Rail`. Written (E-AT1), the three open, audit
+clean and list as Centerline, Utility and Rail with the given track width.
+
+### Curb returns
+
+`add_curb_return(doc, name, incoming, offset_in, outgoing, offset_out,
+forward, radius, (overlap_in, overlap_out), layer)` writes a connected
+alignment (type 3) of the arc curve group between two siteless roads: a
+line of `overlap_in` along the incoming road's offset line (negative to
+its left), a free arc of `radius` fitted between the lines, and a line of
+`overlap_out` along the outgoing road's offset line (negative to the left
+of its stationing), run along the outgoing road's stationing (`forward`)
+or against it. The parents get no anchors. The record is an alignment of
+those three elements whose type block is `BL 3` and the connection block:
+
+```text
+side (incoming, then outgoing): [B backward (outgoing only), B ...],
+  BD signed offset toward the turn's inside (-offset x turn x direction),
+  B 1, BD overlap, 6 bits 010100,
+  4 regions like an offset alignment's: { BD offset, BD road start,
+  BD road end, BD own start, BD own end, BL 1, BL first, BL last,
+  5 x BL 0, BL 3 }: the line (its road stations, its own stations kept a
+  thousandth of the overlap in from each end, reversed for a backward
+  run), two empty regions (zeros, elements 0), the line again
+BD overlap in, BD arc end station, BD radius,
+2 x BD: the point half a unit from where the roads meet into the corner
+  between the incoming road's arm behind and the outgoing arm,
+BD the incoming road's and BD the outgoing road's station where the
+  offset lines meet, BL 0, BL 2 (forward) or 3 (backward), BL 0, BL 3
+```
+
+The runs between the 31 values are constant (written as the samples'
+bits) apart from three flags: right turn, forward, incoming offset outside
+the turn. References: the alignment's six, then in, in, out, out, in,
+out (soft). Samples CR01 to CR05 (left turns: radius, overlaps, offsets
+varied; the stations given to the command are not stored), CR07 (a right
+turn into AL2 against its stationing), CR08, CR09 (a left turn into a
+road against its stationing with the incoming offset outside the turn)
+and CR10 (from a road heading south): written for their roads the
+records equal the samples' apart from the geometry stamp and the last
+bits of four values; E-CR01, E-CR07, E-CR09 and E-CR10 open with AUDIT
+0 errors and the API lists the three elements where they were written
+and the connection parameters (the application reports the outgoing
+offset relative to the direction travelled). A value of exactly 0 or 1
+would shorten the block and is refused.
+
+`add_curb_return_with` takes the other curve groups (`CurbReturnCurve`):
+
+- three arcs (CG01, CG07; CG11 a right turn): one element of kind 267
+  (constraint 1: `BL 0, BL 1, BL 3`, then radius and length of each arc,
+  the middle length 0); the connection block's code (the BL at bits 53
+  to 62 of the run after value 23) is 3, the six values take the
+  radius's place and `BL 1` comes before the bit after them;
+- a clothoid spiral-curve-spiral (CG02, CG06, CG08; CG10 a right turn):
+  the lines keep ids 1 and 3 and the curve is a spiral in (kind 259,
+  constraint 0: `BL 256, B clockwise, 2RD start, 2RD direction, BD
+  length, BD radius, BD 0, BD 0, BD 1`), a fixed arc (start, middle,
+  end) and a spiral out (constraint 1: `BL 256, B clockwise, BD radius,
+  BD length, 2RD start, 2RD direction, BD 0, BD 0, BD 1`), ids 4 to 6,
+  stored after the lines; the code is 4 and the run ends after it,
+  without the overlap, the curve's end station or the radius; the
+  record's keys gain `0x0400D783`, a text before the name holding
+  `{"CurveType": 4, "CurveParameters": {"CurveRadius", "SpiralInLength",
+  "SpiralOutLength", "Greater180": false, "SpiralType": 256}}`
+  (tab-indented lines, numbers in their shortest form).
+
+Written for CR00's roads the records equal the samples' apart from the
+stamp and the last bits of values (the application's spiral points lie
+up to 1e-11 from the series; its lines start up to 4e-10 apart). E-CG01,
+E-CG02, E-CG07, E-CG08, E-CG10 and E-CG11 open with AUDIT 0 and the API
+reports the curve group and its parameters; the application solves a
+spiral-curve-spiral again on open (its own points), three arcs as
+written. The application's interface refuses every spiral-spiral group
+(SSCS, SCSS, SSCSS: "No solution because of invalid parameters" for
+the radii, lengths, offsets and stations tried), so they are not
+written; spirals other than the clothoid are not written either.
+
+### Station anchors
+
+Objects that tie to a station of an alignment do so through an anchor in
+the alignment's record, kept by its identifier (a version-4 GUID); the
+block after the elements lists them:
+
+```text
+BL profiles, BL profile views, BL sample line groups, BL k,
+k x { GUID, B 1, BL kind, BD 0, BD station, BD along, BD remaining,
+      BL element, BL previous element, BL next element,
+      2RD element start, 2RD element end, 2RD point at the station }
+```
+
+The anchors are stored in identifier order (byte by byte: AO12, AO16,
+KH01). The element is the one the station lies on (the one that starts
+there at a join, the last one at the alignment's end; AO16's anchor at 60
+is on the arc that starts there), `along` and `remaining` the distances
+to its ends. Kinds seen: 32763 (and 32765) a profile's start, 6 the ends
+of an offset alignment's range on its parent, 2 an offset alignment's own
+start (its design speed refers to it), 3 a station equation, 582 a
+corridor region locked to the geometry (KH01, §3i-a). Two more texts follow per anchor. The reader
+returns them (`alignment_anchors`); the writer keeps an alignment's
+anchors when it writes it again and adds one per new profile (the profile
+keeps its identifier) and two per offset alignment.
+
+### Design speeds and station equations
+
+Each design speed and each station equation ties to an anchor at its
+(raw) station: kind 2 a speed, kind 3 an equation (AS01 to AS04). After
+the anchors and the interval block's other lists:
+
+```text
+BL e, e x { 2 bits 00, RS 0x04BE, BD raw station, the anchor's GUID,
+            BD station back, BD station ahead, B increasing }
+BL 1, BL s, s x { BL 1, BD station, BD speed, the anchor's GUID }
+```
+
+Speeds are in station order, equations in raw station order; the station
+back is the station the equations before give at the raw station (80 then
+1070 for 1000 ahead from 80, AS04). One more text per speed, two per
+equation. `add_design_speeds(doc, alignment, &[(station, speed)])` and
+`add_station_equations(doc, alignment, &[(raw, ahead, increasing)])`
+write the alignment again with them (equations after its last one); the
+application lists and edits them (E-SE1: AUDIT 0, both lists as written,
+a speed and an equation added on top).
+
+### Superelevation
+
+An alignment with superelevation carries the class key `0x0D00D773` = 2
+(the superelevation type; the application adds it to any alignment it
+saves) and `BL 1` and a block in place of `BL 0` after `BD 100` (SE02 to
+SE16 on a line-arc-line alignment, SB01 and SB02 with two arcs):
+
+```text
+B 0, BL n curves, B 0,
+n x { node, BL 0, B 0, [last: BL n], B 0 }
+n x { node, B 0, node, B 0, B settings (a curve with a manual station:
+      then the 582-bit settings block), 10 bits 0001010000,
+      BL 0, BL k critical stations, k x station, BL 0, [not last: B 0] }
+  node: BL element, BL -1, BL element, BL -1 (the curve element)
+  station: BL 3, fields, node, BL 8 (no slope), then per cross segment
+           BL side (1 left, 2 right), BL 0 outside / 1 inside, BL 1 lane /
+           2 shoulder, BL 3, fields, node, BL 0, BD slope (ratio)
+  fields: BL kind (3 begin full super, 4 end full super, 7 level crown,
+          8 low shoulder match, 9 reverse crown, 10 manual), BD station
+          from the curve's start (from its end in the ending attainment
+          region), BD 0 (1 ending region), B 0
+lane table (the same in every sample): 4 x { BL 2, two segments },
+  8 x { BL 8 (first) or BL 0 + BD 0, segment, BL 1, tail, BL 0, BD 0,
+  BL 2, tail }, BL 0, BL 0, BL 8, the 8 segments in name order
+  tail: BL 0, BL 0, BD 0.5, BD 1, B 0, BL -1, B 1, B 0, BL -1
+```
+
+Cross segments in record order: left outside lane, left inside lane,
+right outside lane, right inside lane, then the shoulders in the same
+order. Texts after all others: the curve names (`Curve.1`, ...), one empty
+text per unit (nine per critical station), each segment's name and two
+empty texts, the names in name order. References after all others: the
+alignment three times per curve and twice per unit, then 16 x (the
+alignment, null).
+
+A manual station (kind 10) sets the curve's settings bit; the 582-bit
+block after it is the same in every sample (SE08, SM1 to SM3, SM5, SM6:
+one or two manual stations in a curve, with a begin full super station,
+in the ending region, in both curves of SB01), and each of the
+station's nine units gets the description `Manual station`, the second
+manual station of a curve `Manual station(2)` and so on (the units of
+other stations stay empty; the numbering starts again in each curve).
+The application keeps a curve's stations in the order they were added.
+`CriticalStationKind::Manual` writes them; E-SM3 (a begin full super and
+a manual station) and E-SM2 (three manual stations, one in the ending
+region) open with AUDIT 0 errors and the API lists the stations with
+their kinds, stations, regions and descriptions. The reader accepts a
+settings block only when it is that block and the curve has a manual
+station. The programming interface refuses normal crown and normal
+shoulder stations in every region and has no calculation method; the
+calculation command is a wizard whose command name was not found (an
+unknown command name stops a script), so they are not sampled.
+
+`add_superelevation(doc, alignment, curves)` writes one curve per curve
+element (`SuperelevationCurve`: element id, `CriticalStation`s with kind,
+station, region and the eight cross slopes) and replaces the alignment's
+own; the reader returns the plain form (`alignment_superelevation`) and
+an alignment that has it is written again with it. E-SV1 (two curves,
+three stations, slopes, a profile added afterwards): AUDIT 0, the
+application lists both curves and the stations with their slopes and
+edits a slope.
+
+### Offset alignments
+
+`add_offset_alignment(doc, parent, name, offset, range, layer)` writes an
+offset alignment of a siteless parent of lines and arcs this crate
+writes, at `offset` (negative to the left) between the parent's stations
+`range` (all of it by default). The record (AO14, AO17, AO21, AO22) is an
+alignment record with:
+
+- `BL 0x00025F04` in place of `0x10025F04`;
+- elements numbered from 2n + 1 (n: the parent's elements) in station
+  order, one per parent element in the range, clipped at the range's ends:
+  a fixed line (`BL 257, BS 0, B 0, BS 0, ids, 2RD, 2RD`) parallel to a
+  parent line, a fixed arc (`BL 258, BS 0, B 0, B 0, BD -1, BD -1, BS 1,
+  BD -1, BL 2, B 0, ids, 2RD start, 2RD middle, 2RD end`) concentric with a
+  parent arc; the first id also in the two fields before the start station
+  and after the 7 criteria bits; the start station is the range's start;
+- one anchor (kind 2) at its start, and one design speed `{BL 1, BD start,
+  BD 0, the anchor's GUID}`;
+- the type `BL 2`, then the offset block (the reader's
+  `offset_parameters`): `BL 1 (dynamic), BL 2, BL 1, BD offset, BL side
+  (1 left, 2 right), B 0, B 0, BL 1 (geometry locking), BL 1, {BD offset,
+  BD parent start, BD parent end, BD start, BD end, BL 2, BL first element,
+  BL last element, BL 0 x 5, BL 3}, BL 0 (transitions), BL k, k x {BL
+  parent element, BL -1, BL 1, BL element} (by parent id), BL 2, 2 x {BD
+  parent station, the parent anchor's GUID}`, then `BL 0, BL 0, BL 3,
+  B 0, BS 0x04BE`;
+- the parent as a seventh reference (soft pointer); one more text per
+  design speed.
+
+`add_offset_alignment_with_widenings(..., widenings, layer)` adds widenings
+(`Widening`: start, end, offset, entry and exit transition lengths along
+the parent, linear transitions; AO16, AO30 to AO33): the stretches in
+station order are nominal, entry transition, widening, exit transition,
+nominal, ...; each nominal or widening stretch is a region (`BL 2` nominal,
+`BL 1` widening) with one element per parent element it covers, each
+transition one element `BL 267, BS 0, B 0, B 0, BD -1, BD -1, BS 1, BD -1,
+BL 3, ids, BL 1, BL 4096, BL 2, 2 x 2RD` from the point where it starts
+(previous offset) to where it ends (new offset; a transition of length 0
+is a jump at one station). The block lists the transitions `{BL 1
+(linear), BD length, BL element, BD 0, BD 0, BL 2, BD 0}` (entry then
+exit per widening), the element map gives each parent element its
+elements in station order (transitions excluded), and the parent gets an
+anchor at every distinct region or transition end. The ids follow the
+application's: the parent elements' first nominal pieces from 2n + 1, then
+per widening its pieces, the nominal pieces after it, its transitions
+(an exit that reaches the next element leaves the application one id
+short of the samples' numbering; AO32). A transition longer than 0 must
+lie on one parent line (an arc's transition was not sampled). E-O5 to
+E-O8 (one or three widenings, with and without transitions, one on the
+arc) open and audit clean, list their regions and transitions, and are
+solved again after a nominal offset change.
+
+The parent is written again with an anchor (kind 6) at each end of the
+range. The companion is the siteless one with nodes numbered from 2n + 1
+(n nodes), every segment flags 10 and no faces (`BL 16` in place of
+`BL 48`, faces `BL 2, BL 0, BL 0`), referring to the alignment and one
+empty soft pointer. Written for AO14's and AO17's parents and ranges the
+records equal the samples' apart from the geometry stamp, the
+identifiers and the last bits of the solved points. E-O1 to E-O4 (written:
+both sides, ranges, an alignment with two profiles and two offsets) open
+without a recovery prompt, audit clean, list each offset with its parent,
+side, nominal offset and region, and follow edits made in the application
+(a new nominal offset and a widening are solved from the parent).
+
 ## 3c. TIN surfaces
 
 `add_tin_surface(doc, name, points, layer)` writes an `AECC_TIN_SURFACE`
-whose one definition adds the points, with its triangulation, and the
-drawing's default surface style (the first style of the style tree's
-surface style collection, key 77). A drawing without that collection
-gets it (§3d); a drawing without any tree first gets the records of §2a.
+whose one definition adds the points; `add_tin_surface_with(doc, name,
+definitions, auto_rebuild, layer)` writes any list of definitions (the
+reader's `TinDefinition`, as `tin_definitions()` returns them) and the
+triangulation they build. Both use the drawing's default surface style
+(the first style of the style tree's surface style collection, key 77).
+A drawing without that collection gets it (§3d); a drawing without any
+tree first gets the records of §2a.
 
 ```text
 BL 80, 2 bits 11, BL 0x1554C738, BL 0x087C1120, BL 5 (version)
@@ -514,28 +1130,140 @@ BL 8 keys: 0x03011E29 RC 1, 0x0D011E25 BL 0, 0x02011E26 BD DBL_MAX,
   0x0201230C BD 0, 0x02011E27 BD DBL_MAX, 0x01011E28 BL 8
 BL 0 (byte form), 121 zero bits, 3BD origin 0, 9 BD identity, BD 1
 RC 1 item, 5 bits 01000
-definitions: 2 bits 00, RL 0x80020A28 (bits 11-15: one definition),
-  BL 0, BL 0, BL 0xE8A5800C, BL 40, BL 0, 3 bits 000, GUID, BL 0,
-  added vertices: BL n, n x 3BD
-  BL 0 (four-byte form), BL 0xAC150A00, 2 bits 00
+definitions (below)
 RL -1, RS 0x04A2, RC 2, RS 0, RS 0x2A3C, "MMS01"
 triangulation (tin.rs): BL vertex count, BL 0, 1, 2, 3 (the corners),
-  per vertex RL flags (corner 0x8440, point 0x80), RL a triangle that
-  uses it, 3 RD; BL triangle count, per triangle 3 RL vertices
-  (counter-clockwise), 3 RL neighbours (across the edge that starts at
-  the vertex, -1 outside), RL flags (1: uses a corner, not drawn), RL -1
+  per vertex RL flags (corner 0x8440, point 0x80; the application keeps a
+  deleted vertex with bit 0), RL a triangle that uses it, 3 RD; BL
+  triangle count, per triangle 3 RL vertices (counter-clockwise), 3 RL
+  neighbours (across the edge that starts at the vertex, -1 outside), RL
+  flags (1 hidden: uses a corner or a boundary hides it; 4 deleted, with
+  vertices -1), RL -1
 7 bits 1010100, BS 0x04BE
-handles: soft pointer 0, hard owner 0, hard pointer 0, style
-strings: "", "", name, "", ""
+handles: soft pointer 0, hard owner 0, the definitions' sources, hard
+  pointer 0, style
+strings: "", "", the definitions' texts, name, "", ""
 ```
 
-The four corners lie 100 units outside the points' extents (WS02, WS03),
-with the nearest point's elevation; the writer triangulates the points
-inside them (Delaunay). Written with WS03's ten points, the drawn
-triangles are the eleven of the application's own surface, and apart
-from the geometry stamp (written as 0) and the triangle order the record
-equals WS02's. The corners' flags of the samples carry 16 more bits
-(`0xBBCC`) that are no field; the writer leaves them out.
+### Definitions
+
+```text
+head: 10 bits 8 + 32 n, RC 2 + 8 n (n definitions), RC 4 when one is a
+  boundary (else 2), RC 0x81 when one is a contour (else 0x80)
+2 bits (00 with a contour, else 10), BL 0
+BS 0x800C and B: the number of breakline definitions + 1, its low bit in
+  the B, the rest in bits 8 and up of the BS
+n x { BL kind, BL flags (9; 4: from drawing objects; 2: proximity),
+      BL 16, GUID, BL k (lines: one per object or held line; else 0),
+      data by kind }
+BL 0 (four-byte form), BL options (0xAC150A00; 0x01000000: rebuild
+  automatically), 2 bits 00
+```
+
+| kind | definition | data | texts | sources |
+|---|---|---|---|---|
+| 47 | points | BL n, n x 3BD | — | — |
+| 0 | point group | — | the group's name | the group |
+| 14, 15, 24 | standard, proximity, non-destructive breaklines | lines | name | the objects |
+| 27 | contours | lines, BL 0 | name | the objects |
+| 13 | boundary | lines, BL type (1 show, 2 hide, 4 outer, 8 data clip), BL non-destructive | name | the objects |
+| 1, 20 | add vertex, vertex elevation | 3BD | — | — |
+| 2, 9, 23 | delete vertex, swap edge, delete line (by plan position) | 2BD | — | — |
+| 8, 22 | move vertex, add line | 4BD | — | — |
+| 17 | raise / lower | BD | — | — |
+| 12 | paste surface | — | name | the pasted surface |
+| 31 | drawing objects | BL object type (0 points, 1 lines), BL maintain edges, BL n, n x 3BD (copied) | description | — |
+| 30 | point file | BL, BL (the file's FILETIME, high half first), 3 option bits | the file | the point file format |
+| 33 | imported file | BL, BL (FILETIME), BL | name, the file | — |
+| 41 | corridor surface | GUID (the corridor's surface) | name | the corridor |
+| 34, 35 | transform, polygon (older drawings) | 16 RD + BL; BL n, n x 2 RD | — | — |
+| 40 | snapshot | BL 0 (1 in older drawings) | — | — |
+
+`lines`: `BL objects, BD mid-ordinate distance, BL m, m x { BL n, n x 3BD }
+(lines held by the definition, made from points), BL k, k x BL (1 to k),
+BD maximum distance (supplementing), BD weeding distance, BD weeding
+angle`. A definition made from drawing objects holds no lines (its
+objects are the sources, in order after the hard owner); the application
+marks such a surface out of date on open (it compares with the objects).
+
+A snapshot (TS00 to TS05: a surface of 25 points and a vertex, a
+snapshot taken, then raised, the snapshot rebuilt, a vertex deleted, the
+snapshot removed) is a definition of kind 40 after those it keeps; after
+the surface's triangulation come `BL 0`, `BL 1`, "MMS01" (no header
+before it) and the snapshot's triangulation in the same form, then `BL
+0` (without a snapshot `BL 0, BL 0`); the snapshot keeps the
+triangulation the definitions before it built (the later ones raise the
+surface, not the snapshot). Removing the snapshot removes the definition
+and the copy but leaves the byte that counts definitions at its highest
+(TS05: 5 for 4 definitions), so the reader takes the count from the ten
+bits. After the application rebuilds a snapshot (TS03, TS04; TO03 with a
+breakline, TO04 after removing it, TO05 rebuilt again) the first byte of
+the field written `BS 0x800C` is 0x0A instead of 0x0C and one more byte
+follows it: 8 x the snapshot definition's index (0x10 for the third, 0x08
+for the second; TO04, read before the surface is rebuilt, still holds
+0x18), then the byte 0x80 + breakline count / 2 and the bit as before.
+The reader reads both forms. A surface out of date (TO01: its breakline
+moved) keeps the 0x0C form. The writer writes the form of a snapshot
+just taken; the application rebuilds it from the same triangulation.
+
+`add_tin_surface_with` writes a snapshot where the definitions hold one
+(`TinOperation::Kind40(0)`, at most one), keeping the triangulation the
+definitions before it build; `ArchEntityData::tin_snapshot` reads it.
+E-TS1 (points, a vertex, a snapshot, a raise) and E-TS2 (points, a
+snapshot, a deleted vertex) open with AUDIT 0; the API reports the
+snapshot and the points and elevations of the written surface, and the
+same after rebuilding the surface and the snapshot.
+
+### The written triangulation
+
+Without a flag that makes the application rebuild a surface on open
+(none found: `auto_rebuild` only marks the surface to follow its
+sources), the writer builds the triangulation the definitions give, in
+order (`tin_build.rs`):
+
+- the four corners lie 100 units outside the extents of every position
+  the definitions bring in, the lower two at the lowest elevation, the
+  upper two at the highest;
+- points are inserted Delaunay (Bowyer-Watson, the cavity stopping at
+  fixed edges); a point at a vertex's plan position replaces its
+  elevation;
+- standard breaklines and contours insert their vertices (and
+  supplementing points, which leave a vertex they fall on as it is) and
+  force each segment in by flipping crossing edges; a segment through
+  another vertex is left as the triangulation has it (as the application
+  does); proximity breaklines force segments between the vertices
+  nearest their points;
+- non-destructive breaklines and boundaries split the triangles they
+  cross without flipping: from each point to the next, the point and each
+  crossing with the edges as they are when the line gets there, at the
+  surface's elevation;
+- outer boundaries hide triangles outside (non-destructive: by centre;
+  destructive: any vertex outside), hide boundaries the ones inside, show
+  boundaries show them again, a data clip boundary leaves later data
+  outside it out (edits are not data);
+- deleting a vertex fills its hole ear by ear, the ear with the highest
+  power of the removed point to its circle first, then restores Delaunay
+  edges; moving a vertex deletes and inserts it; swapped and added edges
+  are fixed; a deleted line hides its triangles; a raise moves every
+  vertex present.
+
+Sources are read from the drawing: a point group's points (its numbers
+and the COGO points), the vertices of lines, 2D and 3D polylines. Pasted
+surfaces, point files, imported files and corridor surfaces bring no
+geometry (the application adds it when it rebuilds the surface).
+
+Checked against 67 sample surfaces (each sample's `tin_definitions()`
+written again and both triangulations compared triangle by triangle): 62
+are identical. The others: a
+non-destructive breakline that runs exactly through existing vertices
+(the application drops its end point there, TT07, TT34; or the whole
+line, TT61), and points far from the rest (TG02, TG03: hull triangles
+between the clusters). A written drawing with ten definitions (E-T5:
+points, point group, two breaklines, an outer boundary from a polyline,
+a hide boundary, add, delete and elevation edits, a raise) opens without
+recovery, AUDIT 0 errors, every definition listed in order; the
+application's rebuild of it differs in five triangles of the deleted
+vertex's hole (not convex there).
 
 ## 3d. Surface style of a new drawing
 
@@ -565,9 +1293,10 @@ whose texts miss the keys' texts is refused (`Errors Found`).
 profile of fixed tangents through the PVIs (station, elevation) with a
 free symmetric parabola of the given length at inner PVIs (0 for none;
 crest where the grade falls); `add_profile_with_curves` takes per inner
-PVI a `VerticalCurve`: none, a free symmetric parabola of a length, a free
-asymmetric parabola of two lengths (before and after the PVI) or a free
-circular curve of a radius. Both use the drawing's default profile style
+PVI a `VerticalCurve`: none, a free symmetric parabola of a length, a K
+value, a radius or through a point, a free asymmetric parabola of two
+lengths (before and after the PVI) or a free circular curve of a radius, a
+horizontal length or through a point. Both use the drawing's default profile style
 (the first style of the style tree's profile style collection, key 74).
 The alignment is written again with the profile in its list; only an
 alignment whose record this crate reproduces bit for bit is accepted (its
@@ -595,14 +1324,19 @@ BL n entity records, the tangents then the curves; each: 11 bits
   tangent (0):     2RD start, 2RD end, 4 zero bits
   parabola (0):    BL 1, BD length, BL 0x1001 crest / 0x1000 sag, BL 0,
                    3 bits 010, 3 x BD -1 (no minimum K)
+  parabola by K (2), by radius (9): BL 0, BD K or radius, then as by length
+  parabola through a point (7): BL 0, 2RD point, BL 0, 3 bits 010,
+                   3 x BD -1 (no crest flag)
   circular (9):    BD radius
+  circular by horizontal length (0): BD length
+  circular through a point (7): 2RD point
   asymmetric (10): BD length before, BD length after the PVI
 2 bits 10, the identifier (a version-4 GUID), 107 constant bits ending
   with the version word
 references: the seven helpers (hard ownership), soft 0, hard 0, hard 0,
   soft 0, style (hard), alignment (hard), soft 0, hard 0, soft 0, soft 0
 texts: "AeccImpVAlignment", "", "", the type-4 keys' texts, name, four
-  empty texts and one more per symmetric parabola
+  empty texts and one more per symmetric parabola (by any of its values)
 ```
 
 The parabola's first `BL` is 1 in current records (WR02) where older
@@ -614,25 +1348,139 @@ for bit apart from the stamp and the identifier. A circular or asymmetric
 curve's record ends with its values; the reader, which looked for a
 parabola's tail after them, now takes the next record there.
 
+The curves by K, radius, horizontal length and through a point (WV01 to
+WV05: K 0.5, radius 50, length 15, point (50, 18)) read back with the
+samples' stations, and written (E-PV1) open, audit clean and list the
+same stations, elevations and lengths as the samples.
+
 The alignment lists its profiles (the oldest first in its references, soft
-pointers; the newest first in its record) after its elements:
+pointers) and holds an anchor (kind 32763) at its start by the profile's
+identifier (§3a "Station anchors"):
 
 ```text
-BL n, BL 0, BL 0, BL n
-n x {the profile's identifier, B 1, BL 32763, BL 0 x 3, BD end station
-     of the alignment's first element, BL 1, BL 0, BL element count (0 for
-     one element), 6 RD (0, 0, that end station, 0, 0, 0)}
+BL n profiles, BL views, BL groups, BL k anchors, k x anchor
 then BL 0 (equations), BL 1, BL 0 (speeds) as before
-texts: two more empty texts per profile
+texts: two more empty texts per anchor
 ```
 
 The identifier must be a version-4 GUID: with random bytes in its place
 the application stops while it opens the drawing (E-P1, E-P3), with the
 application's identifier the same records open (E-P9). A profile written
-without the alignment's entry opens but is not listed under the
-alignment, and is left out when the drawing is saved (E-R1). The entry's
-last value is 2.8e-14 instead of 0 in the application's record for a
-curved alignment (WR06); the writer writes 0.
+without the alignment's anchor opens but is not listed under the
+alignment, and is left out when the drawing is saved (E-R1).
+
+### Profiles laid out entity by entity
+
+`add_profile_entities(doc, alignment, name, entities, layer)` writes a
+layout profile of `ProfileEntity` values in station order (ids in that
+order, each linked to its neighbours): fixed tangents and fixed or
+floating symmetric parabolas (WE01 to WE08):
+
+```text
+fixed by three points (6, 11):       BL 0, 3 x 2RD
+fixed by two points and a grade (6, 12): BL 0, 2 x 2RD, BL 0 start / 1 end,
+                                     BD grade (percent)
+fixed by two points and K (6, 13):   BL 0, 2 x 2RD, BL 0x1001 crest /
+                                     0x1000 sag, BL 0x2000, BD K
+                    ... and a radius: the same with BL 0x2002, BD radius
+                                     (PE10 K 5 and PE11 radius 500 differ
+                                     only there)
+floating, end and K (6, 32):         BL 0, 2RD end, crest flag, BL 0x2000,
+                                     BD K (hangs from the entity before)
+floating, end and grade (6, 34):     BL 0, 2RD end, BL 1, BD grade (percent)
+each then:                           BL 0, 3 bits 010, 3 x BD -1
+floating tangent (2, 4):             2RD point, 4 bits 0000 (leaves the
+                                     parabola before it towards the point)
+free tangent (2, 9):                 4 bits 0000 (touches the parabolas
+                                     before and after it)
+```
+
+The programming interface refuses a floating tangent after a tangent and
+a free tangent between tangents; after and between parabolas it makes
+them (PF02: a floating tangent through (150, 14) after a parabola through
+(0, 10), (25, 12), (50, 11), leaving it at 25.836; a free tangent between
+that parabola and one through (120, 15), (150, 16), (180, 15), from
+22.102 to 134.741). Written with the same entities (E-PF1) they open with
+AUDIT 0 errors and the API lists the same entities and stations; the
+reader solves them the same way.
+
+`ProfileEntity::ParabolaTwoPointsRadius` writes the radius form (E-PR1:
+a parabola from (0, 10) to (50, 11) with radius 500 and a tangent to
+(100, 9) open with AUDIT 0 errors; the programming interface reads the
+parabola as fixed by two points and a parameter, K 5, radius 500, length
+50). The programming interface's other inputs did not return: a fixed
+parabola by an entity's end and a point, a floating parabola by a point
+and a radius, and free parabolas between two fixed tangents by K or
+radius each left the application waiting (PE12 to PE15); free curves
+between tangents are the layout's curves (`add_profile_with_curves`).
+
+The application's floating parabola by K holds an arbitrary word in place
+of the crest flag (WE07); the writer writes the flag. Written (E-PE1) they
+open, audit clean and list the samples' stations and elevations.
+
+### Profiles from a surface
+
+`add_surface_profile(doc, alignment, surface, name, offset, range, layer)`
+writes a profile sampled from a TIN surface at an offset from the
+alignment, over its whole length or a station range (WS11 to WS15). The
+record is a layout profile's with no entities: after the 9 bits `BL 7`
+(0x47 for a range other than the alignment's), `BD start, BD end, BD 30,
+BD offset`, 12 bits `101011000010`, `2 bits 10`, a zero identifier and the
+same 107-bit tail; the surface is the reference after the alignment (soft
+pointer). It holds no elevations: the application samples the surface
+(E-SP1, written: the elevations at the offset and within the range
+appear once the surface is rebuilt, as for the application's own record
+in that session). The alignment lists the profile without an anchor.
+
+### Offset profiles
+
+`add_offset_profile(doc, source, offset_alignment, name, slope, layer)`
+writes the profile the application makes "by slope" on an offset
+alignment from a profile of its parent (OP01, OP02, OB01: left and right
+offsets, the whole parent and a station range, a parabola crossing an
+element boundary):
+
+- The record is an entity-by-entity profile of fixed tangents and fixed
+  parabolas through three points (start, middle station, end): each
+  source entity moved to the offset alignment's stations (lines keep
+  their length, arcs scale with the concentric radius) and raised by
+  `slope * |offset|`, cut where the offset alignment's elements change.
+  Ids run 1 up in station order. It differs from a layout profile in
+  `BL 0x00025F04`, three more class keys (`0x0100FF46 BL 0` after
+  `0x0300FB05`, `0x0D00FF48 BL 4095` after `0x0400FE09`, `0x0200FF40 BD
+  slope` last), 65 zero bits, `BD 2.25`, 7 bits `0111010` (a layout
+  profile: 63 bits, `BD 2`, 9 bits), `BL 0x102` and the offset as the
+  fifth BD before the three `BS 0`, and the tail after its identifier:
+  `PRE`, `BD slope`, `MID`, one region (`BD slope, BD 0, BD parent
+  length, BD 0, BD 0, BL 2, BL 0, BL 0`), `BL 0`, the entity map (`BL n`,
+  each `BL source id, BL -1, BL m, m x BL id`), the source's start and end
+  on the parent (`BL 2`, each `BD station`, the parent anchor's GUID),
+  `END` (a layout profile: `BD 0` and four `BL 0`). References 8 and 9
+  are its companion, 15 the source (soft).
+- Its companion is an `AECC_FEATURE_STYLE` with no path (nodes `BL 1, BL
+  0, BL 0`, faces `BL 2, BL 0, BL 0`) in the node of the siteless
+  companions, referring to the profile.
+- The parent gets two anchors (kind 9 at the source's start, 0 at its
+  end; the application also wrote 221 for the start); the offset
+  alignment lists the profile, anchored at its own start station (an
+  offset alignment's parent stays its last reference).
+- An `AECC_ASSOC_ACTION` in the model space's associative network (the
+  network in the model space's extension dictionary, listed by the
+  drawing's network in the named objects dictionary) with an
+  `AECC_ASSOC_OFFSET_VALIGNMENT_ACTION_BODY` (hard pointer to the
+  profile) and three `AECC_ASSOC_DEPENDENCY` records (each owning an
+  `AECC_ASSOC_DEPENDENCY_BODY`): the source and the offset alignment
+  read, the profile written; each object lists its dependency as a
+  reactor. The action records equal the samples' bit for bit.
+
+E-OF1 (both OB01 cases written): no recovery prompt, AUDIT 0 errors, the
+API lists both as offset profiles with the application's entities,
+stations and elevations; after the source's PVI at 85 is raised to 17 the
+application recomputes the offset profile.
+
+The reader gives `profile_offset()` (source, slope, offset, entity map,
+parent anchors); a profile's entity list is found after five BDs (the
+fifth is the offset) and three BS.
 
 ## 3f. Profile style of a new drawing
 
@@ -744,6 +1592,36 @@ written and the siteless node is not changed. With the edge id left at 1
 the drawing opens, but the application no longer lists a feature line that
 comes before the alignment in the container (E-F6).
 
+### Feature lines that cross
+
+Samples FX00 (a site with FL1 through (0, 0, 10), (50, 0, 12), (100, 30,
+11)), FX01 (a line crossing FL1 at its PI), FX02 (a line ending on FL1),
+FX03 (a line crossing FL1 between its PIs, from (25, -20, 8) to (25, 20,
+9)), FX04 and FX07 (a third line closing a region with them). A feature
+line is split where it meets the site's other members like a lot line
+(the arrangement of §3g, straight segments only), with two rules of its
+own:
+
+- the node a crossing adds takes the elevation of the new line there
+  (FX03: 8.5 on both lines, not FL1's 11);
+- the new line's points take the marks 0x30 of an earlier member's when
+  it crosses another (FX01, FX03; the newest member's points otherwise
+  lack them at the last segment).
+
+Several crossings take node ids by the member crossed, earlier members
+first, then along the new line (FX04, FX07). Written for their lines the
+containers equal the samples' but for the flag 0x800 (and the last point
+mark 2) the application sets on an edge read from a file when another
+member joins, and the crossing points' last digits (the application
+computes them to about 1e-10). E-FX5 (FX00 plus the FX03 line) and E-FX9
+(a new drawing with both lines) open without recovery, AUDIT 0, and the
+programming interface lists both lines with their points.
+
+A line that closes or splits a region makes the application add an
+`AECC_GRADING` for the face (FX04: 744 bits) and list the face without a
+parcel; written without the grading such drawings open with errors, so
+the writer refuses the line.
+
 A feature line is a short record; its points are its edge in the
 container:
 
@@ -775,6 +1653,60 @@ one of -0.3 and an elevation point, the other with two elevation points
 elevation points and the bulges as written and the 2D length 164.983 of
 the first. Without the hard pointers of the table the drawing is refused
 (`Errors Found`).
+
+`set_feature_line_vertices(doc, feature_line, vertices)` replaces a
+feature line's points (inserting or removing PIs and elevation points,
+arcs, elevations) and writes its container again. A container read keeps
+its node ids, elevation point keys and their next free values: the
+application does not reuse the ids of removed points (WF22: ids 1, 2, 4,
+5 with next free 6; WF25: 1, 2, 6, 7, 8 with next free 9; WF26: the keys
+2, 1 in edge order), and new points take the next free ones. The
+container's node records and elevation points are in the application's
+hash order: linear hashing from eight buckets, one more bucket split off
+while the table holds more than eight entries a bucket, a key going to
+`key mod level`, or `key mod 2 level` below the split buckets (WF27: 9
+elevation points; WF28: 130 elevation points and 132 nodes in 17 buckets,
+32, 64, 96, 128 first and 16, 48, 80, 112 last). The outside face loses
+flag 8 once a member has an elevation point or a line's elevations were
+edited (WF11, an elevation set through the API), and a container read
+keeps that. A container read also keeps the application's marks no rule
+here reproduces: an edge's flag 0x800 and with it its last point's flag 8
+(WF04: an alignment edge read from the file when a feature line joined,
+its last point 2), the newest member's point flags 0x10 and 0x20 while it
+is the newest (WP08, WP09), and those of the nodes other members'
+crossings added, which keep their ids too (WP04, WP05: an inserted node
+of the member before the newest keeps 0x10). A closed edge is told by its
+flag 1, no longer by its last point's flag 8. Written so, the containers
+of WF04, WF11, WF12, WF22, WF25 to WF28, WP04, WP05, WP08 to WP14, WP18
+to WP20 and WT09 equal the application's bit for bit, and so do those of
+WP01, WP02 and WT04 to WT06 (below); WP05 and WP08 with a
+parcel added by the crate (E-PX5, E-PX8) and WF04 with a feature line
+added (E-FX4) open with AUDIT 0 errors and the API lists the new parcel
+(area 2000) and line; a new drawing whose feature line was
+edited three times (an elevation point added, a second one, the first
+removed and an end lowered) and whose other line got an elevation point
+in the middle of its arc (E-FL1), and WF21 with an elevation point added
+by the crate (E-FL2) open with AUDIT 0 errors and the API lists the
+written points, elevation points and bulges.
+
+Members without points: in WP01, WP02 and WT04 to WT06 the site's
+alignments have no elements and their edges no vertices. The container
+then holds no nodes (`BL next free id, BL 0, BL 0`: no first id), each
+such edge is `BL 0, BL id, BL flags 0x10, BL 0, BL 0`, then `BL 0` and
+three `BL 0`, and the face list holds the outside face with flags 6 and
+no entries; once the application has opened and saved it (WT04R) the
+edges' flags are 0x810, there are no faces and the site is no longer
+listed. The reader reads both, and a container read keeps its empty
+edges, their flags and the outside face as read. A member added to it
+is laid out as if the empty edges were not there, its nodes taking the
+next free ids; the empty edges stay in their places and the site is
+listed again with the new outside face (WT04F: a feature line added to
+WT04 by the application; written to WT04R the container equals WT04F's
+bit for bit, written to WT04 it keeps the edge flags 0x10 read where the
+application, having opened the file, has 0x810). WT04, WP01 and WT06
+with a feature line added by the crate (E-MV-WT04, E-MV-WP01,
+E-MV-WT06) open with AUDIT 0 errors and the API lists the alignments and
+the new feature line's points.
 
 A new
 member must not cross or touch the site's members: the application splits
@@ -1009,6 +1941,63 @@ from the dates. A view written into a new drawing with them (E-V3) opens
 with AUDIT 0 errors and the API values of the application's own view:
 station -200 to 300, elevations 10-20, extents (0, -100) to (500, 400).
 
+A copy of the default style with another vertical exaggeration (VS11 to
+VS13: the API's `GraphStyle.VerticalScale` 0.2 and 0.05) differs only in
+key `0x02016001` (BD 10 -> 5, 20); the copy gets a text id (high bit set:
+0x800006A9 in the samples) with its name as its first text and an empty
+one after it, and the collection lists it with its name (children by hash
+bucket, key mod 8). `add_profile_view_style(doc, name, exaggeration)`
+writes such a style under a text id from 0x80030001;
+`add_profile_view_with_style(..., style, ...)` writes a view with it, the
+view's vertical scale being the style's exaggeration. E-VS1 (styles
+exaggerating 5 and 20, a view of each and one of the default): AUDIT 0,
+the API lists both styles with their exaggerations and the views with
+them, and makes a view of its own with the written style.
+
+Every other setting of a profile view style is one key, found by
+setting each of the API's 135 writable style settings in turn and saving
+after each (PS001 to PS134, PT001 to PT010): `type << 24 | 0x01_6000 | g
+<< 8 | item`, g 0 for the graph and the grid, 1 to 4 for the left, right,
+top and bottom axes, 5 for the grid lines and the axes' tick switches.
+An axis's items are the same on every axis: title text 02 (type 0x18),
+text style 01 (0x10), location 03 (0x0D: 0 bottom or right, 1 center, 2
+top or left), offset 04 (0x09, X and Y), text height 07, rotation 13;
+major ticks interval 0C, size 0D, text height 08, label 0A, text style
+14, offset 16, rotation 15, justification 27 (0 top or left, 1 bottom or
+right, 2 center); minor ticks 0E, 0F, 09, 0B, 19, 1B, 1A, 28; the top and
+bottom axes' horizontal geometry ticks size 24, text height 23, label 25,
+text style 1E, offset 20, rotation 1F, justification 29. The graph: title
+text 0x1801_600A, text style 0x1001_6002, offset 0x0901_6003, location
+0x0D01_6006 (0 top, 1 bottom, 2 left, 3 right), justification
+0x0D01_6007 (0 top or left, 1 middle, 2 bottom or right), border
+0x0301_6008, border gap 0x0201_6009, text height 0x0201_600B; the
+exaggeration 0x0201_6001 and the direction 0x0301_9001 (1 right to
+left). The grid: padding left, right, bottom, top 0x0201_60 19, 0A, 18,
+17, axis offsets 15, 16, 14, 13; horizontal grid lines omit in padding,
+clip to the highest profile, clip 0x0301_65 09, 08, 01, vertical 0B, 0A,
+03. The left, right and bottom axes have one tick switch each
+(0x0301_65 07, 0C, 06) that the API's "show ticks and labels" and the
+ticks' "ticks and labels at the start elevation" all read and write; the
+top axis has none (the API refuses its start elevation). A text style is
+the style's reference for its key, the references of the keys following
+the header's in key order. The labels are label format strings in the
+stored form (`<[33607712(2097|...)]>`), any text otherwise.
+
+`profile_view_style_settings()` reads them all
+(`ProfileViewStyleSettings`), `add_profile_view_style_with(doc, name,
+settings)` writes a style with them (`ProfileViewStyleSettings::default()`
+is the default style). E-PVS1 (a style changing settings of the graph,
+the grid and every axis, two text styles, and a view with it) opens with
+AUDIT 0 errors and the API lists every written value.
+
+Stacked views (ST01: the API's `StackedProfileViewsCreationOptions`, three
+views of the default style, gap 20) are ordinary views with nothing
+linking them: the three records differ only in their origin (the three
+3BD origins), stacked upwards by the view height plus the gap (-300, 220,
+740 for a height of 500), each with its four label groups. They are
+written as separate views (`add_profile_view_with_style` at those
+origins).
+
 When the drawing has a default profile label set (style tree key 96, id
 30), each profile gets four label groups in the view, entities in model
 space: lines (a label per tangent), PVIs (two labels: the first and the
@@ -1036,44 +2025,274 @@ the same API values as its own. A new drawing gets the default label
 styles with the profile label set (§2b), so its views get the four label
 groups.
 
+### Bands
+
+A view lists its bands after the profile flags: `BL n`, then per band
+`BD gap` and a constant item of its kind (profile data 1056 bits, every
+other kind 572: vertical and horizontal geometry, superelevation,
+sectional data and pipe network items are the same, BV-SE, BV-SD, BV-PN,
+BV-VGT). An item opens with `BL` flags (0x01 below the view, 0x10 label
+at the start station, 0x20 at the end station, 0x100 labels shown: 0x131
+is written as a raw `BL`, 0x31 as a byte, so hiding the labels shortens
+the item by 24 bits: BVPD-SL, BVHG-SL), `BD` weeding (100; BVPD-W 50),
+`BL` stagger (0 none, 1 both, 2 right, 3 left: BVPD-ST, -SR, -SLF) and
+`BD` stagger line height (1/60, the API refuses to set it); a profile
+data item has bits 921/923 = 1/0 above the view, the 572-bit item holds
+the band's
+number in the view (from 1, the bands below first) in bits 436-439 (a
+lone horizontal geometry band holds 1; with the number of another band
+the application lists the band without labels and drops its label group
+at the next band change). The bands below the view
+come first (the application reads either order; when it rewrites the
+list it puts the bands above first, keeping their numbers: E-BD14-edit,
+E-BV1-edit). Each band adds one value to five graph keys (0x0C01BA06 3.0,
+0x0C01BA05 10.0 or -1.0 for horizontal geometry, 0x0B01BA07 0,
+0x1901BA0A 0x1001BA09, 0x0C01BA04 5.0), one hard null reference at the
+head of the view's references and `(style, soft 0, alignment, profile 1,
+profile 2)` after the profiles' triples.
+
+Each band has a label group (`AECC_PROFILEDATABAND_LABELGROUP`,
+`..._VERTICALGEOMETRYBAND_...`, `..._HORIZONTALGEOMETRYBAND_...`,
+`AECC_SUPERELEVATIONBAND_LABELGROUP`, `AECC_SECTIONALDTABAND_LABELGROUP`,
+`AECC_PIPENETWORKBAND_LABELGROUP`) in model space: the profile label groups' header, `BL n` labels (key block, a
+44-bit run of the label's kind, a key list, `BL 0`, `BL 0`), then a tail
+holding the band's number (`BL`, 1-based over all bands); references
+soft 0, soft 0, the view (soft), hard 0 and the view (hard) per label;
+texts the class text and three empty texts. Every label stores the band
+number (key 0x01015013). A profile data band labels the view's stations
+every 25 (0x0200D020 station, 0x0200D61F major interval 100, minor ones
+0x0200D620 25; the first and last stations 0x0300D622/0x0300D623 when
+labelled) and the alignment's start, end and each arc's start, middle and
+end (0x0100D068 point code 0x0200D004, 0x0200D005, 0x0400D053, 0x0400D08E,
+0x0400D054; 0x0100D61E 1, 2, 3; 0x0200D61D fraction along the element);
+a point takes the place of a station label at its station. A vertical
+geometry band labels the profile's entities in identifier order
+(0x01017807 + index = index, 0x0100FC31 entity id). A horizontal
+geometry band labels each alignment element at its middle station
+(0x0200D020) with 14 keys: its start and end point codes (0x01017829,
+0x0101782A: 257 alignment start, 258 end, 260 tangent to curve, 261
+curve to tangent) and the previous element's start code (0x0101782B,
+the first element's own), the signed radii (right of travel positive, 0
+on lines and at the alignment's ends) at its start (0x0201782D), its end
+(0x0201782E) and the previous element's start (0x02017830), whether the
+start radius (the end's at the alignment's start) turns left (byte
+0x0301782C), 0x0101782F 0, 0x0100D621 -1, the curves up to it
+(0x0100D731), line or curve (0x0101780B = 0 or 0x0101780C = 1) and its
+number (0x0100D61E: lines first, then curves); each curve has one more
+five-key label at its middle numbered by curve. The 44-bit run of the
+two label kinds differs (bits 17-19). The application's groups (HG1-HG3,
+HG3P, PB04) list the same values; their key order varies. A
+spiral-curve-spiral is one curve labelled piece by piece (E-HS1 to
+E-HS4, two to five pieces of mixed arcs and spiral-curve-spirals): each
+spiral and its arc carries the element keys with 0x0100D621 273, 274 and
+275, a spiral the kind key 0x0101780D = 2, all three the curve's number;
+a spiral's radius at its tangent end is infinite with the sign of its
+arc, a line takes its neighbours' radii, the turn byte reads finite
+radii only, and the points between a spiral and a tangent or curve are
+coded 264 (tangent to spiral), 265 (spiral to tangent), 266 (curve to
+spiral) and 267 (spiral to curve). The curve's middle label sits at the
+station nearest the intersection of its lines (an arc's middle; for
+unequal spirals not the middle of the curve's stations). Alignments of
+other elements or with two lines or two curves meeting get an empty
+group, which the application fills as soon as the view or one of its
+bands changes (it rebuilds every band label group then; an empty group
+stays empty through open and regeneration). A spiral's solved points
+are stepped with three-point Gauss integration of its direction (the
+chord along the middle heading drifted 3e-4 over 30 m, giving tangent
+points 1e-4 off), and stations along a spiral-curve-spiral use the
+spirals' stored lengths.
+
+A band that hides its labels has no label group (the application
+deletes it: BVPD-SL, BVHG-SL, E-BW1-edit). A group's tail repeats the
+band's stagger (`BL`, after its first 26 bits). The major and minor
+intervals (100, 25) stay constant: the API's setters change nothing.
+
+A band's data source is the soft reference after its style in the
+view's band tuple (sample line group or pipe network; DT01-DT03: the
+view record does not change otherwise). A sectional data band reading a
+sample line group labels each of its lines in station order (keys
+0x15017822 and 0x15017821 with 128 zero bits, 0x0F017824 the line,
+0x01015013 the band number, 0x0200D020 the station, 0x0F017825 the
+group), each line after the first followed by a label of the step from
+the line before (the same keys and 0x02017823 the previous station; run
+bits 17-19 differ); a label's references are its line and the group
+(soft) before the view. A pipe network band reading a gravity network
+labels the network's parts drawn in the view: each pipe (0x0201783B its
+slope, the drop from start to end over its plan length; 0x0201783A the
+largest slope of the network's pipes either way; 0x02017835 and
+0x02017836 the stations of its ends on the alignment; 0x02017837 the
+view's first station; 0x02017838 1.0; 0x02017839 0.0; 0x0301781D 0;
+0x0F01781C the pipe), then each structure (0x0200D020 its station,
+0x0F01781C the structure), in the network's order; a label's reference
+is its part (soft) before the view (DU01, DW01). A part drawn in a view
+is an `AECC_GRAPH_PROFILE_NETWORK_PART` in model space, a constant
+221-bit record with the references soft 0 and the part (hard); the view
+counts it among its items (`RC n`, `10000` each), lists `(soft drawn
+part, hard 0, hard 0)` after its profiles, the drawn parts (soft) after
+its last references, and `BL n` drawn parts as the third `BL` after its
+last `BD 10`. The writer draws the parts of every pipe network band's
+network, its pipes then its structures. Drawing parts in a view leaves
+two AUDIT errors per part, in the application's own drawings too (DW01:
+10 for 5 parts; E-PN4 with the parts drawn by the application: 12 for
+6). A superelevation band needs no data source (the API refuses one): it
+reads the view's alignment. A label is a tree: its keys, run and key
+list, then `BL n` nodes, each written the same way (keys, run, list,
+`BL n` nodes), and the closing `BL 0` only after the label itself (the
+labels of the other kinds have no nodes); each node takes one hard
+reference to the alignment after the label's view, each text key (type
+0x04) one empty text after the group's three. The band labels each
+critical station in station order (key 0x01017812 + n = n: 1 level
+crown, 2 reverse crown, 3 begin or end full super, 4 low shoulder match;
+0x0200D020 its station) with a node naming it (0x0400D56F a text,
+0x0100D551 its kind code, 0x01001025 3, 0x03001040 0, 0x0200D61D 1 when
+it ends its curve, 0x0100D571 0) under which two nodes name the curve
+element (0x0100D61E its id, 0x0100D621 -1, 0x0200D61D 0 and 1); then for
+each cross segment in ascending code (0x100 right side + 2 inside + 1
+lane), each run between two consecutive points where the segment's
+slope changes, the points being the alignment's start (slope 0), the
+critical stations and its end (slope 0): 0x0200D101 and 0x0200D102 its
+stations, 0x0200D020 their middle, 0x02017826 and 0x02017827 the slopes
+there, 0x0101781B the code, 0x02017817 the largest slope of all stations
+either way, 0x03017834 0, with the node of its end point (the
+alignment's end: kind 0, 0x01001025 2, 0x0200D61D 0.5, no element
+nodes). Alignments with manual stations are written without labels.
+Sectional data and pipe network bands without a source have no labels; the group's
+texts are its class text and three empty ones as for the others.
+
+The default band styles of a new drawing (style tree keys 0x42, 0x43,
+0x44, each with its default style, 6 records) refer to label styles of 17
+collections under the label node (0x1001B200-0x1001B802, 99 records);
+both are written from the application's records (PB00) when the drawing
+has no profile data band styles. The superelevation (0x45), sectional
+data (0x148) and pipe network (0x140) band styles (6 records) and their
+14 label style collections (0x1001B500-0x1001B660, 0x1001B803-0x1001B805,
+74 records) are written the same way when the drawing has no
+superelevation band styles. Pressure network, cant, distance, COGO and
+speed band styles (keys 0x192-0x196) exist in the drawing but the API
+adds no such band to a profile view (not sampled, not written). The automatic station range of a view
+is rounded out to 100 (an alignment ending at 211.12 gives a view to 500).
+
+Checks: E-BD13 (OP00 with a view and four bands: profile data, vertical
+and horizontal geometry below, profile data above) equals the
+application's PB04 view record bit for bit and its profile data and
+vertical geometry labels value for value; it opens with AUDIT 0, the API
+lists three bands below and one above with the alignment and profile, and
+after a band change the application's rebuilt profile data and vertical
+geometry groups equal the written ones. E-BD14 (a new drawing: alignment
+with an arc, profile, view with the same four bands, band styles from
+the templates) the same. E-HG1 to E-HG3 (a new drawing: one line, a line
+and an arc, line-arc-line-arc-line; a profile; a view with one horizontal
+geometry band) open with AUDIT 0, the API lists the band with labels and
+after a band change the application's rebuilt group holds the written
+labels value for value. E-BV1 (a new drawing: superelevation, sectional
+data and pipe network bands below, vertical and horizontal geometry above)
+and E-BV4 (the application's HB0 with such a second view, reusing its
+styles) open with AUDIT 0; the API lists the five bands with their types
+and locations and the profile; after a band change all five groups stay
+and the horizontal geometry labels are rebuilt equal. E-HS1 to E-HS4 (a
+new drawing: one and two spiral-curve-spirals, equal and unequal
+spirals, with an arc, and an arcs-only alignment) open with AUDIT 0 and
+after a band change the application's groups hold the written labels
+value for value (label and key order aside). E-SD1 (a new
+drawing: a sample line group with lines at stations 50, 20 and 150 and a
+sectional data band reading it below the view, one without a group
+above) opens with AUDIT 0, the API lists the band's data source as the
+group, and after a band change the application's group equals the
+written one bit for bit and reference for reference. E-PN1 (a new
+drawing: a network of four pipes, one rising, and two structures beside
+an alignment with arcs, a pipe network band reading it) opens with 12
+AUDIT errors as the application's own version (E-PN4-app), the API lists
+the band's data source as the network, and after a band change the
+application's group holds the written labels value for value (stations
+to 1e-13; key order within a label differs). E-SE0 to E-SE4 (a new
+drawing: superelevation on one or both arcs with reverse crown, level
+crown, low shoulder match and full super stations, one to three cross
+segments sloped, and a superelevation band) open with AUDIT 0 and after
+a band change the application's group holds the written labels value
+for value (key order within a label aside). E-BW1 to E-BW4
+(weeding 50, stagger left/right/both, labels hidden below and above the
+view) open with AUDIT 0 and the API lists the written weeding, stagger
+and label visibility.
+
 ## 3i. Corridors
 
-`add_corridor(doc, name, baseline, region, alignment, profile, assembly,
-layer)` writes a corridor with one baseline along the alignment and its
-profile and one region over the alignment's stations that applies an
-assembly of the drawing every 25 units. It is written as the application
-writes a corridor before its first rebuild (WC13, WC24 to WC27: the
-corridor added through the API without a rebuild): out of date, without
-stations, applied sections, feature lines or surfaces. Adding it changes
-no other record (the alignment, the profile and the assembly stay as they
-are). The corridor style is the drawing's default (style tree key 0xEB2;
-a drawing without it gets the application's default, §2c), the code set
-style the assembly's.
+`add_corridor_with(doc, &CorridorDefinition, layer)` writes a corridor
+from the definition the reader returns (`corridor_definition()`): its name
+and description, whether it rebuilds automatically, and its baselines,
+each along an alignment and one of its profiles, with regions applying an
+assembly of the drawing over a station range, each region's frequencies,
+station placement flags and targets, and the stations added by hand per
+baseline (with their descriptions). `add_corridor(doc, name, baseline,
+region, alignment, profile, assembly, layer)` is the one baseline, one
+region form over the alignment's stations with the default frequencies.
+The corridor is written as the application writes a corridor before its
+first rebuild (the samples below: corridors made and changed through the
+API without a rebuild): out of date, without stations, applied sections,
+feature lines or surfaces. Adding it changes no other record. The
+corridor style is the drawing's default (style tree key 0xEB2; a drawing
+without it gets the application's default, §2c), the code set style the
+first region's assembly's.
 
 ```text
 BL 80, 0, 80, 80, 0, BL 0x10025F04, BL 0x40008353 (unbuilt), 4 bits 0101
-RC 1, key 0x0B001081 (BL 2, two values; written 0)
+RC n keys, keys: [0x0C04A61C (BL 0) with targets], 0x0B001081 (BL 2,
+  two values; written 0), [0x0C04A621, 0x0C04A61E: BL regions, one BD
+  per region], [0x0404A627 with targets: its value is the text "[]"],
+  [0x0C04A620: one BD per region]
 2 bits 01, 128 zero bits, 2 bits 01, RC 82
-BL 0 (items), BL 0 (surfaces), BL 0, BL 0 (outlines), BL 0
-2 bits 01, RC 32, RC 0x48, RC (baselines << 3 | 2), 1 bit 0,
-6 bits region count, BL 0 (stations)
-region: identifier, the assembly's group block, BD start, BD end,
-  2 bits 00, BD frequency along tangents (25), BD along curves (25),
-  BL 0, BD 0, BD 25, BD 10, identifier, BL 0 x 3, BL 0 (targets),
-  BL 0 (stations), 3 bits 110, BL 0
-baseline: BL 0, B 1, 9 bits 000000101, identifier, 47 bits ending with
-  the version word
-references: soft 0, style, code set style, hard 0, alignment, profile,
-  assembly (hard), per subassembly {subassembly (soft), soft 0}
-texts: "AeccImpCorridor", "", name, "", "", per assembly group {its name,
-  "", "", ""}, the assembly's name, "", the region's name, the
-  baseline's name
+BL n feature line code settings (0 before a rebuild), BL n surfaces, BD
+  maximum triangle side length, BL n boundary lists, BL 0
+B rebuild automatically, B 1, RC 32, RC layout (0x48 locked to stations,
+  0x28 to the alignment's geometry), RC (baselines << 3 | 2), 1 bit 0,
+  6 bits the first baseline's region count, BL 0 (no station)
+baseline: [after the first: BL region count, BL 0], regions, BL 0, B 1,
+  9 bits 000000101, identifier, BL n, n x BD added station
+region: the assembly's identifier, the assembly's group block, BD start,
+  BD end (locked to the geometry: the identifier of the alignment's anchor
+  at each end before each of them, KH01), 2 bits 00, BD frequency along tangents, BD along curves, BL
+  flags, BD 0, BD along spirals, BD along profile curves, identifier, BL
+  target flags, BL 0, BL 0, BL n target entries, n x 10 lists {BL k, k x
+  item}, BL 0, 3 bits 110, BL 0
+item: BL 0x1015, BL 0, object head, B 0, B 0, BL 0 (a surface), or BL
+  0x1017 (0x1117 for the farthest), BL 0, BL k, k x object head, BL 1
+  farthest / 0 nearest, B 0, B 0, BL 0
+end: 45 bits 101010101010010000001010100001011111000000100
+references: soft 0, style, code set style, per baseline {hard 0,
+  alignment, profile (hard), per region {assembly (hard), per node
+  {subassembly, the subassembly it hangs from or 0} (soft), per target
+  entry {subassembly (hard), its target objects (soft)}}}
+texts: "AeccImpCorridor", "", name, description, ["[]"], per baseline
+  {per region {"", per assembly group {its name, "", "", "" per node},
+  the assembly's name, "", per target {its name twice, "", "", "" per
+  object}, the region's name}, the baseline's name, one description per
+  added station}
 ```
 
-The identifiers are version-4 GUIDs (new ones for every corridor). The
-group block is the assembly's own (`BL 0, BL 0, BL n groups, BL 1`, then
-per group its nested object heads and attachment nodes), copied from the
-assembly record:
+Region flags: 0x1000 at increment and 0x400 by curvature along curves
+(0x1400 both; a region the application never saved after an edit holds
+0, read as at increment), 0x8 at horizontal geometry points, 0x80 at
+superelevation critical points, 0x20000 at profile geometry points,
+0x40000 at profile high and low points. Target flags: 1 at offset target
+geometry points, 4 adjacent to offset target start and end, 8 at
+increment and 16 by curvature along offset target curves. The keys hold,
+per region in corridor order, the frequency along target curves (25
+without the key) and the mid-ordinate distances along curves and along
+target curves (0.1 without them); the application writes all three once a
+region changes one of them. Keys are written in the order above.
+
+A target entry is written for each subassembly of the region's assembly
+that has a target, in node order; its list 5 holds surface targets, 8
+offset (width) targets and 9 elevation (slope) targets, the same lists
+for every stock subassembly tried (nine kinds with targets, list by the target's
+type and not by the parameter's position). An offset or elevation target
+holds any number of objects (alignments, polylines, feature lines,
+profiles, 3D polylines are all object references); a surface target one.
+
+The identifiers are version-4 GUIDs (new ones for every corridor); a
+region starts with its assembly's identifier. The group block is the
+assembly's own (`BL 0, BL 0, BL n groups, BL 1`, then per group its
+nested object heads and attachment nodes), copied from the assembly
+record:
 
 ```text
 BL 80, 0, 80, 80, 0, BL 0x10025F04, BL, 4 bits, RC n keys, keys
@@ -1084,18 +2303,102 @@ texts: "AeccImpAssembly", "", name, "", "", "", per group {name, "", "",
   ""}
 ```
 
-Written with the samples' identifiers, stations, frequencies and
-assemblies (one and two groups), the record equals theirs bit for bit
-(the station range 10-90 and a tangent frequency of 10 included).
+Samples (each one change at a time from a drawing with three alignments
+and profiles, a polyline, a 3D polyline, a feature line, a surface and two
+assemblies, one with a lane, one with a transition lane and a side slope
+ditch): structure (one region, station range, second and third region
+with a gap, a region on another assembly, region name, second baseline
+without and with a region, a baseline along a feature line, removing a
+baseline, renaming, an empty corridor), every frequency and flag, added
+stations with and without a description, targets of each kind (an
+alignment, a polyline and a feature line as offset target, a profile, a
+3D polyline and a feature line as elevation target, a surface, two
+objects, the farthest), targets in several regions and baselines, and
+the targets of nine stock subassembly kinds. Rewriting each sample's
+definition with `add_corridor_with` gives the sample's record field for
+field (the references and texts equal; the identifiers, the geometry
+stamp and the class word differ by design).
 
-Written into WC23 (an assembly of two lanes, E-C1) and WC20 (one lane,
-E-C2), the corridor opens with AUDIT 0 errors and the API lists its
-baseline (alignment, profile, stations 0-100) and region (assembly,
-stations 0-100) as for the application's own unbuilt corridor; the API
-reports it out of date. The API rebuild run after reopening a drawing in
-the check harness changes no corridor, the application's own included (a
-built corridor keeps its stations after a frequency edit and a rebuild),
-so the built result of a written corridor is not checked.
+Written into a drawing with two baselines (`BL1` along a curved
+alignment: a region on the lane assembly from 0 to 100, every 10 along
+tangents, by curvature with a mid-ordinate of 2 along curves, at
+horizontal geometry points; a region on the transition lane and ditch
+assembly from 150 to 300 every 12 along curves and 5 along profile
+curves, at profile high and low points, with the offset alignment and a
+polyline as offset target (farthest), a profile as elevation target and
+the surface as the ditch's target; added stations 33.3 and 175; `BL2` with
+one region at increment and by curvature along curves, by curvature along
+target curves every 7, at offset target geometry points), the corridor
+opens without recovery, AUDIT 0 errors; the API lists both baselines,
+the regions with their assemblies, ranges, every written frequency and
+flag, the added stations (33.3 in the first region, 175 in the second),
+and the targets with their objects. `CorridorCollection.RebuildAll()`
+builds it: stations 0, 10, 20, ..., 33.3, ..., 99.022, 100 in the first
+region, 150, 175, 192, 204, ..., 300 in the second, every 25 along `BL2`,
+and the codes of both assemblies (the ditch's included, its target
+resolved); the rebuilt drawing reads back with its feature lines (seven
+codes on `BL1`, four on `BL2`).
+
+Surfaces are written in the corridor record only (their own TIN surface
+reference is written 0): a built surface (`build`) gets its TIN surface
+from the application when the drawing is opened, before any rebuild. The
+link and feature line codes are written in name order (the order the
+application keeps), boundaries and masks drawn from polygons are closed
+when open. A corridor with two surfaces (`CS1` built, link code `Top` as a
+breakline, overhang correction on top links, the corridor extents and a
+polygon as outside boundaries and a triangle as mask; `CS2` not built) and
+a maximum triangle side length of 50, written into the same drawing, opens
+without recovery, AUDIT 0 errors; the API lists both surfaces with their
+build flags, overhang correction, the boundary names, descriptions and
+kinds and the mask, `CS1` with its TIN surface; after the rebuild `CS1`
+holds 26 points with `Top` as a breakline.
+
+A baseline along a feature line is written with the feature line as its
+first reference and an alignment and one of its profiles (written by
+`add_alignment` and `add_profile` through the feature line's points) as
+the next two: the application's own baseline refers to a hidden
+alignment and profile it makes from the feature line. Written so into
+the drawing above (feature line `FLT`), the corridor opens with AUDIT 0
+errors, the API lists the baseline as along `FLT` (stations 0 to 300),
+and the rebuild places the assembly along the given alignment and
+profile. Written with no alignment and profile, it opens with AUDIT 0
+errors but the API cannot read the baseline (null object) and the
+rebuild skips it.
+
+`corridor_definition()` reads the definition of any corridor record
+(fields of built corridors too; names and references of corridors without
+built stations, whose texts and references are not interleaved with the
+built ones). It also reads corridor surfaces (build flag, link and feature
+line code flags, overhang correction) and their boundaries and masks
+(kind, polygon corners, feature line components): the surface head is
+`B, B build, B, BL n link codes, n x B breakline, BL 0, BL m feature line
+codes, m x B, BL overhang` (older files write the link count in its
+one-byte form `01 00000nnn`, read before as an RC 0x20 or 0xA0 and three
+bits), and the field after the surfaces is the maximum triangle side
+length (a BD). Boundary lists are written per surface that has any, each
+introduced by its surface's name in the texts, then each boundary's name
+and description; references: per surface {the corridor surface's own TIN
+surface (soft, 0 when it is not built), style, 0, render material}, one
+per boundary.
+
+### 3i-a. Corridor options
+
+| option | read | write | evidence / blocked by |
+|---|---|---|---|
+| several baselines along alignments and profiles, their order | yes | yes | §3i |
+| baseline along a feature line | yes (feature line, the alignment and profile made for it) | yes, with an alignment and profile the caller gives | the application makes a hidden alignment and profile for its own; written without them the baseline cannot be read through the API (null object); written with a given alignment and profile it reads as a feature line baseline (stations of the feature line) and the rebuild follows that alignment and profile |
+| offset baselines | no | no | neither programming interface can make one (the .NET and COM offset baseline collections have no add); their command is a dialog |
+| several regions, gaps, an assembly per region, region names | yes | yes | §3i |
+| frequencies along tangents, curves, spirals, profile curves, target curves; mid-ordinates; curve placement; at geometry, superelevation, profile, high/low, offset target points | yes | yes | §3i |
+| added stations with descriptions | yes | yes | §3i |
+| offset, elevation and surface targets (any objects; nearest or farthest) | yes | yes | §3i |
+| rebuild automatically, description | yes | yes | §3i |
+| region lock to the alignment geometry | yes (flag) | yes | the region keeps the identifiers of two anchors (kind 582, §3a) the alignment holds at its start and end; written for alignments this crate writes, the regions follow the alignment when its geometry changes (E-K9: an arc's radius changed moves the locked region ends) |
+| corridor surfaces, link and feature line codes, overhang correction, build flag; boundaries and masks from polygons and the corridor extents; maximum triangle side length | yes | yes | §3i (the application makes each built surface's TIN surface) |
+| boundaries along feature lines | yes (component count) | no | they refer to built feature lines |
+| feature line code settings (connect, draw, pay items) | count only | no | codes exist only once built |
+| built results (stations, applied assemblies, feature lines) | yes (feature lines) | no | written out of date; the application builds them |
+| corridor without baselines | no | no | its record ends in another run after the 32 (one sample) |
 
 ### Code set styles read back
 
@@ -1252,7 +2555,10 @@ prefix of that path, avoids this.
 `add_sample_line_group(doc, alignment, name, layer)` writes an empty
 sample line group of an alignment; `add_sample_line(doc, group, name,
 station, left, right, layer)` adds a two-vertex sample line at a station,
-reaching `left` to the left and `right` to the right of the alignment. The
+reaching `left` to the left and `right` to the right of the alignment;
+`add_sample_line_through(doc, group, name, station, vertices, layer)` adds
+a line through vertices given as (station, offset; negative to the left)
+that crosses the alignment at `station`, with vertices on both sides. The
 alignment is written again with the group: the third count after its
 elements (`BL n, BL v, BL g, BL n`) is the number of groups, and the
 groups follow the profiles and views in its references. Adding a line
@@ -1269,10 +2575,12 @@ group (AECC_SAMPLE_LINE_GROUP, an entity in model space):
 line (AECC_SAMPLE_LINE):
   BL 80, 0, 80, 80, 0, BL 0x10025F04, BL 0x40008353, 4 bits 0010, RC 0,
   120 zero bits, 3BD 0, 9 BD identity, BD station,
-  two vertices {BL 1, BD 0, BD offset (right positive), BD 0},
+  the vertices left, then right of the alignment, each side {BL n,
+    n x {BD 0, BD offset (left negative), BD station less the line's}},
+    from the alignment outwards (the crossing is not stored),
   a 100-bit run ending with the version word
-  references: soft 0, hard owner 0, hard 0, soft 0, soft 0, style, group
-    (hard)
+  references: soft 0, hard owner 0, hard 0, soft 0 per vertex, style,
+    group (hard)
   texts: "AeccImpSampleLine", "", name, ""
 ```
 
@@ -1284,6 +2592,25 @@ With the group and three lines written into WR00 (E-L1) the application
 opens the drawing with AUDIT 0 errors and lists the group, its lines in
 station order, their stations and the left, center and right vertices of
 each.
+
+Lines through more vertices (LV00 to LV02 and LV10, LV11: three, four,
+five and seven vertices, some away from the crossing station, made with
+`SampleLine.Create` from points) are reproduced bit for bit; their
+vertices are stored per side from the alignment outwards. A line with all
+its vertices on one side of the alignment (LV03; LW01 left, LW02 right
+with three vertices, LW04 right and skewed) stands at the station of its
+vertex nearest the alignment (LW04: 45 for (45, -5), (55, -15)), lists
+nothing on the other side and writes `BL 1` in place of the tail's
+second and third bits (`BL 0`); the programming interface lists no
+center vertex for it. Written (`add_sample_line_through` with all
+vertices on one side) the records equal the samples' but for the class
+word; LV02 with a skewed right line and a left line (E-SL1) opens with
+AUDIT 0 errors and the API lists both lines' stations and vertices as
+written. Written into WL10 (E-L5: a line at 40
+through (38, -12), (40, -4), (42, 6), (41, 14) and a two-vertex line at
+70), the drawing opens with AUDIT 0 errors and the API lists each line's
+station and vertices (left, center at the crossing, right) where they were
+written.
 
 The group's label style is the default sample line label style (style
 tree key 3, then 0x112, 0x1002A00F, id 30). Written with no label style
@@ -1369,15 +2696,57 @@ for -30..60 at (200, 0)). Views of sampled sections, of lines with several
 sections are not written. A drawing without the section or section view
 styles gets the defaults (§2c).
 
+### Section view group plots
+
+`add_section_view_group(doc, group, at, layer)` writes what the
+application's default group plot makes from a sample line group (WG01:
+three lines; WG02, WG03, WG10 to WG12: two to ten lines, mixed reaches,
+WX21 to WX23: two plots of one group):
+
+- One view per line in station order, the view record of a single view
+  with `BL plot index` (1 up; 0 for a single view) before its last 77
+  bits, named by station and a counter that runs across the drawing
+  (`0+25.00 (1)`, the second plot of three lines `(4)` to `(6)`): name
+  template 0x8F `<[Section View Station]> (<[Next Counter(CP)]>)`, whose
+  node keeps the next counter (`BL id, BL 0, BL 0, BL 32, 3 bits 001,
+  BL 1, BL next, BL 1, BL 1`; a node the writer makes for another
+  template starts at 2 as before).
+- Placement by the default group plot style: in from the plot's point by
+  0.5, filled by rows from the lower left with `ceil(sqrt(n))` views a
+  row, each column as wide as its views' widest reach left and right of
+  their centerlines (which it aligns), each row as high as its highest
+  view (40 for unsampled sections), 2 between columns and 2.5 between
+  rows.
+- The group record: after the section sources, `2 bits 10`, `BL p`
+  plots, each `BL index, 3BD point, 8 x BD 0, B 0, BD -30, BD 30, B 0,
+  BD 40, BL views, 16 zero bytes` and a constant 52-bit run (the values
+  -30, 30 and 40 are the same in every sample); per plot the references
+  `group plot style (hard), soft 0, hard 0` after the sources' and three
+  empty texts after theirs. Each line lists its view.
+- A drawing without a group plot style gets the default (style tree key
+  0x96, `AECC_SAMPLE_LINE_GROUP_STYLE`, its collection and the default
+  "Standard": rows, lower left start, uniform cells per row and column,
+  centerline alignment).
+
+The root settings node's lists of the drawing's objects are not written
+(as for single views). The group records of WX21 to WX23 and the views
+of WG01 are reproduced bit for bit from the plot count on. E-WG3 (three
+lines, two plots) and E-WG7 (seven lines of seven reaches) open with
+AUDIT 0 errors; the API lists the views in "Section View Group - 1" and
+"- 2" with the written locations, the same as the application's WG11a.
+The reader gives a group's plots (`section_view_group_plots()`) and
+reads a view's section count as a `BL` (a view of a line without a
+section, `BL 0`, gave no frame before).
+
 ## 3k. Intersections
 
 `add_intersection(doc, name, main, main_profile, other, other_profile,
 assembly_sets, layer)` writes the intersection object of two alignments
 that cross once, on line elements and away from their ends, with the
 drawing's default intersection style (style tree key 0x1031). Only the
-intersection is written: the offset alignments, curb returns, corridor
-regions and the profile locking actions the application's command makes
-with it are not, and the record's references to them are null. The two
+intersection is written, its references to offset alignments null;
+`add_intersection_with` adds the offset alignments, actions and label
+the command makes (below). The two
 assembly set files the record names (the file and its form under the
 content folder) are the caller's; empty texts are accepted.
 
@@ -1424,6 +2793,87 @@ the drawings open with AUDIT 0 errors; the API lists the roads with their
 alignments and profiles and null offsets, the four quadrants with their
 in and out alignments and the written angles, and the location (175, 75)
 of E-I3 follows from the written station through the curve.
+
+### Tee junctions
+
+A tee junction (one road starting or ending on the other) has the same
+record with `BL 2` in place of the first `BL 1`, the road words `2, 2`,
+the second road's station where it starts or ends, and two regions: from
+the arm before the second road's arm (counterclockwise) to it and from it
+to the next. The application makes the through road the main road. Every
+region of a crossing or a tee junction is named by the compass quadrant
+its bisector points into (NE between east and north, then NW, SW, SE;
+word NE 2, SE 4, SW 3, NW 1), the regions listed in NE, SE, SW, NW order:
+WI48 (a crossing whose main road heads north-north-east) names its
+regions by the compass, not from the main road's heading. Only the
+region texts present are written (`"NE - Quadrant", "NW - Quadrant"`).
+
+Tee junctions without profiles (WI42, WI44 to WI47: the second road
+starting or ending on the first, north or south of it, at 45 degrees, the
+first road ending on the second) and with them (WT40: the command's
+profile locking question answered "continue") are reproduced by
+`add_intersection` bit for bit apart from the class word (E-T42 to E-T47,
+E-T40); they open with AUDIT 0 errors and the API lists the two quadrants
+with the written in and out alignments and angles, and the profiles. A
+crossing without profiles is written the same way (E-X48 equals WI48
+apart from the class word and the offset alignments the command adds).
+
+### Offset alignments and actions of the command
+
+`add_intersection_with(..., Some(IntersectionOffsets), layer)` writes
+what the application's command writes with the intersection of two
+siteless roads (its curb returns and corridors turned off; WT41 tee with
+profiles, WT43 crossing with profiles, WT44 tee without):
+
+- Per road, main road first, an offset alignment on its left and one on
+  its right over its whole length, named `<road>-Left-<width>` and
+  `<road>-Right-<width>` (three decimals; the command's default width is
+  12). They are the offset alignments of §3a with two differences: the
+  head word is `0x10025F04` (an offset alignment no action keeps has
+  `0x00025F04`) and the alignment's own design speed is 60. Each is kept
+  by an action with an `AECC_ASSOC_OFFSET_ALIGNMENT_ACTION_BODY` (hard
+  pointer to the offset alignment): the road read, the offset written.
+  The intersection refers to them (references 4 and 6 of each road; the
+  offset profiles stay null).
+- A profile locking action, `AECC_ASSOC_PVILOCKING_MULTIALIGNINTER_ACTION_BODY`:
+  its body's 38 bits after the version word are constant
+  (`00010000001101000000111010101001010100`), its references hard
+  pointers to the other road's profile, the intersection, 0, the main
+  road, 0, 0, the main road's profile, 0; its dependencies the
+  intersection (read, order `0x10100`), the other road (read), the other
+  road's profile (written), the main road and its profile (read). Without
+  profiles the body points to the intersection only and the dependencies
+  are the intersection and the other road.
+- The intersection action, `AECC_ASSOC_INTERSECTION_ACTION_BODY` (hard
+  pointer to the intersection): the two roads read, the intersection
+  written (order `0x10000`).
+- The location label, `AECC_INTERSECTION_LOCATION_LABEL`, an entity in
+  model space: a constant 647-bit record, references soft 0, soft 0, the
+  intersection (soft), the label style and the intersection (hard), texts
+  `AeccImpIntersectionLocationLabel` and three empty ones. Its style is the
+  drawing's default intersection label style (label node key 0x1032,
+  collection 0x0F00B579, style 0x800001D5 "Basic" with an iterator and a
+  text component), written with its root and collection when missing
+  (the style's layer layer 0; the application's template has its own
+  text layer).
+
+A dependency's `BL` after its four flags is its order, and dependencies
+on the same object form a chain: the second and third references are the
+previous and next dependency on the object, ordered by order (lower
+first, equal orders in the order added), and the object lists them as
+reactors in chain order (the intersection lists the intersection
+action's dependency, order `0x10000`, before the locking action's,
+`0x10100`, though the locking action comes first). `add_action` links
+every dependency it writes into its entity's chain.
+
+The written records equal the samples' (every action, body and
+dependency bit for bit; the offset alignments apart from their geometry
+stamp and identifiers). E-T42W (WT41's roads and profiles), E-T43W (a
+crossing) and E-T44W (a tee without profiles) open with AUDIT 0 errors
+and the API lists the four offset alignments with their names, types and
+stations and the roads' profiles. Not written: the name template counter
+the command advances, offset alignments of roads on a site, curb
+returns, corridor regions.
 
 ## 3l. Subassembly packages (`pkt`)
 
@@ -2015,16 +3465,20 @@ taken from the records and checked bit for bit against them.
 - Alignments with lone spirals or other curve constraints, on a site,
   offset alignments, labels, design speeds; the written alignment style draws no markers (no marker style
   is written).
-- Surfaces from point groups, breaklines, boundaries or edits.
+- Surfaces: the geometry of pasted surfaces, point files, imported files
+  and corridor surfaces (the application adds it on rebuild); the exact
+  fill of a deleted vertex's hole that is not convex; non-destructive
+  lines through existing vertices (§3c).
 - Profiles with other curve constraints (fixed or floating curves, curves
   by K or through a point), profiles of alignments the application has
   changed.
 - Alignments and feature lines that meet other members on a site, lot
   lines meeting where one has an arc, parcel and feature line styles other than the
   defaults;
-  sections, corridors: not written; pipe networks: other families and
+  sections; corridor offset baselines and geometry locks (§3i-a); pipe networks: other families and
   sizes.
-- Profile views with a vertical scale or style other than the default;
+- Profile views with a style other than the default beyond its vertical
+  exaggeration;
   the graph settings between the named values are constant runs.
 
 ## 6. Status
@@ -2037,20 +3491,115 @@ taken from the records and checked bit for bit against them.
 | point style, its collection, class and settings nodes | yes | yes, in a drawing without the tree (§2a) | yes (§4) | not needed | — |
 | label styles: label node, point, sample line and profile label roots and default styles, profile label set | partly | yes, the defaults in a new drawing (§2b) | yes (§2b) | not needed | other label roots, styles other than the defaults (the settings are constant runs) |
 | alignments (fixed lines, free arcs and spiral-curve-spirals, siteless) | yes | yes (a new drawing gets §3b) | yes (§4) | not needed (the application solves the stored elements) | other constraints, sites, labels |
-| TIN surfaces (added points) | yes | yes (a new drawing gets §3d) | yes (§4) | not needed (the stored triangulation is drawn; the application rebuilds it after an edit) | other definitions |
+| TIN surfaces: points, point groups, breaklines (standard, proximity, non-destructive), contours, boundaries, vertex and edge edits, raise, drawing objects, pasted surfaces, point and imported files, corridor surfaces | yes (every definition kind of the samples) | yes, with the triangulation the definitions build (a new drawing gets §3d) | yes (§3c) | not found; the written triangulation is built by the writer (§3c) | geometry of pasted, file and corridor sources; the cases of §3c |
 | layout profiles (fixed tangents; free symmetric and asymmetric parabolas, free circular curves) | yes | yes (a new drawing gets §3f) | yes (§4) | not needed (the application solves the stored entities) | fixed and floating curves |
 | sites, alignments and feature lines (arcs, elevation points) on a site | yes | yes (a new drawing gets the node of sites and the default parcel and feature line styles, §2c) | yes (§4) | not needed (the application rewrites the site's cache) | alignments or feature lines meeting other members; containers the application edited after inserting elevation points |
 | parcels of closed and open, crossing and touching lot lines, with arcs | yes (number, face, boundary) | yes (§3g) | yes (§3g) | not needed | arcs where lines meet; lot lines meeting alignments or feature lines; the label of a nearly isosceles right triangle; the newest member's point marks 0x10, 0x20 where it meets another |
 | profile views (automatic or user ranges) and their profile label groups | yes (frame) | yes (a new drawing gets the default view style, §3h) | yes (§3h) | not needed (the application recomputes the view from its style) | other styles and vertical scales |
 | assemblies and package subassemblies | partly (corridor's group block) | yes (a new drawing gets the default assembly, code set, link and shape styles, §2c) | yes (§3i, §2c) | not needed | — |
-| corridors (one baseline, one region, unbuilt) | yes | yes, with an assembly of the drawing (a new drawing gets the default corridor style, §2c) | yes (§3i, §2c) | the corridor is written out of date and built by the application's rebuild | built results, surfaces, several regions or baselines |
-| sample line groups and two-vertex sample lines | yes | yes, with the drawing's sample line label style (§3j) | yes (§3j) | not needed | lines with more vertices |
+| corridors: baselines along alignments, regions, frequencies, placement flags, added stations, targets (unbuilt) | yes (fields of built ones; names and references of unbuilt ones) | yes, with assemblies of the drawing (a new drawing gets the default corridor style, §2c) | yes (§3i, §2c) | the corridor is written out of date and built by the application's rebuild | see §3i-a |
+| sample line groups and sample lines through two or more vertices | yes | yes, with the drawing's sample line label style (§3j) | yes (§3j) | not needed | lines with all vertices on one side |
 | sections of a TIN surface (unsampled) | yes (geometry once sampled) | yes (§3j) | yes (§3j) | the application samples the source | corridor sources, lines added after sampling |
 | section views of a line (default style, unsampled section) | yes (frame) | yes, with the drawing's section view style or the default one (§3j, §2c) | yes (§3j, §2c) | not needed | sampled sections, several sections |
-| intersections of two crossing roads (the object only) | yes (stations, angles) | yes, with the drawing's intersection style or the default one (§3k, §2c) | yes (§3k, §2c) | not needed | offset alignments, curb returns, corridor regions and locking actions; tee junctions |
+| intersections of two crossing roads and tee junctions, with their offset alignments, locking and intersection actions and location label | yes (stations, angles) | yes, with the drawing's intersection style or the default one (§3k, §2c) | yes (§3k, §2c) | not needed | curb returns, corridor regions, roads on a site |
 | gravity pipe networks: every structure and pipe family of the default parts list (its one size each), connections | partly (part positions, pipe ends, connector counts, sizes of older part definitions) | yes (a new drawing gets the default parts list and styles, §3m) | yes (§3m) | not needed (the application recomputes outlines, lengths and extents) | sizes the default parts list does not hold, the catalog's body solids |
 | pressure networks: every pipe, elbow, tee, cross and gate valve size of the default catalog (straight and curved pipes), connections | yes (ports: positions, directions, joint sizes, connections; pipe ends and bulge, part positions and rotations) | yes (a new drawing gets the default pressure part list and styles, §3n) | yes (§3n) | not needed | part kinds of other catalogs, the catalog's body solids |
 | gradings, mass haul | partly (grading criteria, mass haul line and view frame) | no | — | — | no controlled samples (§6a) |
+
+### 6b. Options per kind
+
+What each kind offers in the application and whether acadrust reads and
+writes it. "read" means read field by field; "write" means written from
+named fields and checked in the application (§4 and the sections named).
+Corridors are listed in §3i-a.
+
+| kind | option | read | write | evidence / what blocks it |
+|---|---|---|---|---|
+| COGO points | position, number, raw description, name, styles | yes | yes | §3 |
+| COGO points | point label styles other than the default | yes | yes | §2d |
+| COGO points | user-defined properties (classifications; whole number, double, text and boolean properties with defaults, bounds and descriptions; values) | yes | yes | §3 (user-defined properties) |
+| COGO points | enumeration properties (choices, default, values) | yes | yes | §3 (user-defined properties): `add_point_choice_property`; E-UE1 opens with AUDIT 0 and the programming interface reads the choices and the values |
+| COGO points | properties of other kinds (distance, elevation, ...) | no | no | the programming interface makes only whole number, double, text, boolean and enumeration type infos |
+| point groups | number lists, elevation comparisons and ranges, description, name and full description patterns, exclusions | yes | yes | §3, §4 |
+| point groups | number ranges (`2-6`) | yes | as a number list | the application stores the range as its numbers |
+| point groups | overrides: point style, label style, fixed elevation, raw description; locked points; classifications applied (none, all, one) | yes | yes | §3 (point groups) |
+| point groups | custom queries: AND, OR, parentheses, a leading NOT over number, elevation, descriptions and name | yes | yes | §3 (custom queries) |
+| point groups | custom queries with a comparison opening or closing two parentheses | no | no | the application stores the extra parenthesis as an empty-text comparison and shows it in its own query text (PQ02 D4, PQ04); not written |
+| point groups | case-sensitive matching, elevation and description overrides from a property or extended data | partly | no | not sampled |
+| TIN surfaces | points added to the surface | yes | yes | §3c |
+| TIN surfaces | point groups, breaklines (standard, proximity, non-destructive; from objects or held points, mid-ordinate, supplementing, weeding), contours, boundaries (outer, hide, show, data clip; destructive or not), add/delete/move vertex, vertex elevation, swap edge, add/delete line, raise, drawing objects, automatic rebuild | yes (every field by kind, §3c) | yes, with the triangulation the definitions build (§3c) | 62 of 67 sample surfaces built identically; non-destructive lines through vertices, far point clusters and a non-convex deleted vertex's hole differ (§3c) |
+| TIN surfaces | pasted surfaces, point files, imported files, corridor surfaces | yes | the definition (no geometry from the source) | the application adds the source's geometry when it rebuilds |
+| TIN surfaces | snapshots | yes | yes | §3c (snapshots) |
+| TIN surfaces | definitions of a surface whose snapshot was rebuilt | yes | as a snapshot just taken | §3c (snapshots; TS03, TO03 to TO05) |
+| TIN surfaces | transform and polygon definitions of older drawings, DEM files, surfaces referenced from other drawings | partly (older kinds walked) | no | not sampled; referenced surfaces have no definitions list |
+| alignments | fixed lines, free arcs, spiral-curve-spirals, start station, siteless and on a site | yes | yes | §3a, §3g |
+| alignments | offset alignments of lines and arcs, on either side, over the whole parent or a station range | yes | yes | §3a (station anchors, offset alignments) |
+| alignments | station anchors (profiles, offset ranges, own design speed, corridor geometry locks, design speeds, station equations) | yes | yes | §3a |
+| alignments | design speeds, station equations (increasing, decreasing) | yes | yes | §3a (design speeds and station equations) |
+| alignments | widenings with linear transitions (on lines; of length 0 anywhere) | yes | yes | §3a (offset alignments) |
+| alignments | types: centerline, utility, rail (track gauge) | yes | yes | §3a (alignment types) |
+| alignments | curb returns (connected alignments) of one arc between two roads' offset lines, turning left or right, into the outgoing road along or against its stationing | yes (type, roads) | yes | §3a (curb returns) |
+| alignments | curb returns of three arcs and of a clothoid spiral-curve-spiral | yes | yes | §3a (curb returns; CG01 to CG11) |
+| alignments | curb returns of spiral-spiral groups (SSCS, SCSS, SSCSS) | — | no | the application's interface refuses every set of parameters tried (§3a) |
+| alignments | widening transitions on arcs or curved (kinds 2, 4, 5), offsets of spirals, rail cant | yes (offset parameters and regions, connected alignments, type) | no | not decoded |
+| alignments | lone spirals, other constraints (fixed/floating curves, curves through points) | yes (elements) | no | other element kinds not written; no sample: after a fixed line the API's floating line and floating curve additions never return in a batch run (AE01, AE02) |
+| alignments | superelevation: curves over curve elements, critical stations (begin/end full super, level crown, low shoulder match, reverse crown) with cross slopes | yes | yes | §3a (superelevation) |
+| alignments | superelevation: manual stations (with their curve settings block and descriptions) | yes | yes | §3a (superelevation) |
+| alignments | superelevation: normal crown and shoulder stations, other curve settings, lanes-only blocks, cant | yes (block walked; plain form read) | no | normal crown/shoulder stations were refused by the programming interface; the calculation wizard was not reached |
+| profiles | layout: fixed tangents, free parabolas (symmetric, asymmetric), free circular curves | yes | yes | §3e |
+| profiles | layout: free curves by K, radius, horizontal length or through a point (parabolas and circular curves) | yes | yes | §3e |
+| profiles | layout entity by entity: fixed tangents, fixed parabolas (three points, two points and a grade or K), floating parabolas (end and K or grade) | yes | yes | §3e (entity by entity) |
+| profiles | floating tangents after a parabola, free tangents between parabolas | yes | yes | §3e (entity by entity) |
+| profiles | fixed parabolas by two points and a radius | yes | yes | §3e (entity by entity) |
+| profiles | fixed and floating circular curves, asymmetric fixed curves; fixed parabolas by an entity's end and a point, floating parabolas by a radius | yes (tangents; parameter words read) | no | the programming interface has no add for circular or asymmetric fixed or floating curves (only free ones by PVI); the other inputs never returned (PE12, PE13) |
+| profiles | from a TIN surface (existing ground), at an offset, over the whole alignment or a station range | yes (definition) | yes | §3e (profiles from a surface) |
+| profiles | offset profiles by slope, of tangents and symmetric parabolas, on an offset alignment of one region | yes | yes | §3e (offset profiles) |
+| profiles | offset profiles of other source curves or over widenings; superimposed profiles, profiles of corridor feature lines, static copies | partly | no | not sampled for writing |
+| profile views | automatic and user ranges, default style, profile label groups | yes (frame) | yes | §3h |
+| profile views | styles that copy the default with another vertical exaggeration, views with them | yes (frame, style exaggeration) | yes | §3h |
+| profile views | stacked views (separate views at stacked origins) | yes | yes | §3h |
+| profile views | every style setting the API exposes (graph title, direction, exaggeration, grid, the four axes' titles and ticks, text styles) | yes | yes | §3h |
+| profile views | profile data, vertical and horizontal geometry, superelevation, sectional data and pipe network bands below or above the view, with their gaps, end station labels, label visibility, weeding, stagger, profiles and label groups; the default band styles of a new drawing | yes | yes (horizontal geometry labels of spiral-curve-spirals; alignments of other spiral elements left to the application) | §3h (Bands) |
+| profile views | sectional data bands reading a sample line group, pipe network bands reading a gravity network (its parts drawn in the view), superelevation bands of an alignment with superelevation, with their labels | yes | yes (no labels with manual stations) | §3h (Bands) |
+| profile views | pressure network band data sources and labels, pressure network/cant/distance/COGO/speed bands, band styles other than the defaults, intervals, stagger line height | partly | no | the API adds no band of the last five kinds; the API ignores the interval setters and refuses the stagger line height |
+| sites | name, description, members | yes | yes | §3g |
+| parcels | closed and open, crossing and touching lot lines, arcs, labels | yes | yes | §3g |
+| parcels | members added to containers the application wrote with crossings (its point marks and edge flags kept) | yes | yes | §3g |
+| parcels | lot lines meeting alignments or feature lines; arcs where lines meet; the rule of the newest member's point marks 0x10/0x20 for members the crate adds | yes | no | §3g (rule not found; marks read are kept) |
+| sites | containers with members without points or nodes (WP01, WP02, WT04 to WT06: alignments without elements on a site), members added to them | yes | yes | §3g (members without points) |
+| feature lines | points, elevation points, arcs, on a site | yes | yes | §3g |
+| feature lines | edits: points, arcs, elevations and elevation points replaced, in containers this crate or the application wrote (ids and keys kept) | yes | yes | §3g |
+| feature lines | crossing and touching other members on a site (straight segments), where no region closes | yes | yes | §3g (feature lines that cross) |
+| feature lines | crossings that close or split a region (the application adds a grading of the face), styles other than the default | yes | no | §3g (FX04, FX07); gradings are not written (§6a) |
+| sample line groups | lines by station or through vertices on both sides | yes | yes | §3j |
+| sample line groups | lines with all vertices on one side | yes | yes | §3j |
+| sample line groups | section sources other than a TIN surface (corridors, corridor surfaces, pipe networks) | yes | no | not sampled |
+| sections | of a TIN surface (unsampled) | yes (geometry once sampled) | yes | §3j |
+| section views | one view of a line, default style | yes (frame) | yes | §3j |
+| section views | group plots with the default group plot style, one or more per group | yes | yes | §3j (section view group plots) |
+| section views | group plots with other group plot styles or plot settings (pages, sheets), several sections in a view, views of sampled sections, other styles | partly | no | not sampled |
+| assemblies | groups of package subassemblies (offsets, attachments) | partly | yes | §3l, §3i |
+| subassemblies | packages (`pkt`) written by acadrust | yes | yes | §3l |
+| subassemblies | stock subassemblies of the application's library | yes (parameters) | no | their texts carry the library path of the product |
+| corridors | see §3i-a | | | |
+| intersections | two crossing roads (the object) | yes | yes | §3k |
+| intersections | tee junctions without profiles (either side, starting or ending, skewed, the first road ending) | yes | yes | §3k (tee junctions) |
+| intersections | tee junctions with profiles | yes | yes | §3k (tee junctions) |
+| intersections | the offset alignments, profile locking action, intersection action and location label the command makes (siteless roads) | yes | yes | §3k (offset alignments and actions of the command) |
+| intersections | curb returns, corridor regions, roads on a site (offsets in the site's topology) | yes (records) | no | curb return records not decoded (hand-off notes); site topology of offset alignments not written |
+| gravity pipe networks | every family of the default parts list (one size each), connections | partly | yes | §3m |
+| gravity pipe networks | sizes the parts list does not hold, the catalog's body solids | partly | no | §3m |
+| pressure networks | every size of the default catalog (straight and curved pipes, elbows, tees, crosses, gate valves), connections | yes | yes | §3n |
+| pressure networks | parts of other catalogs | partly | no | §3n |
+| gradings | criteria, groups, gradings | partly (criteria) | no | §6a |
+| mass haul | line and view | partly | no | §6a |
+| label styles | the defaults of a new drawing (§2b) | partly | yes | §2b |
+| label styles | settings: visibility, layer, text style, orientation, insert option, plan readability, leader, dragged state; text components' contents, height, offsets, angle, attachment, anchor, color, lineweight, border | yes (every record of the application's style tree; 23 collectors of drawings of older releases do not read) | yes, as copies of a drawing's label style (§2d) | §2d |
+| label styles | pipe, structure and pressure part label styles (plan, profile, section, crossing profile) | yes | yes, as copies (§2d, E-NL1) | §2d |
+| label styles | adding and removing text components | yes | yes (§2d) | §2d |
+| label styles | line, block, tick and direction arrow components: settings, adding and removing them | yes | yes, in copies (§2d) | §2d |
+| label styles | text iterators: settings and removing them | yes | yes, in copies (§2d) | §2d |
+| label styles | adding text iterators; reference text components; anchors of lines | iterators yes | no | impossible: the API adds no iterator or reference text, no drawing has a reference text component, and it refuses to set line and block anchors (§2d) |
 
 ### 6a. Gradings and mass haul
 

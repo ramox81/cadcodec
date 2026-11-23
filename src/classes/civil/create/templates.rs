@@ -25,6 +25,8 @@ pub(super) enum Target {
     /// The style `id` of the style tree's collection `key` (written
     /// before this table).
     Style(i32, i32),
+    /// The label style `id` of the label node's collection `key`.
+    Label(u32, u32),
 }
 
 /// A piece of a template's fields after the version word.
@@ -52,7 +54,7 @@ pub(super) struct Template {
     pub strings: &'static [&'static str],
 }
 
-fn run(w: &mut DwgMergedWriter, len: usize, hex: &str) {
+pub(super) fn run(w: &mut DwgMergedWriter, len: usize, hex: &str) {
     let mut left = len;
     for c in hex.chars() {
         let v = c.to_digit(16).unwrap_or(0);
@@ -68,6 +70,17 @@ fn run(w: &mut DwgMergedWriter, len: usize, hex: &str) {
 
 /// Writes `templates` under the style tree `styles` and returns their
 /// handles; the caller lists the top-level ones in the style tree.
+///
+/// Every table's first template is its family's collection root, and it
+/// carries the same DXF class as the styles it owns. A class-instance
+/// census of an `AECC_*_STYLE` family therefore counts one record more
+/// than the family has styles, while Civil 3D's own style collections
+/// enumerate only a root's children and so report the style count
+/// without the root. `DE_Busbucht_2023.dwg` (Civil 3D 2027) shows both
+/// sides of that: its alignment family holds 18 `AeccDbAlignmentStyle`
+/// records — the collection root `0x1D3` owned by the `AeccDbTreeNode`
+/// `0xF3`, plus the 17 named styles the root owns — while the .NET
+/// `Styles.AlignmentStyles` collection reports 17.
 pub(super) fn write_templates(doc: &mut CadDocument, styles: Handle, templates: &[Template]) -> Result<Vec<Handle>, DxfError> {
     let table = |doc: &CadDocument, t: Target| -> Option<u64> {
         Some(match t {
@@ -80,6 +93,12 @@ pub(super) fn write_templates(doc: &mut CadDocument, styles: Handle, templates: 
                 let collection = tree.children.iter().find(|c| c.0 == key)?.1;
                 read_node(doc, Handle::new(collection))?.children.iter().find(|c| c.0 == id)?.1
             }
+            Target::Label(key, id) => {
+                let tree = read_node(doc, root_node(doc, super::tree::KEY_STYLES)?)?;
+                let labels = tree.children.iter().find(|c| c.0 == super::labels::KEY_LABELS)?.1;
+                let collection = read_node(doc, Handle::new(labels))?.children.iter().find(|c| c.0 as u32 == key)?.1;
+                read_node(doc, Handle::new(collection))?.children.iter().find(|c| c.0 as u32 == id)?.1
+            }
             _ => 0,
         })
     };
@@ -87,7 +106,7 @@ pub(super) fn write_templates(doc: &mut CadDocument, styles: Handle, templates: 
         table(doc, t).ok_or_else(|| invalid("drawing lacks layer 0, the ByBlock linetype or the Standard text style"))?;
     }
     for t in templates.iter().flat_map(|t| t.refs.iter().map(|r| r.1)) {
-        if matches!(t, Target::Style(..)) && table(doc, t).is_none() {
+        if matches!(t, Target::Style(..) | Target::Label(..)) && table(doc, t).is_none() {
             return Err(invalid("a style these styles refer to is missing"));
         }
     }

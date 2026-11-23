@@ -52,6 +52,18 @@ fn split_proxy_text_data(binary: &[u8], text_data_bits: u32) -> (&[u8], &[u8]) {
     binary.split_at(binary.len() - text_len)
 }
 
+/// Whether the group after a proxy's `70` (original data format DXF) opens
+/// the binary layout rather than the record's own DXF groups: the next
+/// record (`0`), a graphics or data size (`92`/`160`, `93`/`161`,
+/// `96`/`162`), a binary chunk (`310`), the object-id terminator (`94`) or
+/// the end of input. A record's own groups start with its `100` subclass.
+fn proxy_binary_data_follows(code: Option<i32>) -> bool {
+    matches!(
+        code,
+        None | Some(0 | 92 | 93 | 94 | 96 | 160 | 161 | 162 | 310)
+    )
+}
+
 fn object_data_payload_dxf(fields: &mut ClassDxfFields) -> Vec<u8> {
     let mut payload = Vec::new();
     for chunk in fields.strings("CIrdBaseRecord", 1004) {
@@ -12266,11 +12278,8 @@ impl<'a> SectionReader<'a> {
                 97 => object.maintenance_version = pair.as_i32().unwrap_or(0),
                 70 => {
                     object.from_dxf = pair.as_i16().unwrap_or(0) != 0;
-                    dxf_data_follows = object.from_dxf
-                        && !matches!(
-                            self.reader.peek_code()?,
-                            None | Some(0 | 92 | 93 | 94 | 96 | 160 | 161 | 162 | 310)
-                        );
+                    dxf_data_follows =
+                        object.from_dxf && !proxy_binary_data_follows(self.reader.peek_code()?);
                 }
                 // Data size in bits: 93 up to R2007, 161 (64-bit) from R2010.
                 93 | 161 => {
@@ -15222,10 +15231,18 @@ impl<'a> SectionReader<'a> {
         let mut subclass = String::new();
         let mut common_graphics_size = 0usize;
         let mut common_graphics = Vec::new();
+        let mut dxf_data = Vec::new();
+        // After `70 1` (original data format DXF) AutoCAD writes the entity's
+        // own DXF groups instead of binary data; keep them verbatim.
+        let mut dxf_data_follows = false;
         while let Some(pair) = self.reader.read_pair()? {
             if pair.code == 0 {
                 self.reader.push_back(pair);
                 break;
+            }
+            if dxf_data_follows {
+                dxf_data.push((pair.code, pair.value_string));
+                continue;
             }
             match pair.code {
                 100 => subclass = pair.value_string.clone(),
@@ -15240,7 +15257,11 @@ impl<'a> SectionReader<'a> {
                 95 => version = pair.as_i32().unwrap_or(0),
                 71 => dwg_version = pair.as_i32().unwrap_or(0),
                 97 => maintenance_version = pair.as_i32().unwrap_or(0),
-                70 => from_dxf = pair.as_i16().unwrap_or(0) != 0,
+                70 => {
+                    from_dxf = pair.as_i16().unwrap_or(0) != 0;
+                    dxf_data_follows =
+                        from_dxf && !proxy_binary_data_follows(self.reader.peek_code()?);
+                }
                 // Graphics size in bytes: 92 up to R2007, 160 (64-bit) from R2010.
                 92 | 160 => {
                     proxy_data_size = pair.as_int().unwrap_or(0).max(0) as usize;
@@ -15329,6 +15350,7 @@ impl<'a> SectionReader<'a> {
                 payload,
                 text_payload,
                 object_ids,
+                dxf_data,
             }),
         }))
     }
@@ -15347,6 +15369,7 @@ impl<'a> SectionReader<'a> {
         let mut current_subclass = String::new();
         let mut definition_point = PointReader::new();
         let mut text_middle_point = PointReader::new();
+        let mut insertion_point = PointReader::new();
         let mut first = PointReader::new();
         let mut second = PointReader::new();
         let mut third = PointReader::new();
@@ -15374,6 +15397,9 @@ impl<'a> SectionReader<'a> {
                 }
                 11 | 21 | 31 => {
                     text_middle_point.add_coordinate(&pair);
+                }
+                12 | 22 | 32 => {
+                    insertion_point.add_coordinate(&pair);
                 }
                 13 | 23 | 33 => {
                     first.add_coordinate(&pair);
@@ -15406,6 +15432,9 @@ impl<'a> SectionReader<'a> {
                 41 | 44 if current_subclass == "AcDbDimension" => {
                     base.line_spacing_factor = pair.as_double().unwrap_or(1.0)
                 }
+                51 if current_subclass == "AcDbDimension" => {
+                    base.horizontal_direction = pair.as_double().unwrap_or(0.0).to_radians()
+                }
                 53 if current_subclass == "AcDbDimension" => {
                     base.text_rotation = pair.as_double().unwrap_or(0.0).to_radians()
                 }
@@ -15437,6 +15466,12 @@ impl<'a> SectionReader<'a> {
                 72 if current_subclass == "AcDbDimension" => {
                     base.line_spacing_style = pair.as_i16().unwrap_or(1)
                 }
+                74 if current_subclass == "AcDbDimension" => {
+                    base.flip_arrow1 = pair.as_i16().is_some_and(|v| v != 0)
+                }
+                75 if current_subclass == "AcDbDimension" => {
+                    base.flip_arrow2 = pair.as_i16().is_some_and(|v| v != 0)
+                }
                 210 | 220 | 230 => {
                     let mut normal = PointReader::new();
                     normal.add_coordinate(&pair);
@@ -15459,6 +15494,9 @@ impl<'a> SectionReader<'a> {
         }
         if let Some(point) = text_middle_point.get_point() {
             base.text_middle_point = point;
+        }
+        if let Some(point) = insertion_point.get_point() {
+            base.insertion_point = point;
         }
 
         if is_arc {
@@ -18474,7 +18512,7 @@ impl<'a> SectionReader<'a> {
                         ml.text_attachment_point =
                             mlt::TextAttachmentPointType::from(self.leader_code(
                                 v,
-                                &[1, 2, 3],
+                                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
                                 "read_multileader.TextAttachmentPointType",
                             ));
                     }
@@ -18687,7 +18725,7 @@ impl<'a> SectionReader<'a> {
                         ctx.text_attachment_point =
                             mlt::TextAttachmentPointType::from(self.leader_code(
                                 v,
-                                &[1, 2, 3],
+                                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
                                 "read_mleader_context.TextAttachmentPointType",
                             ));
                     }

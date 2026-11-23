@@ -2595,6 +2595,23 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             } else {
                 graphics
             };
+            if data.from_dxf && !data.dxf_data.is_empty() {
+                // Original data format DXF: the ids, the proxy graphics in
+                // the reference order (before the version and `70`, so the
+                // reader does not take them for binary data), then the
+                // entity's own DXF groups as read, with no binary data or 94
+                // terminator (AutoCAD refuses binary data after 70 1).
+                self.writer.write_i32(90, 498)?;
+                self.writer.write_i32(91, data.class_id)?;
+                if !graphics.is_empty() {
+                    self.write_proxy_graphics_dxf(&graphics)?;
+                }
+                self.write_proxy_version_dxf(data.dwg_version, data.maintenance_version, true)?;
+                for (code, value) in &data.dxf_data {
+                    self.writer.write_string(*code, value)?;
+                }
+                return Ok(());
+            }
             return self.write_proxy_body_dxf(
                 498,
                 data.class_id,
@@ -4120,6 +4137,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 payload: Default::default(),
                 text_payload: Default::default(),
                 object_ids: Vec::new(),
+                dxf_data: Vec::new(),
             };
             if entity.raw_dwg_data.is_some() {
                 if let Err(error) = self.decode_unknown_proxy_data(entity, &mut data) {
@@ -6655,6 +6673,15 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
     ) -> Result<()> {
         self.writer.write_i32(90, proxy_id)?;
         self.writer.write_i32(91, class_id)?;
+        self.write_proxy_version_dxf(dwg_version, maintenance_version, from_dxf)
+    }
+
+    fn write_proxy_version_dxf(
+        &mut self,
+        dwg_version: i32,
+        maintenance_version: i32,
+        from_dxf: bool,
+    ) -> Result<()> {
         if self.dxf_version >= DxfVersion::AC1032 {
             self.writer.write_i32(71, dwg_version)?;
             self.writer.write_i32(97, maintenance_version)?;
@@ -6663,6 +6690,20 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
                 .write_i32(95, (maintenance_version << 16) | (dwg_version & 0xffff))?;
         }
         self.writer.write_bool(70, from_dxf)
+    }
+
+    /// Proxy graphics: the size in bytes (92 up to R2007, 160 from R2010),
+    /// then the bytes as 310 chunks.
+    fn write_proxy_graphics_dxf(&mut self, graphics: &[u8]) -> Result<()> {
+        if self.dxf_version >= DxfVersion::AC1024 {
+            self.writer.write_i64(160, graphics.len() as i64)?;
+        } else {
+            self.writer.write_i32(92, graphics.len() as i32)?;
+        }
+        for chunk in graphics.chunks(127) {
+            self.writer.write_binary(310, chunk)?;
+        }
+        Ok(())
     }
 
     fn write_proxy_body_dxf(
@@ -6688,14 +6729,7 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
             false,
         )?;
         if let Some(graphics) = graphics {
-            if v2010 {
-                self.writer.write_i64(160, graphics.len() as i64)?;
-            } else {
-                self.writer.write_i32(92, graphics.len() as i32)?;
-            }
-            for chunk in graphics.chunks(127) {
-                self.writer.write_binary(310, chunk)?;
-            }
+            self.write_proxy_graphics_dxf(graphics)?;
         }
         const DHL_1021: i32 = 27;
         if self.dxf_version >= DxfVersion::AC1021 && dwg_version >= DHL_1021 {
@@ -10831,6 +10865,12 @@ impl<'a, W: DxfStreamWriter> SectionWriter<'a, W> {
         for v in &image.clip_boundary.vertices {
             self.writer.write_double(14, v.x)?;
             self.writer.write_double(24, v.y)?;
+        }
+
+        // Clip mode (0 = outside, 1 = inside); R2010+ only.
+        if self.dxf_version >= DxfVersion::AC1024 {
+            self.writer
+                .write_bool(290, image.clip_boundary.clip_mode == ClipMode::Inside)?;
         }
 
         Ok(())

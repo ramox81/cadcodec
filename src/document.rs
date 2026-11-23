@@ -115,9 +115,9 @@ mod dim_header;
 mod handle_reservation;
 pub(crate) mod handle_usage;
 pub use handle_reservation::{HandleReservation, HandleReservationError, HandleReservationIter};
+mod app_id_usage;
 mod legacy_header;
 mod semantic_inventory;
-mod app_id_usage;
 pub(crate) use dim_header::{
     apply_dimension_arrow_header, dimension_arrow_dxf_name, sync_dimension_arrow_header,
 };
@@ -1279,6 +1279,22 @@ pub struct SummaryInfo {
     pub custom_properties: Vec<(String, String)>,
 }
 
+/// One physical DWG FileDepList record. Stored and found paths are independent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FileDependency {
+    pub feature: String,
+    pub file_name: String,
+    pub found_path: String,
+    pub fingerprint_guid: Option<String>,
+    pub version_guid: Option<String>,
+    /// Seconds since 1980-01-01.
+    pub timestamp: u32,
+    pub file_size: u32,
+    pub affects_graphics: bool,
+    pub reference_count: u32,
+}
+
 /// A CAD document containing all drawing data
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1295,6 +1311,10 @@ pub struct CadDocument {
 
     /// Header variables containing drawing settings
     pub header: HeaderVariables,
+
+    /// Typed external file identities, independent of the drawing header GUID.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub file_dependencies: Vec<FileDependency>,
 
     /// Layer table
     pub layers: Table<Layer>,
@@ -1627,6 +1647,7 @@ impl CadDocument {
             version: DxfVersion::AC1032, // DXF 2018
             maintenance_version: 0,
             header: HeaderVariables::default(),
+            file_dependencies: Vec::new(),
             layers: Table::new(),
             line_types: Table::new(),
             text_styles: Table::new(),
@@ -4683,7 +4704,10 @@ impl CadDocument {
 
     /// Mutable counterpart of [`CadDocument::named_objects_dictionary`].
     pub fn named_objects_dictionary_mut(&mut self) -> Option<&mut crate::objects::Dictionary> {
-        match self.objects.get_mut(&self.header.named_objects_dict_handle)? {
+        match self
+            .objects
+            .get_mut(&self.header.named_objects_dict_handle)?
+        {
             ObjectType::Dictionary(dict) => Some(dict),
             _ => None,
         }
@@ -4693,7 +4717,10 @@ impl CadDocument {
     pub fn ensure_named_objects_dictionary(&mut self) -> Handle {
         let mut root_handle = self.header.named_objects_dict_handle;
         if root_handle.is_null()
-            || !matches!(self.objects.get(&root_handle), Some(ObjectType::Dictionary(_)))
+            || !matches!(
+                self.objects.get(&root_handle),
+                Some(ObjectType::Dictionary(_))
+            )
         {
             root_handle = self.allocate_handle();
             let mut root = crate::objects::Dictionary::new();
@@ -4840,8 +4867,7 @@ impl CadDocument {
             }
         }
 
-        self.objects
-            .insert(group_handle, ObjectType::Group(group));
+        self.objects.insert(group_handle, ObjectType::Group(group));
 
         if let Some(ObjectType::Dictionary(dict)) = self.objects.get_mut(&group_dict_handle) {
             dict.insert(name, group_handle);
@@ -4867,11 +4893,7 @@ impl CadDocument {
         let name = {
             let dict = match self.objects.get(&group_dict_handle) {
                 Some(ObjectType::Dictionary(d)) => d,
-                _ => {
-                    return Err(crate::error::DxfError::Custom(
-                        "ACAD_GROUP missing".into(),
-                    ))
-                }
+                _ => return Err(crate::error::DxfError::Custom("ACAD_GROUP missing".into())),
             };
             let mut i = 1;
             loop {
@@ -4898,8 +4920,7 @@ impl CadDocument {
             }
         }
 
-        self.objects
-            .insert(group_handle, ObjectType::Group(group));
+        self.objects.insert(group_handle, ObjectType::Group(group));
 
         if let Some(ObjectType::Dictionary(dict)) = self.objects.get_mut(&group_dict_handle) {
             dict.insert(&name, group_handle);
@@ -6414,6 +6435,11 @@ impl CadDocument {
                                     {
                                         reference.subentity_object = *new_handle;
                                     }
+                                    if let Some(new_handle) =
+                                        remap_map.get(&reference.reserved_reference.value())
+                                    {
+                                        reference.reserved_reference = *new_handle;
+                                    }
                                 }
                             }
                             DataObjectData::IdBuffer(value) => {
@@ -6896,13 +6922,7 @@ impl CadDocument {
             for eh in &br.entity_handles {
                 if let Some(&idx) = self.entity_index.get(eh) {
                     let entity = Arc::make_mut(&mut self.entities[idx]);
-                    let common = match entity {
-                        EntityType::Dimension(d) => {
-                            let base = d.base_mut();
-                            &mut base.common
-                        }
-                        _ => get_common_mut(entity),
-                    };
+                    let common = entity.common_mut();
                     if common.owner_handle.is_null() {
                         common.owner_handle = br_handle;
                     }
@@ -6915,17 +6935,7 @@ impl CadDocument {
         // (code 67 → entity_mode 1), model space otherwise.
         for entity in self.entities.iter_mut() {
             let entity = Arc::make_mut(entity);
-            let common = match entity {
-                EntityType::Dimension(d) => {
-                    let base = d.base_mut();
-                    &mut base.common
-                }
-                _ => {
-                    // For all other entity types, use as_entity_mut().set_handle pattern
-                    // but we need &mut EntityCommon directly — use a helper
-                    get_common_mut(entity)
-                }
-            };
+            let common = entity.common_mut();
             if common.owner_handle.is_null() {
                 common.owner_handle = if common.entity_mode == Some(1) {
                     paper_handle
@@ -6983,32 +6993,36 @@ impl CadDocument {
         self.resolve_table_style_names();
         self.resolve_group_names();
         self.resolve_xrecord_backed_properties();
-        if let Some(s) = self
-            .text_styles
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(&self.header.current_text_style_name))
-        {
-            let is_default_name = self.header.current_text_style_name.eq_ignore_ascii_case("Standard");
+        if let Some(s) = self.text_styles.iter().find(|s| {
+            s.name
+                .eq_ignore_ascii_case(&self.header.current_text_style_name)
+        }) {
+            let is_default_name = self
+                .header
+                .current_text_style_name
+                .eq_ignore_ascii_case("Standard");
             let handle_is_valid_custom = !self.header.current_text_style_handle.is_null()
-                && self
-                    .text_styles
-                    .iter()
-                    .any(|t| t.handle == self.header.current_text_style_handle && !t.name.eq_ignore_ascii_case("Standard"));
+                && self.text_styles.iter().any(|t| {
+                    t.handle == self.header.current_text_style_handle
+                        && !t.name.eq_ignore_ascii_case("Standard")
+                });
             if !is_default_name || !handle_is_valid_custom {
                 self.header.current_text_style_handle = s.handle;
             }
         }
-        if let Some(s) = self
-            .dim_styles
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(&self.header.current_dimstyle_name))
-        {
-            let is_default_name = self.header.current_dimstyle_name.eq_ignore_ascii_case("Standard");
+        if let Some(s) = self.dim_styles.iter().find(|s| {
+            s.name
+                .eq_ignore_ascii_case(&self.header.current_dimstyle_name)
+        }) {
+            let is_default_name = self
+                .header
+                .current_dimstyle_name
+                .eq_ignore_ascii_case("Standard");
             let handle_is_valid_custom = !self.header.current_dimstyle_handle.is_null()
-                && self
-                    .dim_styles
-                    .iter()
-                    .any(|d| d.handle == self.header.current_dimstyle_handle && !d.name.eq_ignore_ascii_case("Standard"));
+                && self.dim_styles.iter().any(|d| {
+                    d.handle == self.header.current_dimstyle_handle
+                        && !d.name.eq_ignore_ascii_case("Standard")
+                });
             if !is_default_name || !handle_is_valid_custom {
                 self.header.current_dimstyle_handle = s.handle;
             }
@@ -7063,60 +7077,6 @@ impl CadDocument {
                 }
             }
         }
-    }
-}
-
-/// Helper to get a mutable reference to EntityCommon for non-Dimension entities.
-fn get_common_mut(entity: &mut EntityType) -> &mut EntityCommon {
-    match entity {
-        EntityType::Point(e) => &mut e.common,
-        EntityType::Line(e) => &mut e.common,
-        EntityType::Circle(e) => &mut e.common,
-        EntityType::Arc(e) => &mut e.common,
-        EntityType::Ellipse(e) => &mut e.common,
-        EntityType::Polyline(e) => &mut e.common,
-        EntityType::Polyline2D(e) => &mut e.common,
-        EntityType::Polyline3D(e) => &mut e.common,
-        EntityType::LwPolyline(e) => &mut e.common,
-        EntityType::Text(e) => &mut e.common,
-        EntityType::MText(e) => &mut e.common,
-        EntityType::Spline(e) => &mut e.common,
-        EntityType::Helix(e) => &mut e.common,
-        EntityType::Dimension(d) => &mut d.base_mut().common,
-        EntityType::Hatch(e) => &mut e.common,
-        EntityType::Solid(e) => &mut e.common,
-        EntityType::Face3D(e) => &mut e.common,
-        EntityType::Insert(e) => &mut e.common,
-        EntityType::Block(e) => &mut e.common,
-        EntityType::BlockEnd(e) => &mut e.common,
-        EntityType::Ray(e) => &mut e.common,
-        EntityType::XLine(e) => &mut e.common,
-        EntityType::Viewport(e) => &mut e.common,
-        EntityType::AttributeDefinition(e) => &mut e.common,
-        EntityType::AttributeEntity(e) => &mut e.common,
-        EntityType::Leader(e) => &mut e.common,
-        EntityType::MultiLeader(e) => &mut e.common,
-        EntityType::MLine(e) => &mut e.common,
-        EntityType::Mesh(e) => &mut e.common,
-        EntityType::RasterImage(e) => &mut e.common,
-        EntityType::Solid3D(e) => &mut e.common,
-        EntityType::Region(e) => &mut e.common,
-        EntityType::Body(e) => &mut e.common,
-        EntityType::Surface(e) => &mut e.common,
-        EntityType::Table(e) => &mut e.common,
-        EntityType::Tolerance(e) => &mut e.common,
-        EntityType::PolyfaceMesh(e) => &mut e.common,
-        EntityType::Wipeout(e) => &mut e.common,
-        EntityType::Shape(e) => &mut e.common,
-        EntityType::Underlay(e) => &mut e.common,
-        EntityType::Light(e) => &mut e.common,
-        EntityType::SectionSymbol(e) => &mut e.common,
-        EntityType::ViewBorder(e) => &mut e.common,
-        EntityType::Seqend(e) => &mut e.common,
-        EntityType::Ole2Frame(e) => &mut e.common,
-        EntityType::PolygonMesh(e) => &mut e.common,
-        EntityType::Extended(e) => &mut e.common,
-        EntityType::Unknown(e) => &mut e.common,
     }
 }
 

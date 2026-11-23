@@ -405,6 +405,8 @@ pub(super) fn class_header(bits: &mut Bits) -> Option<u8> {
 /// element count.
 struct Section2 {
     start_station: f64,
+    /// The track gauge (rail alignments).
+    gauge: f64,
     /// The 7 criteria bits after the start station.
     criteria_at: usize,
     count_at: usize,
@@ -430,7 +432,7 @@ fn section2_with(data: &[u8], start: usize, end: usize, run: usize) -> Option<Se
     let criteria_at = bits.pos;
     bits.pos += 7;
     // The track gauge (0 unless the superelevation type is cant), one bit.
-    bits.bit_double()?;
+    let gauge = bits.bit_double()?;
     bits.bit()?;
     bits.bit_long()?;
     // The element list must follow: the RECOVER/AUDIT layout reads through
@@ -444,7 +446,7 @@ fn section2_with(data: &[u8], start: usize, end: usize, run: usize) -> Option<Se
         _ => element_list_at(data, bits.pos, end).is_some(),
     };
     listed.then_some(())?;
-    Some(Section2 { start_station, criteria_at, count_at: bits.pos })
+    Some(Section2 { start_station, gauge, criteria_at, count_at: bits.pos })
 }
 
 /// Design elements found in a main stream, keyed by their own ids.
@@ -1191,13 +1193,24 @@ fn walk_points(start: Vector2, h: f64, k0: f64, k1: f64, length: f64) -> (Vec<Ve
     points.push(start);
     let mut p = start;
     let heading_at = |s: f64| h + k0 * s + (k1 - k0) * s * s / (2.0 * length);
+    let spiral = (k1 - k0).abs() > 1e-12;
+    // Three-point Gauss weights and nodes on a step.
+    let gauss = [(5.0 / 18.0, (1.0 - (0.6f64).sqrt()) / 2.0), (8.0 / 18.0, 0.5), (5.0 / 18.0, (1.0 + (0.6f64).sqrt()) / 2.0)];
     for i in 0..n {
         let (s0, s1) = (i as f64 * ds, (i + 1) as f64 * ds);
-        // The chord of a step is shorter than the step by sinc of half its
-        // turn: exact on an arc, close on a spiral.
-        let half = (heading_at(s1) - heading_at(s0)) / 2.0;
-        let chord = if half.abs() < 1e-12 { ds } else { ds * half.sin() / half };
-        p = p + direction(heading_at((s0 + s1) / 2.0)) * chord;
+        if spiral {
+            // A spiral's step: its direction integrated (the chord along
+            // the middle heading drifts 3e-4 over a 30 m spiral).
+            for (w, t) in gauss {
+                p = p + direction(heading_at(s0 + t * ds)) * (w * ds);
+            }
+        } else {
+            // The chord of an arc's step is shorter than the step by sinc
+            // of half its turn.
+            let half = (heading_at(s1) - heading_at(s0)) / 2.0;
+            let chord = if half.abs() < 1e-12 { ds } else { ds * half.sin() / half };
+            p = p + direction(heading_at((s0 + s1) / 2.0)) * chord;
+        }
         points.push(p);
     }
     (points, h + k0 * length + (k1 - k0) * length / 2.0)
@@ -2743,6 +2756,11 @@ pub(super) fn start_station(data: &[u8], start: usize, end: usize) -> f64 {
     0.0
 }
 
+/// The track gauge of a rail alignment (0 for the other types).
+pub(super) fn track_gauge(data: &[u8], start: usize, end: usize) -> Option<f64> {
+    section2(data, start, end).map(|s| s.gauge)
+}
+
 /// Design Criteria and Constraint Editing check boxes of Alignment
 /// Properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2804,28 +2822,95 @@ pub fn display_station(equations: &[StationEquation], raw: f64) -> f64 {
         .map_or(raw, |e| if e.increasing { e.ahead + (raw - e.raw) } else { e.ahead - (raw - e.raw) })
 }
 
-/// The end of the interval block at `pos` (see [`post_cache_starts`]).
-fn interval_block_end(data: &[u8], pos: usize, end: usize) -> Option<usize> {
+/// A station anchor of an alignment: a station other objects tie to by
+/// its identifier (a profile's start, an offset alignment's region ends,
+/// a corridor region locked to the geometry, the alignment's own design
+/// speeds), with the element it lies on as the alignment held it then.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AlignmentAnchor {
+    pub id: [u8; 16],
+    /// 1 in every sample.
+    pub flag: bool,
+    /// What ties to it: 32763 or 32765 a profile, 6 an offset alignment's
+    /// region end, 2 an offset alignment's own start (its design speed),
+    /// 582 a corridor region locked to the geometry.
+    pub kind: i32,
+    /// 0 in every sample.
+    pub value: f64,
+    pub station: f64,
+    /// Distance from the element's start to the station, and from the
+    /// station to the element's end.
+    pub along: f64,
+    pub remaining: f64,
+    /// The element the station lies on and the elements before and after
+    /// it (0: none).
+    pub element: i32,
+    pub previous: i32,
+    pub next: i32,
+    /// The element's start and end and the point at the station.
+    pub element_start: Vector2,
+    pub element_end: Vector2,
+    pub point: Vector2,
+}
+
+/// The interval block at `pos`:
+///
+/// ```text
+/// BL profiles, BL profile views, BL sample line groups, BL n,
+/// n x { GUID, B, BL kind, BD value, BD station, BD along, BD remaining,
+///       BL element, BL previous, BL next, 2RD element start,
+///       2RD element end, 2RD point }
+/// ```
+///
+/// Returns the anchors, the three counts and the bit after the block.
+pub(super) fn anchors_at(data: &[u8], pos: usize, end: usize) -> Option<(Vec<AlignmentAnchor>, [i32; 3], usize)> {
     let mut bits = Bits::new(data, pos, end);
-    for _ in 0..3 {
-        bits.bit_long()?;
-    }
+    let counts = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
     let k = usize::try_from(bits.bit_long()?).ok()?;
-    // An interval takes at least 529 bits.
+    // An anchor takes at least 529 bits.
     (k <= end.saturating_sub(bits.pos) / 529).then_some(())?;
+    let mut anchors = Vec::with_capacity(k);
     for _ in 0..k {
-        bits.pos += 128;
-        bits.bit()?;
-        bits.bit_long()?;
-        for _ in 0..4 {
-            bits.bit_double()?;
-        }
-        for _ in 0..3 {
-            bits.bit_long()?;
-        }
-        bits.pos += 6 * 64;
+        let id = guid(&mut bits)?;
+        let flag = bits.bit()?;
+        let kind = bits.bit_long()?;
+        let [value, station, along, remaining] = [bits.bit_double()?, bits.bit_double()?, bits.bit_double()?, bits.bit_double()?];
+        let [element, previous, next] = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+        let mut point = || Some(Vector2::new(bits.raw_double()?, bits.raw_double()?));
+        let (element_start, element_end, at) = (point()?, point()?, point()?);
+        anchors.push(AlignmentAnchor {
+            id,
+            flag,
+            kind,
+            value,
+            station,
+            along,
+            remaining,
+            element,
+            previous,
+            next,
+            element_start,
+            element_end,
+            point: at,
+        });
     }
-    (bits.pos < end).then_some(bits.pos)
+    (bits.pos < end).then_some((anchors, counts, bits.pos))
+}
+
+/// The end of the interval block at `pos` (see [`anchors_at`]).
+fn interval_block_end(data: &[u8], pos: usize, end: usize) -> Option<usize> {
+    anchors_at(data, pos, end).map(|(_, _, pos)| pos)
+}
+
+/// The anchors of the record whose interval block is followed by its
+/// equations, speeds and type (see [`post_cache_starts`]).
+pub(super) fn anchors(data: &[u8], start: usize, end: usize) -> Option<Vec<AlignmentAnchor>> {
+    post_cache_starts_at(data, start, end)?
+        .into_iter()
+        .find(|(_, pos)| typed_at(data, *pos, end, f64::MIN, f64::MAX, true).is_some())
+        .and_then(|(block, _)| anchors_at(data, block, end))
+        .map(|(anchors, _, _)| anchors)
 }
 
 /// Where the station equations start, read field by field: the element
@@ -2839,19 +2924,24 @@ fn interval_block_end(data: &[u8], pos: usize, end: usize) -> Option<usize> {
 /// A free arc last has two tail forms; both positions are returned and the
 /// lists after them settle which one holds.
 fn post_cache_starts(data: &[u8], start: usize, end: usize) -> Option<Vec<usize>> {
+    post_cache_starts_at(data, start, end).map(|at| at.into_iter().map(|(_, pos)| pos).collect())
+}
+
+/// [`post_cache_starts`] with the interval block's start before each.
+fn post_cache_starts_at(data: &[u8], start: usize, end: usize) -> Option<Vec<(usize, usize)>> {
     let count_at = section2(data, start, end)?.count_at;
     let mut bits = Bits::new(data, count_at, end);
     let n = usize::try_from(bits.bit_long()?).ok().filter(|n| *n < 10_000)?;
-    let intervals = |pos: usize| interval_block_end(data, pos, end);
+    let intervals = |pos: usize| interval_block_end(data, pos, end).map(|after| (pos, after));
     if n == 0 {
-        return intervals(bits.pos).map(|pos| vec![pos]);
+        return intervals(bits.pos).map(|at| vec![at]);
     }
     let mut at = bits.pos;
     for _ in 1..n {
         at = record_at(data, at, end, false)?.1;
     }
     let (element, body_end) = record_at(data, at, end, true)?;
-    let ends: Vec<usize> = tails(&element.kind)
+    let ends: Vec<(usize, usize)> = tails(&element.kind)
         .iter()
         .filter_map(|tail| {
             let mut b = Bits::new(data, body_end, end);
@@ -2943,6 +3033,181 @@ fn post_cache_at(
     read(pos)
 }
 
+/// [`equations_and_speeds`] with the identifiers of the anchors they tie
+/// to (see [`anchors`]).
+pub(super) fn equations_and_speeds_with_ids(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<(Vec<(StationEquation, [u8; 16])>, Vec<(DesignSpeed, [u8; 16])>)> {
+    let at = post_cache_starts(data, start, end)?.into_iter().find(|pos| post_cache_at(data, *pos, end, first, last, true).is_some())?;
+    let mut bits = Bits::new(data, at, end);
+    let k = bits.bit_long()?;
+    (0..=1000).contains(&k).then_some(())?;
+    let mut equations = Vec::new();
+    for _ in 0..k {
+        (bits.bits_value(2)? == 0 && bits.raw_short_byte()? == 0xBE && bits.raw_short_byte()? == 0x04).then_some(())?;
+        let raw = bits.bit_double()?;
+        let id = guid(&mut bits)?;
+        let (back, ahead) = (bits.bit_double()?, bits.bit_double()?);
+        equations.push((StationEquation { raw, back, ahead, increasing: bits.bit()? }, id));
+    }
+    (bits.bit_long()? == 1).then_some(())?;
+    let n = bits.bit_long()?;
+    (0..=1000).contains(&n).then_some(())?;
+    let mut speeds = Vec::new();
+    for _ in 0..n {
+        (bits.bit_long()? == 1).then_some(())?;
+        let (station, speed) = (bits.bit_double()?, bits.bit_double()?);
+        speeds.push((DesignSpeed { station, speed }, guid(&mut bits)?));
+    }
+    Some((equations, speeds))
+}
+
+/// A critical station of a superelevation curve as stored: its kind (3
+/// begin full super, 4 end full super, 7 level crown, 8 low shoulder
+/// match, 9 reverse crown, 10 manual, ...), its station from the curve's
+/// start (from its end in the ending attainment region), the region and
+/// the cross slopes of the left outside lane, left inside lane, right
+/// outside lane, right inside lane, then the same four shoulders.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CriticalStationData {
+    pub kind: i32,
+    pub offset: f64,
+    pub ending: bool,
+    pub slopes: [f64; 8],
+}
+
+/// A superelevation curve as stored: the curve element it covers and its
+/// critical stations.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SuperelevationCurveData {
+    pub element: i16,
+    pub stations: Vec<CriticalStationData>,
+}
+
+/// The cross segments of a superelevation block in record order: (side 1
+/// left 2 right, 0 outside 1 inside, 1 lane 2 shoulder).
+pub(super) const SUPERELEVATION_SEGMENTS: [(i32, i32, i32); 8] = [(1, 0, 1), (1, 1, 1), (2, 0, 1), (2, 1, 1), (1, 0, 2), (1, 1, 2), (2, 0, 2), (2, 1, 2)];
+
+/// Kind of a manual critical station.
+pub(super) const MANUAL_STATION: i32 = 10;
+
+/// The settings block a superelevation curve with a manual critical
+/// station holds (582 bits, the same in every sample: SE08, SM1 to SM3,
+/// SM5, SM6).
+pub(super) const MANUAL_SETTINGS: (usize, &str) = (582, "00418000002070000004300000010c0000004300000060c00000083000028408cb5781daf15c4a8408cb5781daf15c48070c000001c30000000000000000000c000000000000005300");
+
+/// Whether the next bits are `run` (`(length, hex digits)`), read past it.
+pub(super) fn bits_are(bits: &mut Bits, run: (usize, &str)) -> Option<bool> {
+    let mut same = true;
+    for i in 0..run.0 {
+        let digit = run.1.as_bytes().get(i / 4).and_then(|c| (*c as char).to_digit(16))?;
+        same &= bits.bit()? == (digit >> (3 - i % 4) & 1 == 1);
+    }
+    Some(same)
+}
+
+/// The superelevation curves of a block of the plain form this crate
+/// writes (see the writer's `write_superelevation`): no curve settings
+/// but a manual station's, one unit per critical station and per cross
+/// segment with a slope each, the standard lane table. `None` for any
+/// other block.
+fn plain_superelevation(bits: &mut Bits) -> Option<Vec<SuperelevationCurveData>> {
+    let node = |bits: &mut Bits| -> Option<i16> {
+        let v = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+        (v[0] == v[2] && v[1] == -1 && v[3] == -1).then_some(())?;
+        i16::try_from(v[0]).ok()
+    };
+    (!bits.bit()?).then_some(())?;
+    let n = bits.bit_long()?;
+    (1..=1000).contains(&n).then_some(())?;
+    (!bits.bit()?).then_some(())?;
+    let mut elements = Vec::new();
+    for i in 0..n {
+        elements.push(node(bits)?);
+        (bits.bit_long()? == 0 && !bits.bit()?).then_some(())?;
+        if i + 1 == n {
+            (bits.bit_long()? == n).then_some(())?;
+        }
+        (!bits.bit()?).then_some(())?;
+    }
+    let mut curves = Vec::new();
+    for (i, element) in elements.into_iter().enumerate() {
+        (node(bits)? == element && !bits.bit()? && node(bits)? == element).then_some(())?;
+        // A curve with a manual station holds the settings block.
+        (!bits.bit()?).then_some(())?;
+        let settings = bits.bit()?;
+        if settings {
+            bits_are(bits, MANUAL_SETTINGS)?.then_some(())?;
+        }
+        (bits.bits_value(5)? == 0b00010 && bits.bits_value(5)? == 0b10000).then_some(())?;
+        (bits.bit_long()? == 0).then_some(())?;
+        let k = bits.bit_long()?;
+        (0..=1000).contains(&k).then_some(())?;
+        let mut stations = Vec::new();
+        for _ in 0..k {
+            let fields = |bits: &mut Bits| -> Option<(i32, f64, bool)> {
+                let kind = bits.bit_long()?;
+                let offset = bits.bit_double()?;
+                let region = bits.bit_double()?;
+                (!bits.bit()? && (region == 0.0 || region == 1.0)).then_some((kind, offset, region == 1.0))
+            };
+            (bits.bit_long()? == 3).then_some(())?;
+            let (kind, offset, ending) = fields(bits)?;
+            (node(bits)? == element && bits.bit_long()? == 8).then_some(())?;
+            let mut slopes = [0.0; 8];
+            for (segment, slope) in SUPERELEVATION_SEGMENTS.iter().zip(&mut slopes) {
+                ([bits.bit_long()?, bits.bit_long()?, bits.bit_long()?] == [segment.0, segment.1, segment.2] && bits.bit_long()? == 3).then_some(())?;
+                (fields(bits)? == (kind, offset, ending) && node(bits)? == element && bits.bit_long()? == 0).then_some(())?;
+                *slope = bits.bit_double()?;
+            }
+            stations.push(CriticalStationData { kind, offset, ending, slopes });
+        }
+        (bits.bit_long()? == 0).then_some(())?;
+        if i + 1 < n as usize {
+            (!bits.bit()?).then_some(())?;
+        }
+        (settings == stations.iter().any(|s| s.kind == MANUAL_STATION)).then_some(())?;
+        curves.push(SuperelevationCurveData { element, stations });
+    }
+    for pair in SUPERELEVATION_SEGMENTS.chunks(2) {
+        (bits.bit_long()? == 2).then_some(())?;
+        for s in pair {
+            ([bits.bit_long()?, bits.bit_long()?, bits.bit_long()?] == [s.0, s.1, s.2]).then_some(())?;
+        }
+    }
+    for (i, s) in SUPERELEVATION_SEGMENTS.iter().enumerate() {
+        let tail = |bits: &mut Bits| -> Option<()> {
+            (bits.bit_long()? == 0 && bits.bit_long()? == 0 && bits.bit_double()? == 0.5 && bits.bit_double()? == 1.0).then_some(())?;
+            (!bits.bit()? && bits.bit_long()? == -1 && bits.bit()? && !bits.bit()? && bits.bit_long()? == -1).then_some(())
+        };
+        let head = bits.bit_long()?;
+        (if i == 0 { head == 8 } else { head == 0 && bits.bit_double()? == 0.0 }).then_some(())?;
+        ([bits.bit_long()?, bits.bit_long()?, bits.bit_long()?, bits.bit_long()?] == [s.0, s.1, s.2, 1]).then_some(())?;
+        tail(bits)?;
+        (bits.bit_long()? == 0 && bits.bit_double()? == 0.0 && bits.bit_long()? == 2).then_some(())?;
+        tail(bits)?;
+    }
+    (bits.bit_long()? == 0 && bits.bit_long()? == 0 && bits.bit_long()? == 8).then_some(())?;
+    for _ in 0..24 {
+        bits.bit_long()?;
+    }
+    Some(curves)
+}
+
+/// The superelevation curves of an alignment record of the plain form
+/// (see [`plain_superelevation`]); an empty list when it has no block.
+pub(super) fn superelevation_curves(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<Vec<SuperelevationCurveData>> {
+    let at = post_cache_starts(data, start, end)?.into_iter().find(|pos| typed_at(data, *pos, end, first, last, true).is_some())?;
+    let (_, _, pos) = post_cache_at(data, at, end, first, last, true)?;
+    let mut bits = Bits::new(data, pos, end);
+    bits.bit_double()?;
+    match bits.bit_long()? {
+        0 => Some(Vec::new()),
+        1 => plain_superelevation(&mut bits),
+        _ => None,
+    }
+}
+
 /// What kind of alignment a record is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2951,8 +3216,10 @@ pub enum AlignmentType {
     Offset,
     /// A connected (curb return) alignment between two others.
     CurbReturn,
+    /// Utility (the type the application's interfaces name Utility).
     Miscellaneous,
-    /// A value not seen in a sample (5 is most likely Rail).
+    Rail,
+    /// A value not seen in a sample.
     Other(i32),
 }
 
@@ -2963,6 +3230,7 @@ impl AlignmentType {
             2 => Self::Offset,
             3 => Self::CurbReturn,
             4 => Self::Miscellaneous,
+            5 => Self::Rail,
             other => Self::Other(other),
         }
     }
@@ -3052,7 +3320,8 @@ fn superelevation_entry(bits: &mut Bits, fields: usize) -> Option<()> {
 ///             without a slope), [kind 0: BD slope], BL v
 /// lane table: 4 x { BL n, n x (BL, BL, BL) }, then per lane two entries
 ///             (see [`superelevation_entry`]) with 4 and 1 fields,
-///             BL 0, BL 0, BL n, 2n x BL, RD
+///             BL 0, BL 0, BL n, n x (BL side, BL inside, BL lane)
+///             (the cross segments in name order)
 /// ```
 // ponytail: the 582-bit settings, the 10 bits after them and the 4 lane
 // groups are the same in every sample.
@@ -3121,10 +3390,10 @@ fn superelevation(bits: &mut Bits) -> Option<()> {
     (bits.bit_long()? == 0 && bits.bit_long()? == 0).then_some(())?;
     let n = bits.bit_long()?;
     (0..=64).contains(&n).then_some(())?;
-    for _ in 0..2 * n {
+    for _ in 0..3 * n {
         bits.bit_long()?;
     }
-    bits.raw_double().map(|_| ())
+    Some(())
 }
 
 pub(super) fn alignment_type(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<(AlignmentType, usize)> {
@@ -3827,6 +4096,29 @@ fn reverse_from_circle(
         .map(|(_, from, q, end)| (from, q, end))
 }
 
+/// A superelevation diagram view (`AECC_SUPERELEVATION_DIAGRAM_VIEW`) of
+/// an alignment: its name and the alignment whose superelevation it shows.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SuperelevationView {
+    /// The view's name (`Superelevation View - (1)`, ...).
+    pub name: String,
+    /// The alignment the view shows.
+    pub alignment: u64,
+}
+
+/// A superelevation diagram view's record: its name in the text stream
+/// (third string), then its alignment among its references (a hard
+/// pointer after the record's owner).
+pub(super) fn superelevation_view(strings: &[String], refs: &[(u64, u8)]) -> Option<SuperelevationView> {
+    let alignment = match refs {
+        [(.., 4), (alignment, 5), ..] => *alignment,
+        _ => return None,
+    };
+    (alignment != 0).then_some(())?;
+    Some(SuperelevationView { name: strings.get(2)?.clone(), alignment })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3844,7 +4136,6 @@ mod tests {
         };
         let node = format!("{}{}{}{}", bl(2), bl(-1), bl(2), bl(-1));
         let bd50 = format!("00{}", 50.0f64.to_le_bytes().iter().map(|b| format!("{b:08b}")).collect::<String>());
-        let rd = 3.26f64.to_le_bytes().iter().map(|b| format!("{b:08b}")).collect::<String>();
         let s = [
             // B, one curve, B; its entry: node, BL 0, B, BL 1, B.
             format!("0{}0", bl(1)),
@@ -3855,8 +4146,9 @@ mod tests {
             format!("{}{bd50}10 0", bl(10)),
             format!("{node}{}10 {}{}{} {}{}{bd50}10 0", bl(0), bl(1), bl(0), bl(1), bl(3), bl(10)),
             format!("{node}{}10 {}", bl(0), bl(0)),
-            // The lane table: 4 empty groups, BL 0, BL 0, BL 0, RD.
-            format!("{}{}{}{} {}{}{} {rd}", bl(0), bl(0), bl(0), bl(0), bl(0), bl(0), bl(0)),
+            // The lane table: 4 empty groups, BL 0, BL 0, BL 0 (no cross
+            // segments).
+            format!("{}{}{}{} {}{}{}", bl(0), bl(0), bl(0), bl(0), bl(0), bl(0), bl(0)),
         ]
         .concat();
         let s: Vec<u8> = s.bytes().filter(|b| *b == b'0' || *b == b'1').collect();
@@ -3886,13 +4178,13 @@ mod tests {
             }
             format!("{e}{}{}{}{} 0{}10{}", bl(0), bl(0), bd(0.5), "01", bl(-1), bl(-1))
         };
-        let rd = 3.26f64.to_le_bytes().iter().map(|b| format!("{b:08b}")).collect::<String>();
         let s = [
             format!("0{}1 0", bl(0)),
             format!("{}{}{}{} {}{}{}", bl(1), bl(1), bl(0), bl(1), bl(0), bl(0), bl(0)),
             entry(8, &[1, 0, 1, 1]),
             entry(0, &[2]),
-            format!("{}{}{}{}{} {rd}", bl(0), bl(0), bl(1), bl(1), bl(1)),
+            // BL 0, BL 0, one cross segment (side 1, inside 0, lane 1).
+            format!("{}{}{}{}{}{}", bl(0), bl(0), bl(1), bl(1), bl(0), bl(1)),
         ]
         .concat();
         let s: Vec<u8> = s.bytes().filter(|b| *b == b'0' || *b == b'1').collect();

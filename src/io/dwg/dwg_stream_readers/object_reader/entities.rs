@@ -920,6 +920,7 @@ pub fn read_proxy_entity(
         payload,
         text_payload,
         object_ids,
+        dxf_data: Vec::new(),
     })
 }
 
@@ -4185,7 +4186,7 @@ pub fn read_table(
         unknown_short = reader.read_bit_short();
         horizontal_direction = reader.read_3bit_double();
 
-        if reader.read_bit_long() == 1 {
+        if reader.read_bit_long() != 0 {
             break_options = reader.read_bit_long();
             break_flow_direction = reader.read_bit_long();
             break_spacing = reader.read_bit_double();
@@ -4847,7 +4848,7 @@ pub fn read_multileader(
     crate::io::leader_codes::dwg(
         reader,
         text_attachment_point,
-        &[1, 2, 3],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9],
         "read_multileader.text_attachment_point",
     );
     let scale_factor = reader.read_bit_double();
@@ -5061,7 +5062,7 @@ pub(crate) fn read_multileader_annotation_context(
             crate::io::leader_codes::dwg(
                 reader,
                 code,
-                &[1, 2, 3],
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
                 "read_multileader_annotation_context.TextAttachmentPointType",
             )
         });

@@ -14,9 +14,15 @@ use super::tree::{ensure_profile_tree, KEY_PROFILE_STYLES};
 /// Bits of a profile record after its identifier.
 const TAIL: usize = 107;
 /// The 107 bits after a profile's identifier, the same in every sample
-/// (WR01 to WR09), ending with the version word.
-// ponytail: not split into fields; name them once a profile varies them.
+/// (WR01 to WR09), ending with the version word: `PRE`, `BD 0`, `MID`,
+/// four empty lists (`BL 0`), `END` (an offset profile fills them, see
+/// [`OffsetTail`]).
 const TAIL_BITS: &str = "10001111111100001111000000000000000010100001000000010100000001101010100000000110001010100001011111000000100";
+// ponytail: the constant runs are not split into fields; name them once a
+// profile varies them.
+const PRE: &str = "10001111111100001111000000000000000010";
+const MID: &str = "0001000000010100000001";
+const END: &str = "0000000110001010100001011111000000100";
 
 /// The helper records a profile owns, in the order of its references (and
 /// of the class keys that refer to them).
@@ -78,13 +84,20 @@ fn default_style(doc: &CadDocument) -> Option<u64> {
     read_node(doc, Handle::new(head))?.children.first().map(|c| c.1).filter(|h| *h != 0)
 }
 
-/// The identifier a profile record stores before its last 107 bits, a
-/// version-4 GUID (the alignment lists its profiles by it).
+/// The identifier a profile record stores after its entities, a
+/// version-4 GUID (the alignment lists its profiles by it): before its
+/// last 107 bits (`TAIL_BITS`), or, after a longer tail (an offset
+/// profile's), where the reader finds it.
 pub(super) fn identifier(doc: &CadDocument, profile: u64) -> Option<[u8; 16]> {
     let EntityType::Extended(x) = doc.get_entity(Handle::new(profile))? else { return None };
     let ExtendedEntityData::Arch(a) = &x.data else { return None };
     (a.dxf_name == "AECC_PROFILE").then_some(())?;
     let (data, start, end) = a.main_stream()?;
+    let bit = |p: usize| data[p / 8] >> (7 - p % 8) & 1;
+    let fixed = end >= start + TAIL && TAIL_BITS.bytes().enumerate().all(|(i, c)| bit(end - TAIL + i) == c - b'0');
+    if !fixed {
+        return super::super::profile::after_entities(data, start, end).map(|(id, _)| id);
+    }
     let at = end.checked_sub(TAIL + 128).filter(|at| *at >= start)?;
     let mut id = [0u8; 16];
     for (i, byte) in id.iter_mut().enumerate() {
@@ -130,6 +143,16 @@ pub enum VerticalCurve {
     Asymmetric { before: f64, after: f64 },
     /// A free circular curve of this radius.
     Circular(f64),
+    /// A free symmetric parabola of this K value (length per percent of
+    /// grade change), of this radius, or through this point (station,
+    /// elevation).
+    ParabolaK(f64),
+    ParabolaRadius(f64),
+    ParabolaThrough(Vector2),
+    /// A free circular curve of this horizontal length, or through this
+    /// point.
+    CircularLength(f64),
+    CircularThrough(Vector2),
 }
 
 impl VerticalCurve {
@@ -137,20 +160,36 @@ impl VerticalCurve {
         self != VerticalCurve::None
     }
 
-    /// The stations it takes before and after its PVI between the grades
-    /// `g1` and `g2`, `None` when its values are not positive.
-    fn reach(self, g1: f64, g2: f64) -> Option<(f64, f64)> {
+    /// The stations it takes before and after its PVI `pvi` between the
+    /// grades `g1` and `g2`, `None` when its values are not positive or no
+    /// such curve passes its point.
+    fn reach(self, pvi: Vector2, g1: f64, g2: f64) -> Option<(f64, f64)> {
         let positive = |v: f64| (v.is_finite() && v > 0.0).then_some(v);
+        let parabola = |l: f64| positive(l).map(|l| (l / 2.0, l / 2.0));
+        let circular = |r: f64| {
+            let (a1, a2) = (g1.atan(), g2.atan());
+            let t = positive(r)? * ((a2 - a1).abs() / 2.0).tan();
+            Some((t * a1.cos(), t * a2.cos()))
+        };
+        // The unit grades' vertical parts: a circular curve's horizontal
+        // length is its radius times their difference.
+        let rise = |g: f64| g / (1.0 + g * g).sqrt();
         match self {
             VerticalCurve::None => Some((0.0, 0.0)),
-            VerticalCurve::Parabola(l) => positive(l).map(|l| (l / 2.0, l / 2.0)),
+            VerticalCurve::Parabola(l) => parabola(l),
+            VerticalCurve::ParabolaK(k) => parabola(positive(k)? * 100.0 * (g2 - g1).abs()),
+            VerticalCurve::ParabolaRadius(r) => parabola(positive(r)? * (g2 - g1).abs()),
+            VerticalCurve::ParabolaThrough(p) => parabola(super::super::profile::parabola_length_through(pvi, g1, g2, p)?),
             VerticalCurve::Asymmetric { before, after } => Some((positive(before)?, positive(after)?)),
-            VerticalCurve::Circular(r) => {
-                let (a1, a2) = (g1.atan(), g2.atan());
-                let t = positive(r)? * ((a2 - a1).abs() / 2.0).tan();
-                Some((t * a1.cos(), t * a2.cos()))
-            }
+            VerticalCurve::Circular(r) => circular(r),
+            VerticalCurve::CircularLength(l) => circular(positive(l)? / (rise(g1) - rise(g2)).abs()),
+            VerticalCurve::CircularThrough(p) => circular(super::super::profile::circle_through(pvi, g1, g2, p)?),
         }
+    }
+
+    /// Whether the record names it a parabola (one more text each).
+    fn parabola(self) -> bool {
+        matches!(self, VerticalCurve::Parabola(_) | VerticalCurve::ParabolaK(_) | VerticalCurve::ParabolaRadius(_) | VerticalCurve::ParabolaThrough(_))
     }
 }
 
@@ -159,6 +198,71 @@ impl VerticalCurve {
 enum Part {
     Tangent(Vector2, Vector2),
     Curve { curve: VerticalCurve, crest: bool },
+    /// A fixed or floating parabola (an entity of its own).
+    Fixed(ProfileEntity),
+}
+
+/// One entity of a profile laid out entity by entity (station, elevation
+/// points; grades as ratios).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProfileEntity {
+    /// A fixed tangent.
+    Tangent { start: Vector2, end: Vector2 },
+    /// A fixed symmetric parabola through three points (start, middle, end).
+    ParabolaThreePoints { start: Vector2, middle: Vector2, end: Vector2 },
+    /// A fixed symmetric parabola between two points with its grade at the
+    /// start (or at the end).
+    ParabolaTwoPointsGrade { start: Vector2, end: Vector2, grade: f64, at_end: bool },
+    /// A fixed symmetric parabola between two points with a K value.
+    ParabolaTwoPointsK { start: Vector2, end: Vector2, k: f64, crest: bool },
+    /// A fixed symmetric parabola between two points with a radius.
+    ParabolaTwoPointsRadius { start: Vector2, end: Vector2, radius: f64, crest: bool },
+    /// A floating symmetric parabola that leaves the entity before it and
+    /// ends at a point, with a K value or its grade at the point.
+    FloatingParabolaK { end: Vector2, k: f64, crest: bool },
+    FloatingParabolaGrade { end: Vector2, grade: f64 },
+    /// A floating tangent that leaves the parabola before it towards a
+    /// point.
+    FloatingTangent { through: Vector2 },
+    /// A free tangent touching the parabolas before and after it.
+    FreeTangent,
+}
+
+impl ProfileEntity {
+    /// Its prefix and constraint codes.
+    fn codes(self) -> (u32, i32) {
+        match self {
+            ProfileEntity::Tangent { .. } => (2, 0),
+            ProfileEntity::ParabolaThreePoints { .. } => (6, 11),
+            ProfileEntity::ParabolaTwoPointsGrade { .. } => (6, 12),
+            ProfileEntity::ParabolaTwoPointsK { .. } | ProfileEntity::ParabolaTwoPointsRadius { .. } => (6, 13),
+            ProfileEntity::FloatingParabolaK { .. } => (6, 32),
+            ProfileEntity::FloatingParabolaGrade { .. } => (6, 34),
+            ProfileEntity::FloatingTangent { .. } => (2, 4),
+            ProfileEntity::FreeTangent => (2, 9),
+        }
+    }
+
+    fn valid(self) -> bool {
+        let p = |v: Vector2| v.x.is_finite() && v.y.is_finite();
+        let k = |v: f64| v.is_finite() && v > 0.0;
+        match self {
+            ProfileEntity::Tangent { start, end } => p(start) && p(end) && start.x < end.x,
+            ProfileEntity::ParabolaThreePoints { start, middle, end } => p(start) && p(middle) && p(end) && start.x < middle.x && middle.x < end.x,
+            ProfileEntity::ParabolaTwoPointsGrade { start, end, grade, .. } => p(start) && p(end) && start.x < end.x && grade.is_finite(),
+            ProfileEntity::ParabolaTwoPointsK { start, end, k: v, .. } | ProfileEntity::ParabolaTwoPointsRadius { start, end, radius: v, .. } => p(start) && p(end) && start.x < end.x && k(v),
+            ProfileEntity::FloatingParabolaK { end, k: v, .. } => p(end) && k(v),
+            ProfileEntity::FloatingParabolaGrade { end, grade } => p(end) && grade.is_finite(),
+            ProfileEntity::FloatingTangent { through } => p(through),
+            ProfileEntity::FreeTangent => true,
+        }
+    }
+
+    /// A parabola (fixed or floating), which a floating or free tangent
+    /// can touch.
+    fn parabola(self) -> bool {
+        self.codes().0 == 6
+    }
 }
 
 /// The entities through `pvis`: the tangents (ids 1..n in station order)
@@ -193,6 +297,31 @@ fn parts(pvis: &[Vector2], curves: &[VerticalCurve]) -> Vec<(i32, i32, i32, Part
     out
 }
 
+/// The source of a profile sampled from a surface: the surface, the
+/// offset from the alignment and the stations it samples between, and
+/// whether they are the alignment's own (`whole`).
+struct Sampled {
+    surface: u64,
+    offset: f64,
+    range: (f64, f64),
+    whole: bool,
+}
+
+/// What an offset profile's record holds besides its entities (see
+/// [`add_offset_profile`]).
+struct OffsetTail {
+    slope: f64,
+    offset: f64,
+    parent_length: f64,
+    /// For each source entity (by id) the entities copied from it.
+    map: Vec<(i32, Vec<i32>)>,
+    /// The parent's anchors at the source's start and end.
+    anchors: [(f64, [u8; 16]); 2],
+    /// Its companion and its source.
+    feature: u64,
+    source: u64,
+}
+
 /// The profile record.
 ///
 /// ```text
@@ -218,29 +347,50 @@ fn parts(pvis: &[Vector2], curves: &[VerticalCurve]) -> Vec<(i32, i32, i32, Part
 /// Written with the PVIs and curves of WR01, WR02 and WR10 to WR13, the
 /// records equal the samples' bit for bit apart from the geometry stamp
 /// and the identifier.
+///
+/// An offset profile (OP01, OP02, OB01): `BL 0x00025F04`; three more keys
+/// (`0x0100FF46` BL 0 after `0x0300FB05`, `0x0D00FF48` BL 4095 after
+/// `0x0400FE09`, `0x0200FF40` BD slope last); 65 zero bits, `BD 2.25`, 7
+/// bits `0111010` in place of the 63 bits, BD and 9 bits; `BL 0x102`,
+/// `BD 0, BD 0, BD 30, BD 0, BD offset, 3 x BS 0` in place of `BL 0,
+/// BD 0, BD 0, BD 30, 5 x BS 0`; the tail's lists filled (see
+/// `profile::after_entities`); references 8 and 9 its companion, 15 the
+/// source profile (soft).
 #[allow(clippy::too_many_arguments)]
 fn write_profile(doc: &mut CadDocument, common: EntityCommon, name: &str, parts: &[(i32, i32, i32, Part)], helpers: &[Handle; 7], style: u64, alignment: Handle, id: &[u8; 16]) -> Result<Handle, DxfError> {
+    write_profile_of(doc, common, name, parts, helpers, style, alignment, id, None, None)
+}
+
+/// [`write_profile`]; with `sampled` a profile sampled from a surface (no
+/// entities): after the 9 bits, `BL 7` (0x47 for stations other than the
+/// alignment's), `BD start, BD end, BD 30, BD offset`, 12 bits
+/// `101011000010`, then `2 bits 10`, a zero identifier and the tail; the
+/// surface is the reference after the alignment (soft pointer; WS11 to
+/// WS15).
+#[allow(clippy::too_many_arguments)]
+fn write_profile_of(doc: &mut CadDocument, common: EntityCommon, name: &str, parts: &[(i32, i32, i32, Part)], helpers: &[Handle; 7], style: u64, alignment: Handle, id: &[u8; 16], sampled: Option<&Sampled>, offset: Option<&OffsetTail>) -> Result<Handle, DxfError> {
     let byte = |w: &mut DwgMergedWriter, v: u8| bits(w, &format!("{v:08b}"));
+    let feature = offset.map_or(0, |o| o.feature);
     let mut refs: Vec<Ref> = helpers.iter().map(|h| Ref(DwgReferenceType::HardOwnership, h.value())).collect();
-    refs.extend([soft_pointer(0), hard_pointer(0), hard_pointer(0), soft_pointer(0), hard_pointer(style), hard_pointer(alignment.value()), soft_pointer(0), hard_pointer(0), soft_pointer(0), soft_pointer(0)]);
+    refs.extend([soft_pointer(0), hard_pointer(feature), hard_pointer(feature), soft_pointer(0), hard_pointer(style), hard_pointer(alignment.value()), soft_pointer(sampled.map_or(0, |s| s.surface)), hard_pointer(0), soft_pointer(offset.map_or(0, |o| o.source)), soft_pointer(0)]);
     let mut strings = vec!["AeccImpVAlignment".to_string(), String::new(), String::new()];
     strings.extend(KEYS.iter().filter_map(|(_, k)| match k {
         Key::Text(t) => Some(t.to_string()),
         _ => None,
     }));
     strings.push(name.to_string());
-    let parabolas = parts.iter().filter(|p| matches!(p.3, Part::Curve { curve: VerticalCurve::Parabola(_), .. })).count();
+    let parabolas = parts.iter().filter(|p| matches!(p.3, Part::Curve { curve, .. } if curve.parabola()) || matches!(p.3, Part::Fixed(e) if e.codes().0 == 6)).count();
     strings.extend((0..4 + parabolas).map(|_| String::new()));
     put_entity(
         doc,
         "AECC_PROFILE",
         common,
         |w| {
-            for v in [80, 0, 80, 80, 0, 0x1002_5F04] {
+            for v in [80, 0, 80, 80, 0, if offset.is_some() { 0x0002_5F04 } else { 0x1002_5F04 }] {
                 w.write_bit_long(v);
             }
             bits(w, "010101");
-            byte(w, KEYS.len() as u8);
+            byte(w, KEYS.len() as u8 + if offset.is_some() { 3 } else { 0 });
             for (key, value) in &KEYS {
                 w.write_bit_long(*key as i32);
                 match value {
@@ -252,16 +402,51 @@ fn write_profile(doc: &mut CadDocument, common: EntityCommon, name: &str, parts:
                         }
                     }
                 }
+                if offset.is_some() {
+                    match key {
+                        0x0300_FB05 => {
+                            w.write_bit_long(0x0100_FF46);
+                            w.write_bit_long(0);
+                        }
+                        0x0400_FE09 => {
+                            w.write_bit_long(0x0D00_FF48);
+                            w.write_bit_long(0xFFF);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(o) = offset {
+                w.write_bit_long(0x0200_FF40);
+                w.write_bit_double(o.slope);
             }
             bl_byte(w, 0);
-            bits(w, &"0".repeat(63));
-            w.write_bit_double(2.0);
-            bits(w, "011011010");
-            w.write_bit_long(0);
-            for v in [0.0, 0.0, 30.0] {
+            if offset.is_some() {
+                bits(w, &"0".repeat(65));
+                w.write_bit_double(2.25);
+                bits(w, "0111010");
+            } else {
+                bits(w, &"0".repeat(63));
+                w.write_bit_double(2.0);
+                bits(w, "011011010");
+            }
+            if let Some(s) = sampled {
+                w.write_bit_long(if s.whole { 7 } else { 0x47 });
+                for v in [s.range.0, s.range.1, 30.0, s.offset] {
+                    w.write_bit_double(v);
+                }
+                bits(w, "101011000010");
+                bits(w, "10");
+                w.write_bytes(&[0; 16]);
+                bits(w, TAIL_BITS);
+                return;
+            }
+            // `BD 0` and `BS 0` share their bits.
+            w.write_bit_long(if offset.is_some() { 0x102 } else { 0 });
+            for v in [0.0, 0.0, 30.0, 0.0, offset.map_or(0.0, |o| o.offset)] {
                 w.write_bit_double(v);
             }
-            for _ in 0..5 {
+            for _ in 0..3 {
                 w.write_bit_short(0);
             }
             bits(w, "0000001000");
@@ -270,32 +455,115 @@ fn write_profile(doc: &mut CadDocument, common: EntityCommon, name: &str, parts:
                 let (prefix, constraint) = match part {
                     Part::Tangent(..) => (2, 0),
                     Part::Curve { curve: VerticalCurve::Circular(_), .. } => (4, 9),
+                    Part::Curve { curve: VerticalCurve::CircularLength(_), .. } => (4, 0),
+                    Part::Curve { curve: VerticalCurve::CircularThrough(_), .. } => (4, 7),
                     Part::Curve { curve: VerticalCurve::Asymmetric { .. }, .. } => (8, 10),
+                    Part::Curve { curve: VerticalCurve::ParabolaK(_), .. } => (6, 2),
+                    Part::Curve { curve: VerticalCurve::ParabolaRadius(_), .. } => (6, 9),
+                    Part::Curve { curve: VerticalCurve::ParabolaThrough(_), .. } => (6, 7),
                     Part::Curve { .. } => (6, 0),
+                    Part::Fixed(e) => e.codes(),
                 };
                 bits(w, &format!("{prefix:011b}{:023b}", 0x08 << 13));
                 for v in [constraint, *id, *previous, *next] {
                     w.write_bit_long(v);
                 }
                 match part {
-                    Part::Tangent(a, b) => {
+                    Part::Tangent(a, b) | Part::Fixed(ProfileEntity::Tangent { start: a, end: b }) => {
                         for v in [a.x, a.y, b.x, b.y] {
                             w.write_raw_double(v);
                         }
                         bits(w, "0000");
                     }
+                    // A floating tangent: its point, then 4 bits; a free
+                    // tangent: the 4 bits only (PF02).
+                    Part::Fixed(ProfileEntity::FloatingTangent { through }) => {
+                        w.write_raw_double(through.x);
+                        w.write_raw_double(through.y);
+                        bits(w, "0000");
+                    }
+                    Part::Fixed(ProfileEntity::FreeTangent) => bits(w, "0000"),
+                    Part::Fixed(e) => {
+                        // BL 0, the points and values, then BL 0, 3 bits
+                        // 010 and no minimum K (WE01 to WE08).
+                        let point = |w: &mut DwgMergedWriter, p: Vector2| {
+                            w.write_raw_double(p.x);
+                            w.write_raw_double(p.y);
+                        };
+                        w.write_bit_long(0);
+                        match *e {
+                            ProfileEntity::ParabolaThreePoints { start, middle, end } => {
+                                for p in [start, middle, end] {
+                                    point(w, p);
+                                }
+                            }
+                            ProfileEntity::ParabolaTwoPointsGrade { start, end, grade, at_end } => {
+                                point(w, start);
+                                point(w, end);
+                                w.write_bit_long(i32::from(at_end));
+                                w.write_bit_double(grade * 100.0);
+                            }
+                            // The value word: 0x2000 a K value, 0x2002 a radius.
+                            ProfileEntity::ParabolaTwoPointsK { start, end, k: value, crest } | ProfileEntity::ParabolaTwoPointsRadius { start, end, radius: value, crest } => {
+                                point(w, start);
+                                point(w, end);
+                                w.write_bit_long(if crest { 0x1001 } else { 0x1000 });
+                                w.write_bit_long(if matches!(*e, ProfileEntity::ParabolaTwoPointsK { .. }) { 0x2000 } else { 0x2002 });
+                                w.write_bit_double(value);
+                            }
+                            ProfileEntity::FloatingParabolaK { end, k, crest } => {
+                                point(w, end);
+                                w.write_bit_long(if crest { 0x1001 } else { 0x1000 });
+                                w.write_bit_long(0x2000);
+                                w.write_bit_double(k);
+                            }
+                            ProfileEntity::FloatingParabolaGrade { end, grade } => {
+                                point(w, end);
+                                w.write_bit_long(1);
+                                w.write_bit_double(grade * 100.0);
+                            }
+                            ProfileEntity::Tangent { .. } | ProfileEntity::FloatingTangent { .. } | ProfileEntity::FreeTangent => {}
+                        }
+                        w.write_bit_long(0);
+                        bits(w, "010");
+                        for _ in 0..3 {
+                            w.write_bit_double(-1.0);
+                        }
+                    }
                     Part::Curve { curve, crest } => match *curve {
-                        VerticalCurve::Parabola(length) => {
-                            w.write_bit_long(1);
-                            w.write_bit_double(length);
-                            w.write_bit_long(if *crest { 0x1001 } else { 0x1000 });
+                        VerticalCurve::Parabola(_) | VerticalCurve::ParabolaK(_) | VerticalCurve::ParabolaRadius(_) | VerticalCurve::ParabolaThrough(_) => {
+                            // A length opens with BL 1, a K value or radius
+                            // with BL 0; a point has no crest flag.
+                            match *curve {
+                                VerticalCurve::Parabola(v) => {
+                                    w.write_bit_long(1);
+                                    w.write_bit_double(v);
+                                }
+                                VerticalCurve::ParabolaK(v) | VerticalCurve::ParabolaRadius(v) => {
+                                    w.write_bit_long(0);
+                                    w.write_bit_double(v);
+                                }
+                                VerticalCurve::ParabolaThrough(p) => {
+                                    w.write_bit_long(0);
+                                    w.write_raw_double(p.x);
+                                    w.write_raw_double(p.y);
+                                }
+                                _ => {}
+                            }
+                            if !matches!(curve, VerticalCurve::ParabolaThrough(_)) {
+                                w.write_bit_long(if *crest { 0x1001 } else { 0x1000 });
+                            }
                             w.write_bit_long(0);
                             bits(w, "010");
                             for _ in 0..3 {
                                 w.write_bit_double(-1.0);
                             }
                         }
-                        VerticalCurve::Circular(radius) => w.write_bit_double(radius),
+                        VerticalCurve::Circular(v) | VerticalCurve::CircularLength(v) => w.write_bit_double(v),
+                        VerticalCurve::CircularThrough(p) => {
+                            w.write_raw_double(p.x);
+                            w.write_raw_double(p.y);
+                        }
                         VerticalCurve::Asymmetric { before, after } => {
                             w.write_bit_double(before);
                             w.write_bit_double(after);
@@ -306,10 +574,46 @@ fn write_profile(doc: &mut CadDocument, common: EntityCommon, name: &str, parts:
             }
             bits(w, "10");
             w.write_bytes(id);
-            bits(w, TAIL_BITS);
+            write_tail(w, offset);
         },
         Body { refs, strings },
     )
+}
+
+/// The profile's tail after its identifier (see [`OffsetTail`]): equal to
+/// `TAIL_BITS` without an offset.
+fn write_tail(w: &mut DwgMergedWriter, offset: Option<&OffsetTail>) {
+    bits(w, PRE);
+    w.write_bit_double(offset.map_or(0.0, |o| o.slope));
+    bits(w, MID);
+    let Some(o) = offset else {
+        for _ in 0..4 {
+            w.write_bit_long(0);
+        }
+        bits(w, END);
+        return;
+    };
+    w.write_bit_long(1);
+    for v in [o.slope, 0.0, o.parent_length, 0.0, 0.0] {
+        w.write_bit_double(v);
+    }
+    for v in [2, 0, 0, 0, o.map.len() as i32] {
+        w.write_bit_long(v);
+    }
+    for (source, ids) in &o.map {
+        for v in [*source, -1, ids.len() as i32] {
+            w.write_bit_long(v);
+        }
+        for id in ids {
+            w.write_bit_long(*id);
+        }
+    }
+    w.write_bit_long(2);
+    for (station, id) in &o.anchors {
+        w.write_bit_double(*station);
+        w.write_bytes(id);
+    }
+    bits(w, END);
 }
 
 /// The helper records a profile owns: each the version word and `BL 0`
@@ -360,7 +664,7 @@ pub fn add_profile_with_curves(doc: &mut CadDocument, alignment: Handle, name: &
     let grade = |i: usize| (pvis[i + 1].y - pvis[i].y) / (pvis[i + 1].x - pvis[i].x);
     let mut reach = Vec::with_capacity(curves.len());
     for (j, c) in curves.iter().enumerate() {
-        let r = c.reach(grade(j), grade(j + 1)).ok_or_else(|| invalid("a vertical curve needs positive values"))?;
+        let r = c.reach(pvis[j + 1], grade(j), grade(j + 1)).ok_or_else(|| invalid("a vertical curve needs positive values (or a point it can pass)"))?;
         if c.is_some() && grade(j) == grade(j + 1) {
             return Err(invalid("a curve's grades are equal"));
         }
@@ -395,6 +699,226 @@ pub fn add_profile_with_curves(doc: &mut CadDocument, alignment: Handle, name: &
         ..EntityCommon::default()
     };
     write_profile(doc, common, name, &parts(pvis, curves), &helpers, style, alignment, &id)
+}
+
+/// Adds a layout profile `name` to `alignment` made entity by entity
+/// (`entities` in station order: fixed tangents, fixed parabolas by three
+/// points, by two points and a grade or K, floating parabolas that leave
+/// the entity before them, floating tangents that leave the parabola
+/// before them towards a point, free tangents between two parabolas), on
+/// `layer` (layer "0" when `None`). The ids
+/// follow the order given and each entity is linked to its neighbours in
+/// it. The alignment must be one this crate writes.
+pub fn add_profile_entities(doc: &mut CadDocument, alignment: Handle, name: &str, entities: &[ProfileEntity], layer: Option<&str>) -> Result<Handle, DxfError> {
+    if name.is_empty() || entities.is_empty() || entities.iter().any(|e| !e.valid()) {
+        return Err(invalid("a profile needs a name and valid entities"));
+    }
+    if matches!(entities[0], ProfileEntity::FloatingParabolaK { .. } | ProfileEntity::FloatingParabolaGrade { .. }) {
+        return Err(invalid("a floating parabola needs an entity before it"));
+    }
+    // A floating tangent leaves a parabola; a free tangent sits between two.
+    for (i, e) in entities.iter().enumerate() {
+        let parabola = |j: Option<usize>| j.and_then(|j| entities.get(j)).is_some_and(|e| e.parabola());
+        let ok = match e {
+            ProfileEntity::FloatingTangent { .. } => parabola(i.checked_sub(1)),
+            ProfileEntity::FreeTangent => parabola(i.checked_sub(1)) && parabola(Some(i + 1)),
+            _ => true,
+        };
+        if !ok {
+            return Err(invalid("a floating tangent needs a parabola before it, a free tangent one on each side"));
+        }
+    }
+    let n = entities.len() as i32;
+    let parts: Vec<(i32, i32, i32, Part)> = entities.iter().enumerate().map(|(i, e)| {
+        let id = i as i32 + 1;
+        (id, id - 1, if id == n { 0 } else { id + 1 }, Part::Fixed(*e))
+    }).collect();
+    let (written, before) = rewritable(doc, alignment, |h| identifier(doc, h)).ok_or_else(|| invalid("the alignment is not one this crate writes"))?;
+    let layer = layer.unwrap_or("0");
+    let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
+    ensure_profile_tree(doc)?;
+    let style = default_style(doc).ok_or_else(|| invalid("drawing has no profile styles"))?;
+    let handle = doc.allocate_handle();
+    let id = new_identifier(handle.value());
+    let mut profiles: Vec<ProfileRef> = before.iter().map(|p| ProfileRef { handle: p.handle, id: p.id }).collect();
+    profiles.push(ProfileRef { handle: handle.value(), id });
+    rewrite(doc, alignment, written, &before, &profiles)?;
+    let helpers = write_helpers(doc, handle)?;
+    let common = EntityCommon {
+        handle,
+        owner_handle: doc.header.model_space_block_handle,
+        layer: layer.into(),
+        layer_handle: Some(layer_handle),
+        ..EntityCommon::default()
+    };
+    write_profile(doc, common, name, &parts, &helpers, style, alignment, &id)
+}
+
+/// Adds a profile `name` of `alignment` sampled from the TIN surface
+/// `surface` at `offset` from the alignment (negative to the left), between
+/// the stations `range` (the alignment's whole length when `None`), on
+/// `layer` (layer "0" when `None`). The record holds no elevations: the
+/// application samples the surface when it opens the drawing. The alignment
+/// is written again with the profile in its list (no anchor).
+pub fn add_surface_profile(doc: &mut CadDocument, alignment: Handle, surface: Handle, name: &str, offset: f64, range: Option<(f64, f64)>, layer: Option<&str>) -> Result<Handle, DxfError> {
+    if name.is_empty() || !offset.is_finite() {
+        return Err(invalid("a surface profile needs a name and a finite offset"));
+    }
+    if !matches!(doc.get_entity(surface), Some(EntityType::Extended(x)) if matches!(&x.data, ExtendedEntityData::Arch(a) if a.dxf_name == "AECC_TIN_SURFACE")) {
+        return Err(invalid("surface not found"));
+    }
+    let (written, before) = rewritable(doc, alignment, |h| identifier(doc, h)).ok_or_else(|| invalid("the alignment is not one this crate writes"))?;
+    let length = super::alignment::length_of(&written.elements).ok_or_else(|| invalid("the alignment cannot be solved"))?;
+    let whole = range.is_none();
+    let range = range.unwrap_or((0.0, length));
+    if !(range.0.is_finite() && range.1.is_finite() && range.0 >= 0.0 && range.0 < range.1 && range.1 <= length + 1e-9 * length.max(1.0)) {
+        return Err(invalid("the stations must run forward within the alignment"));
+    }
+    let layer = layer.unwrap_or("0");
+    let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
+    ensure_profile_tree(doc)?;
+    let style = default_style(doc).ok_or_else(|| invalid("drawing has no profile styles"))?;
+    let handle = doc.allocate_handle();
+    // The profile is listed without an anchor: its identifier is zero.
+    let mut profiles: Vec<ProfileRef> = before.iter().map(|p| ProfileRef { handle: p.handle, id: p.id }).collect();
+    profiles.push(ProfileRef { handle: handle.value(), id: [0; 16] });
+    rewrite(doc, alignment, written, &before, &profiles)?;
+    let helpers = write_helpers(doc, handle)?;
+    let common = EntityCommon {
+        handle,
+        owner_handle: doc.header.model_space_block_handle,
+        layer: layer.into(),
+        layer_handle: Some(layer_handle),
+        ..EntityCommon::default()
+    };
+    let sampled = Sampled { surface: surface.value(), offset, range, whole };
+    write_profile_of(doc, common, name, &[], &helpers, style, alignment, &[0; 16], Some(&sampled), None)
+}
+
+/// Anchor kinds of an offset profile's start and end on the parent (the
+/// application wrote 221 and 9 for the start in two samples; it accepts
+/// either).
+const OFFSET_START_ANCHOR: i32 = 9;
+const OFFSET_END_ANCHOR: i32 = 0;
+
+/// The entities of an offset profile copied from `source` (link order: id,
+/// kind, points at the start, middle station and end; tangents and
+/// symmetric parabolas only), each cut where `map` (parent stations to the
+/// offset alignment's, see `offset_station_map`) changes and moved to the
+/// offset alignment's stations, raised by `rise`. Returns the entities in
+/// station order and, by source id, the ids (1 up, in station order) made
+/// from each.
+fn offset_entities(source: &[(i32, crate::classes::civil::ProfilePiece, [Vector2; 3])], map: &[[f64; 4]], rise: f64) -> Option<(Vec<ProfileEntity>, Vec<(i32, Vec<i32>)>)> {
+    use crate::classes::civil::ProfilePiece;
+    let tol = 1e-9 * map.last()?[1].abs().max(1.0);
+    let at = |s: f64| -> Option<f64> {
+        let m = map.iter().find(|m| s >= m[0] - tol && s <= m[1] + tol)?;
+        Some(m[2] + (s - m[0]) * (m[3] - m[2]) / (m[1] - m[0]))
+    };
+    let mut entities = Vec::new();
+    let mut ids: Vec<(i32, Vec<i32>)> = Vec::new();
+    for (id, piece, [a, m, b]) in source {
+        // Elevation along the entity: its line, or the parabola through its
+        // three points.
+        let z = |x: f64| match piece {
+            ProfilePiece::Tangent => a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x),
+            _ => {
+                let l = |p: Vector2, q: Vector2, r: Vector2| (x - q.x) * (x - r.x) / ((p.x - q.x) * (p.x - r.x)) * p.y;
+                l(*a, *m, *b) + l(*m, *a, *b) + l(*b, *a, *m)
+            }
+        };
+        if !matches!(piece, ProfilePiece::Tangent | ProfilePiece::Parabola) {
+            return None;
+        }
+        let mut cuts = vec![a.x];
+        cuts.extend(map.iter().map(|m| m[0]).filter(|s| *s > a.x + tol && *s < b.x - tol));
+        cuts.push(b.x);
+        let mut made = Vec::new();
+        for w in cuts.windows(2) {
+            let p = |x: f64| -> Option<Vector2> { Some(Vector2::new(at(x)?, z(x) + rise)) };
+            entities.push(match piece {
+                ProfilePiece::Tangent => ProfileEntity::Tangent { start: p(w[0])?, end: p(w[1])? },
+                _ => ProfileEntity::ParabolaThreePoints { start: p(w[0])?, middle: p((w[0] + w[1]) / 2.0)?, end: p(w[1])? },
+            });
+            made.push(entities.len() as i32);
+        }
+        ids.push((*id, made));
+    }
+    ids.sort_by_key(|e| e.0);
+    Some((entities, ids))
+}
+
+/// Adds an offset profile `name` on `offset_alignment` copied from
+/// `source`, a profile of the offset alignment's parent, raised by `slope`
+/// times the offset (the application's "by slope" offset profile), on
+/// `layer` (layer "0" when `None`). Like the application it copies the
+/// source's entities as fixed tangents and fixed parabolas by three
+/// points, cut where the offset alignment's elements change, and ties it
+/// to the source and the offset alignment by an action in the drawing's
+/// associative network; the parent gets anchors at the source's start and
+/// end.
+///
+/// The offset alignment must be one this crate writes with one region and
+/// no widenings, the source a profile of tangents and symmetric parabolas
+/// within the stations the offset alignment follows.
+pub fn add_offset_profile(doc: &mut CadDocument, source: Handle, offset_alignment: Handle, name: &str, slope: f64, layer: Option<&str>) -> Result<Handle, DxfError> {
+    if name.is_empty() || !slope.is_finite() {
+        return Err(invalid("an offset profile needs a name and a finite slope"));
+    }
+    let (parent, map) = super::alignment::offset_station_map(doc, offset_alignment).ok_or_else(|| invalid("the offset alignment needs one region without widenings"))?;
+    let arch = |h: Handle| match doc.get_entity(h) {
+        Some(EntityType::Extended(x)) => match &x.data {
+            ExtendedEntityData::Arch(a) => Some(a),
+            _ => None,
+        },
+        _ => None,
+    };
+    let src = arch(source).filter(|a| a.dxf_name == "AECC_PROFILE").ok_or_else(|| invalid("source profile not found"))?;
+    if src.typed_handles().get(12).map(|r| r.0) != Some(parent) {
+        return Err(invalid("the source is not a profile of the offset alignment's parent"));
+    }
+    let (data, start, end) = src.main_stream().ok_or_else(|| invalid("source profile cannot be read"))?;
+    let points = super::super::profile::entity_points(data, start, end).filter(|p| !p.is_empty()).ok_or_else(|| invalid("source profile cannot be solved"))?;
+    let offset = arch(offset_alignment).and_then(|a| a.alignment_offset_parameters()).map(|o| o.offset).ok_or_else(|| invalid("offset alignment not found"))?;
+    let parent_length = arch(Handle::new(parent)).and_then(|a| super::alignment::length_of(&a.alignment_elements()?)).ok_or_else(|| invalid("the parent cannot be solved"))?;
+    let (first, last) = (points[0].2[0].x, points[points.len() - 1].2[2].x);
+    let (entities, ids) = offset_entities(&points, &map, slope * offset.abs()).ok_or_else(|| invalid("the source must have tangents and symmetric parabolas within the offset alignment's stations"))?;
+    let (written, before) = rewritable(doc, offset_alignment, |h| identifier(doc, h)).ok_or_else(|| invalid("the offset alignment is not one this crate writes"))?;
+    let layer = layer.unwrap_or("0");
+    let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
+    ensure_profile_tree(doc)?;
+    let style = default_style(doc).ok_or_else(|| invalid("drawing has no profile styles"))?;
+    let handle = doc.allocate_handle();
+    let id = new_identifier(handle.value());
+    let anchors = [(first, new_identifier(handle.value() ^ 1)), (last, new_identifier(handle.value() ^ 2))];
+    super::alignment::add_anchors(doc, Handle::new(parent), OFFSET_START_ANCHOR, &[(anchors[0].1, anchors[0].0)])?;
+    super::alignment::add_anchors(doc, Handle::new(parent), OFFSET_END_ANCHOR, &[(anchors[1].1, anchors[1].0)])?;
+    let mut profiles: Vec<ProfileRef> = before.iter().map(|p| ProfileRef { handle: p.handle, id: p.id }).collect();
+    profiles.push(ProfileRef { handle: handle.value(), id });
+    rewrite(doc, offset_alignment, written, &before, &profiles)?;
+    let helpers = write_helpers(doc, handle)?;
+    let feature = super::alignment::add_profile_companion(doc, handle)?;
+    let n = entities.len() as i32;
+    let parts: Vec<(i32, i32, i32, Part)> = entities.iter().enumerate().map(|(i, e)| {
+        let id = i as i32 + 1;
+        (id, id - 1, if id == n { 0 } else { id + 1 }, Part::Fixed(*e))
+    }).collect();
+    let common = EntityCommon {
+        handle,
+        owner_handle: doc.header.model_space_block_handle,
+        layer: layer.into(),
+        layer_handle: Some(layer_handle),
+        ..EntityCommon::default()
+    };
+    let tail = OffsetTail { slope, offset, parent_length, map: ids, anchors, feature: feature.value(), source: source.value() };
+    write_profile_of(doc, common, name, &parts, &helpers, style, offset_alignment, &id, None, Some(&tail))?;
+    use super::assoc::{add_action, ActionBody, Dependency};
+    add_action(
+        doc,
+        ActionBody { dxf: "AECC_ASSOC_OFFSET_VALIGNMENT_ACTION_BODY", refs: vec![handle], tail: "" },
+        &[Dependency { object: source, writes: false, order: 0 }, Dependency { object: offset_alignment, writes: false, order: 0 }, Dependency { object: handle, writes: true, order: 0 }],
+    )?;
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -478,8 +1002,8 @@ mod tests {
             let want: Vec<u8> = id.iter().flat_map(|b| (0..8).rev().map(move |k| b >> k & 1)).collect();
             bits.windows(128).position(|w| w == want.as_slice())
         };
-        // Newest first.
-        assert!(find(&ids[1]).unwrap() < find(&ids[0]).unwrap());
+        // The anchors are stored in identifier order.
+        assert_eq!(find(&ids[0]).unwrap() < find(&ids[1]).unwrap(), ids[0] < ids[1]);
         // A record that is not an alignment is refused.
         let mut doc = back;
         assert!(add_profile(&mut doc, p1, "P3", &v, &[0.0], None).is_err());
@@ -528,5 +1052,176 @@ mod tests {
         // reference application starts it (station 42.6636).
         assert!((pieces[0].1.last().unwrap().x - 42.663_583_344).abs() < 1e-6);
         assert!((pieces[3].1[0].x - 92.0).abs() < 1e-9 && (pieces[3].1.last().unwrap().x - 112.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn curves_by_k_radius_length_and_point_read_back() {
+        let v = Vector2::new;
+        let mut doc = CadDocument::new();
+        doc.version = DxfVersion::AC1032;
+        let al = crate::classes::civil::add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(100.0, 0.0)], None).unwrap();
+        let pvis = [v(0.0, 10.0), v(50.0, 20.0), v(100.0, 15.0)];
+        // A point no parabola at the PVI passes is refused.
+        assert!(add_profile_with_curves(&mut doc, al, "X", &pvis, &[VerticalCurve::ParabolaThrough(v(50.0, 30.0))], None).is_err());
+        let curves = [
+            (VerticalCurve::ParabolaK(0.5), (42.5, 57.5)),
+            (VerticalCurve::ParabolaRadius(50.0), (42.5, 57.5)),
+            (VerticalCurve::ParabolaThrough(v(50.0, 18.0)), (70.0 / 3.0, 230.0 / 3.0)),
+            (VerticalCurve::CircularLength(15.0), (42.554880987, 57.554880987)),
+            (VerticalCurve::CircularThrough(v(50.0, 18.0)), (23.673140622, 76.714991262)),
+        ];
+        let handles: Vec<Handle> = curves.iter().map(|(c, _)| add_profile_with_curves(&mut doc, al, "P", &pvis, &[*c], None).unwrap()).collect();
+        let path = std::env::temp_dir().join(format!("civil-profile-curve-kinds-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        for (h, (_, (from, to))) in handles.iter().zip(&curves) {
+            let pieces = match back.get_entity(*h) {
+                Some(crate::entities::EntityType::Extended(x)) => match &x.data {
+                    crate::entities::ExtendedEntityData::Arch(a) => a.profile_pieces(),
+                    _ => panic!(),
+                },
+                _ => panic!(),
+            };
+            let curve = &pieces[1].1;
+            assert!((curve[0].x - from).abs() < 1e-6 && (curve[curve.len() - 1].x - to).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn surface_profiles_name_their_surface() {
+        let v = Vector2::new;
+        let mut doc = CadDocument::new();
+        doc.version = DxfVersion::AC1032;
+        let al = crate::classes::civil::add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(100.0, 0.0)], None).unwrap();
+        let pts = [(0.0, -10.0), (100.0, -10.0), (0.0, 10.0), (100.0, 10.0)].map(|(x, y)| crate::types::Vector3::new(x, y, 5.0));
+        let s = crate::classes::civil::add_tin_surface(&mut doc, "S1", &pts, None).unwrap();
+        assert!(add_surface_profile(&mut doc, al, al, "X", 0.0, None, None).is_err());
+        assert!(add_surface_profile(&mut doc, al, s, "X", 0.0, Some((50.0, 150.0)), None).is_err());
+        let eg = add_surface_profile(&mut doc, al, s, "EG", 5.0, Some((10.0, 90.0)), None).unwrap();
+        let path = std::env::temp_dir().join(format!("civil-surface-profile-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let arch = |h: Handle| match back.get_entity(h) {
+            Some(EntityType::Extended(x)) => match &x.data {
+                ExtendedEntityData::Arch(a) => a.clone(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        let p = arch(eg);
+        assert_eq!(p.profile_name().as_deref(), Some("EG"));
+        let refs = p.typed_handles();
+        assert_eq!((refs[12].0, refs[13].0), (al.value(), s.value()));
+        // Listed by the alignment without an anchor.
+        let a = arch(al);
+        assert!(a.typed_handles().iter().any(|r| r.0 == eg.value()));
+        assert!(a.alignment_anchors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_radius_parabola_reads_back_as_its_k() {
+        // A radius of 500 is a K of 5 (grades in percent).
+        let v = Vector2::new;
+        let mut doc = CadDocument::new();
+        doc.version = DxfVersion::AC1032;
+        let al = crate::classes::civil::add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(100.0, 0.0)], None).unwrap();
+        let k = add_profile_entities(&mut doc, al, "K", &[ProfileEntity::ParabolaTwoPointsK { start: v(0.0, 10.0), end: v(50.0, 11.0), k: 5.0, crest: true }], None).unwrap();
+        let r = add_profile_entities(&mut doc, al, "R", &[ProfileEntity::ParabolaTwoPointsRadius { start: v(0.0, 10.0), end: v(50.0, 11.0), radius: 500.0, crest: true }], None).unwrap();
+        let pieces = |h: Handle| match doc.get_entity(h) {
+            Some(EntityType::Extended(x)) => match &x.data {
+                ExtendedEntityData::Arch(a) => a.profile_pieces(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        let (a, b) = (pieces(k), pieces(r));
+        assert_eq!(a.len(), 1);
+        assert!(a[0].1.iter().zip(&b[0].1).all(|(p, q)| p.distance(q) < 1e-9));
+    }
+
+    #[test]
+    fn fixed_and_floating_parabolas_read_back() {
+        let v = Vector2::new;
+        let mut doc = CadDocument::new();
+        doc.version = DxfVersion::AC1032;
+        let al = crate::classes::civil::add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(100.0, 0.0)], None).unwrap();
+        let t1 = ProfileEntity::Tangent { start: v(0.0, 10.0), end: v(40.0, 18.0) };
+        assert!(add_profile_entities(&mut doc, al, "X", &[ProfileEntity::FloatingParabolaGrade { end: v(60.0, 19.0), grade: -0.1 }], None).is_err());
+        let three = add_profile_entities(&mut doc, al, "P3", &[t1, ProfileEntity::ParabolaThreePoints { start: v(40.0, 18.0), middle: v(50.0, 19.5), end: v(60.0, 19.0) }, ProfileEntity::Tangent { start: v(60.0, 19.0), end: v(100.0, 15.0) }], None).unwrap();
+        let floating = add_profile_entities(&mut doc, al, "FK", &[t1, ProfileEntity::FloatingParabolaK { end: v(60.0, 19.0), k: 0.5, crest: true }], None).unwrap();
+        let path = std::env::temp_dir().join(format!("civil-profile-entities-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let pieces = |h: Handle| match back.get_entity(h) {
+            Some(EntityType::Extended(x)) => match &x.data {
+                ExtendedEntityData::Arch(a) => a.profile_pieces(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        let p = pieces(three);
+        assert_eq!(p.len(), 3);
+        assert!(p[1].1[0].distance(&v(40.0, 18.0)) < 1e-9 && p[2].1[0].distance(&v(60.0, 19.0)) < 1e-9);
+        // The floating parabola leaves the tangent where its K brings it:
+        // L = K * 100 * |g2 - g1| with the grade at its end.
+        let p = pieces(floating);
+        assert!((p[1].1[0].x - 42.679491924).abs() < 1e-6);
+    }
+
+    #[test]
+    fn offset_profiles_copy_their_source_cut_at_the_offset_elements() {
+        use crate::classes::civil::{add_alignment_with_curves, add_offset_alignment, VertexCurve};
+        let v = Vector2::new;
+        let mut doc = CadDocument::new();
+        doc.version = DxfVersion::AC1032;
+        let al = add_alignment_with_curves(&mut doc, "AL1", &[v(0.0, 0.0), v(100.0, 0.0), v(200.0, 50.0)], &[VertexCurve::Arc(80.0)], None).unwrap();
+        let fg = add_profile(&mut doc, al, "FG", &[v(0.0, 10.0), v(85.0, 15.0), v(200.0, 13.0)], &[30.0], None).unwrap();
+        let off = add_offset_alignment(&mut doc, al, "OFF", -10.0, None, None).unwrap();
+        let op = add_offset_profile(&mut doc, fg, off, "OP", 0.02, None).unwrap();
+        let path = std::env::temp_dir().join(format!("acadrust_offset_profile_{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let EntityType::Extended(x) = back.get_entity(op).unwrap() else { panic!() };
+        let ExtendedEntityData::Arch(a) = &x.data else { panic!() };
+        // The parabola crossing the arc's start is cut in two (OB01).
+        let o = a.profile_offset().unwrap();
+        assert_eq!((o.source, o.slope, o.offset), (fg.value(), 0.02, -10.0));
+        assert_eq!(o.entity_map, vec![(1, vec![1]), (2, vec![4, 5]), (3, vec![2, 3])]);
+        let pvis = a.profile_pvis();
+        assert!((pvis[0].point.y - 10.2).abs() < 1e-12);
+        assert!((pvis.last().unwrap().point.x - 195.3635239099919).abs() < 1e-9);
+        assert_eq!(x.common.reactors.len(), 1);
+        assert!(identifier(&back, op.value()).is_some());
+    }
+
+    #[test]
+    fn floating_and_free_tangents_touch_their_parabolas() {
+        use crate::classes::civil::ProfilePiece;
+        let mut doc = drawing();
+        let v = Vector2::new;
+        let al = crate::classes::civil::add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(200.0, 0.0)], None).unwrap();
+        let p1 = ProfileEntity::ParabolaThreePoints { start: v(0.0, 10.0), middle: v(25.0, 12.0), end: v(50.0, 11.0) };
+        let p2 = ProfileEntity::ParabolaThreePoints { start: v(120.0, 15.0), middle: v(150.0, 16.0), end: v(180.0, 15.0) };
+        assert!(add_profile_entities(&mut doc, al, "X", &[ProfileEntity::Tangent { start: v(0.0, 10.0), end: v(50.0, 11.0) }, ProfileEntity::FloatingTangent { through: v(150.0, 14.0) }], None).is_err());
+        assert!(add_profile_entities(&mut doc, al, "X", &[p1, ProfileEntity::FreeTangent], None).is_err());
+        let floating = add_profile_entities(&mut doc, al, "P4", &[p1, ProfileEntity::FloatingTangent { through: v(150.0, 14.0) }], None).unwrap();
+        let free = add_profile_entities(&mut doc, al, "P5", &[p1, ProfileEntity::FreeTangent, p2], None).unwrap();
+        let path = std::env::temp_dir().join(format!("civil-profile-tangents-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The tangents leave the parabolas where they touch them (the
+        // application's stations: 25.836 and 22.102 to 134.741).
+        let floating = arch(&back, floating).profile_pieces();
+        assert_eq!(floating.iter().map(|p| p.0).collect::<Vec<_>>(), [ProfilePiece::Parabola, ProfilePiece::Tangent]);
+        assert!((floating[1].1[0].x - 25.836129785405483).abs() < 1e-9);
+        let free = arch(&back, free).profile_pieces();
+        assert_eq!(free.iter().map(|p| p.0).collect::<Vec<_>>(), [ProfilePiece::Parabola, ProfilePiece::Tangent, ProfilePiece::Parabola]);
+        let tangent = &free[1].1;
+        assert!((tangent[0].x - 22.102416604041473).abs() < 1e-9 && (tangent[tangent.len() - 1].x - 134.74121986472957).abs() < 1e-9);
     }
 }

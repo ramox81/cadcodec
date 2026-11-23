@@ -4,7 +4,8 @@
 use super::super::bits::Bits;
 use super::points::{support, Support};
 use super::support::*;
-use crate::classes::civil::CogoPoint;
+use crate::classes::civil::cogo::{CLASSIFICATION_ALL, CLASSIFICATION_NONE};
+use crate::classes::civil::{CogoPoint, PointGroupClassification, PointGroupOverrides};
 use crate::error::DxfError;
 use crate::io::dwg::dwg_stream_writers::DwgMergedWriter;
 use crate::types::{Handle, Vector3};
@@ -69,6 +70,42 @@ pub enum PointQuery {
     /// Points the first query selects (every point when `None`) that the
     /// second does not; neither may be an exclusion itself.
     Excluding(Option<Box<PointQuery>>, Box<PointQuery>),
+    /// A custom query: comparisons joined by AND and OR, grouped by
+    /// parentheses, the first one or group possibly negated.
+    Custom(QueryExpression),
+}
+
+/// A point attribute a custom query compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointAttribute {
+    Number,
+    Elevation,
+    RawDescription,
+    FullDescription,
+    Name,
+}
+
+/// What a custom query compares an attribute with: a point number, an
+/// elevation, or a description or name pattern (`*` any run, `?` one
+/// character, case ignored; equal comparisons only).
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryConstant {
+    Number(u32),
+    Elevation(f64),
+    Pattern(String),
+}
+
+/// A custom point group query. AND binds tighter than OR and NOT tighter
+/// than both, as the application reads them; a NOT may only open the
+/// query (the application refuses `AND NOT` and `OR NOT`), and no
+/// comparison may open or close two parentheses.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryExpression {
+    Compare(PointAttribute, Comparison, QueryConstant),
+    And(Box<QueryExpression>, Box<QueryExpression>),
+    Or(Box<QueryExpression>, Box<QueryExpression>),
+    Not(Box<QueryExpression>),
+    Parens(Box<QueryExpression>),
 }
 
 /// The point attribute a query compares, as its records store it: a node
@@ -115,6 +152,7 @@ impl Constant {
 pub(super) struct Statement {
     include: Option<Criteria>,
     exclude: Option<Criteria>,
+    custom: Option<QueryExpression>,
 }
 
 /// The records of a query: the attribute, the comparison every leaf
@@ -134,15 +172,19 @@ impl PointQuery {
         Ok(match self {
             PointQuery::Excluding(include, exclude) => {
                 let plain = |q: &PointQuery| if matches!(q, PointQuery::Excluding(..)) { Err(invalid("an exclusion cannot hold another")) } else { q.criteria() };
-                Statement { include: include.as_deref().map(plain).transpose()?, exclude: Some(plain(exclude)?) }
+                Statement { include: include.as_deref().map(plain).transpose()?, exclude: Some(plain(exclude)?), custom: None }
             }
-            q => Statement { include: Some(q.criteria()?), exclude: None },
+            PointQuery::Custom(e) => {
+                custom_terms(e)?;
+                Statement { include: None, exclude: None, custom: Some(e.clone()) }
+            }
+            q => Statement { include: Some(q.criteria()?), exclude: None, custom: None },
         })
     }
 
     fn criteria(&self) -> Result<Criteria, DxfError> {
         Ok(match self {
-            PointQuery::Excluding(..) => return Err(invalid("an exclusion is a statement")),
+            PointQuery::Excluding(..) | PointQuery::Custom(_) => return Err(invalid("an exclusion or custom query is a statement")),
             PointQuery::ElevationRange(a, b) => {
                 if !(a.is_finite() && b.is_finite() && a <= b) {
                     return Err(invalid("elevation range needs finite ends, low first"));
@@ -190,6 +232,7 @@ impl PointQuery {
             PointQuery::Names(patterns) => p.name.as_deref().is_some_and(|n| patterns.iter().any(|q| wildcard(q, n))),
             PointQuery::ElevationRange(a, b) => (*a..=*b).contains(&p.position.z),
             PointQuery::Excluding(include, exclude) => include.as_ref().map_or(true, |q| q.selects(p)) && !exclude.selects(p),
+            PointQuery::Custom(e) => e.selects(p),
         }
     }
 }
@@ -219,6 +262,9 @@ const FIRST_GROUP_TAG: u32 = 0x8001_0001;
 /// Bits after a group's extents: the same 164 bits in every group of WP01,
 /// WP08, WP10 and WG01 (`_All Points` and six named groups; the group's
 /// override settings, not mapped field by field).
+/// First text id given to a group's override texts.
+const FIRST_OVERRIDE_TAG: u32 = 0x8004_0001;
+
 const GROUP_TAIL: &str = "10100101010111101010101010100000000000000000000000000000000000000000000000000000000000000000101010000000000000000000000000000000000000000000000000000000000000000010";
 
 /// One group of the point group node: its id, record and name.
@@ -356,7 +402,7 @@ pub(super) fn set_query(doc: &mut CadDocument, title: &str, tag: i32, statement:
 
 /// The query of `_All Points`, `(number > 0)`.
 pub(super) fn all_points_query() -> Statement {
-    Statement { include: Some(Criteria { attribute: &POINT_NUMBER, comparison: Comparison::Greater, constants: vec![Constant::Number(0)] }), exclude: None }
+    Statement { include: Some(Criteria { attribute: &POINT_NUMBER, comparison: Comparison::Greater, constants: vec![Constant::Number(0)] }), exclude: None, custom: None }
 }
 
 /// The bits that close the last node record of the included part when an
@@ -393,6 +439,9 @@ const RANGE_TEXT_ID: i32 = 8;
 /// WP08 and WG01, the elevation, description, name and full description
 /// queries of WQ03 and the exclusion and range queries of WQ04 bit for bit.
 fn write_query(doc: &mut CadDocument, handle: Handle, outer: Handle, tag: i32, title: &str, st: &Statement) -> Result<(), DxfError> {
+    if let Some(e) = &st.custom {
+        return write_custom_query(doc, handle, outer, tag, title, e);
+    }
     let parts: Vec<(&Criteria, bool)> = st.include.iter().map(|c| (c, false)).chain(st.exclude.iter().map(|c| (c, true))).collect();
     let both = parts.len() == 2;
     let byte = |w: &mut DwgMergedWriter, v: u8| bits(w, &format!("{v:08b}"));
@@ -520,10 +569,14 @@ fn read_query(doc: &CadDocument, query: Handle) -> Option<PointQuery> {
     let mut b = Bits::new(data, start, end);
     b.bit_long()?;
     (b.bit_long()? == 0 && b.bit_long()? == 0).then_some(())?;
-    b.skip(5)?;
+    let custom = (0..5).map(|_| b.bit()).collect::<Option<Vec<_>>>()? == [false, true, false, true, false];
     let k = usize::try_from(b.bit_long()?).ok().filter(|k| *k > 0)?;
-    b.skip(7)?;
+    let seven = b.bits_value(7)?;
     let s = o.decode().strings;
+    if custom {
+        (seven == 0).then_some(())?;
+        return read_custom_query(&mut b, s.get(2..2 + k)?, k).map(PointQuery::Custom);
+    }
     let texts = s.get(2..2 + k)?;
     let nodes: Vec<&str> = s.get(2 + k..)?.iter().map(String::as_str).filter(|t| t.starts_with("AeccQueryNode")).collect();
     let (both, mut rest) = match nodes.first()? {
@@ -627,6 +680,113 @@ pub(super) struct Group<'a> {
     pub extents: Option<(Vector3, Vector3)>,
     /// label style, point style, query, database, group node, settings node
     pub refs: [u64; 6],
+    pub settings: GroupSettings,
+}
+
+/// A point group's overrides as its record stores them (see
+/// `cogo::group_record`).
+#[derive(Clone)]
+pub(super) struct GroupSettings {
+    pub flags: u8,
+    pub run: u8,
+    pub elevation: f64,
+    /// Raw description text id and text.
+    pub raw: Option<(i32, String)>,
+    /// Classification word and, for a named one, its name.
+    pub classification: (i32, Option<String>),
+    /// The bits after the classification word.
+    pub rest: String,
+}
+
+impl Default for GroupSettings {
+    fn default() -> Self {
+        GroupSettings { flags: 0, run: 0, elevation: 0.0, raw: None, classification: (CLASSIFICATION_NONE, None), rest: GROUP_TAIL[14..].to_string() }
+    }
+}
+
+/// The settings of a group record of the recent form.
+pub(super) fn group_settings(doc: &CadDocument, group: Handle) -> Option<GroupSettings> {
+    let o = object(doc, group)?;
+    let (data, start, end) = o.main_stream()?;
+    let g = crate::classes::civil::cogo::group_record(data, start, end)?;
+    let t = g.tail?;
+    let strings = o.decode().strings;
+    let own = strings.iter().position(|s| s == "AeccImpPG" || s == "AeccImpAllPointsPG")? + 1;
+    let mut texts = strings.into_iter().skip(own);
+    let raw = if t.raw_tag != 0 { Some((t.raw_tag, texts.next()?)) } else { None };
+    let named = t.classification as u32 & 0x8000_0000 != 0;
+    let classification = (t.classification, if named { Some(texts.next()?) } else { None });
+    let rest = (t.rest..end).map(|i| if data[i / 8] >> (7 - i % 8) & 1 == 1 { '1' } else { '0' }).collect();
+    Some(GroupSettings { flags: g.flags, run: g.run, elevation: t.elevation, raw, classification, rest })
+}
+
+/// A text id for an override text of a group: an id another group uses
+/// for the same text, else one above every override id of the groups.
+fn override_tag(doc: &CadDocument, text: &str) -> i32 {
+    let mut top = FIRST_OVERRIDE_TAG - 1;
+    for h in doc.objects.iter().filter(|(_, o)| matches!(o, crate::objects::ObjectType::Arch(a) if a.dxf_name == "AECC_POINT_PG")).map(|(h, _)| *h) {
+        let Some(s) = group_settings(doc, h) else { continue };
+        for (tag, t) in s.raw.iter().map(|r| (r.0, Some(&r.1))).chain([(s.classification.0, s.classification.1.as_ref())]) {
+            if tag as u32 & 0x8000_0000 == 0 {
+                continue;
+            }
+            if t.is_some_and(|t| t == text) {
+                return tag;
+            }
+            top = top.max(tag as u32);
+        }
+    }
+    (top.max(FIRST_OVERRIDE_TAG - 1) + 1) as i32
+}
+
+/// Sets what point group `group` overrides in its points: styles,
+/// elevation, raw description, lock and classification. The group keeps
+/// its points, query and serial; it must be of the form recent releases
+/// write. A custom classification is named, not checked.
+pub fn set_point_group_overrides(doc: &mut CadDocument, group: Handle, o: &PointGroupOverrides) -> Result<(), DxfError> {
+    let bad = || invalid("point group record cannot be rewritten");
+    if !plain(doc, group) {
+        return Err(bad());
+    }
+    let obj = object(doc, group).ok_or_else(bad)?;
+    let (owner, d) = (obj.owner, obj.decode());
+    let (data, start, end) = obj.main_stream().ok_or_else(bad)?;
+    let rec = crate::classes::civil::cogo::group_record(data, start, end).ok_or_else(bad)?;
+    let tail = rec.tail.ok_or_else(bad)?;
+    let mut settings = group_settings(doc, group).ok_or_else(bad)?;
+    let id = fields_of(obj).and_then(|(x, s0, e0)| Bits::new(x, s0, e0).bit_long()).ok_or_else(bad)?;
+    let all = d.strings.iter().any(|s| s == "AeccImpAllPointsPG");
+    let (name, description) = if all { (None, String::new()) } else { (d.strings.first().cloned(), d.strings.get(1).cloned().unwrap_or_default()) };
+    let mut refs = [0, 1, 2, 3, 4, 5].map(|j| d.handles.get(j).copied().unwrap_or(0));
+    if let Some(h) = o.label_style {
+        refs[0] = h;
+    }
+    if let Some(h) = o.point_style {
+        refs[1] = h;
+    }
+    if o.elevation.is_some_and(|e| !e.is_finite()) {
+        return Err(invalid("override elevation must be finite"));
+    }
+    settings.run = (u8::from(o.label_style.is_some()) << 4) | (u8::from(o.point_style.is_some()) << 3) | (settings.run & 0b110) | u8::from(o.locked);
+    settings.flags = (settings.flags & !3) | (u8::from(o.elevation.is_some()) << 1) | u8::from(o.raw_description.is_some());
+    if let Some(e) = o.elevation {
+        settings.elevation = e;
+    }
+    if let Some(text) = &o.raw_description {
+        let tag = match &settings.raw {
+            Some((tag, t)) if t == text => *tag,
+            _ => override_tag(doc, text),
+        };
+        settings.raw = Some((tag, text.clone()));
+    }
+    settings.classification = match &o.classification {
+        PointGroupClassification::None => (CLASSIFICATION_NONE, None),
+        PointGroupClassification::All => (CLASSIFICATION_ALL, None),
+        PointGroupClassification::Custom(n) if n.trim().is_empty() => return Err(invalid("a classification needs a name")),
+        PointGroupClassification::Custom(n) => (override_tag(doc, n), Some(n.clone())),
+    };
+    let g = Group { id, serial: rec.serial.ok_or_else(bad)?, name: name.as_deref(), description: &description, numbers: rec.numbers, extents: Some(tail.extents), refs, settings };
+    write_group(doc, group, owner, &g)
 }
 
 /// `BL id, BL 0, BL 0` (no override lists or keys), `a` = 0 in its byte
@@ -634,10 +794,13 @@ pub(super) struct Group<'a> {
 /// constant bits, `BD 0`, the extents (min, max) and [`GROUP_TAIL`].
 pub(super) fn write_group(doc: &mut CadDocument, handle: Handle, owner: Handle, g: &Group) -> Result<(), DxfError> {
     let (min, max) = g.extents.unwrap_or((Vector3::new(1e20, 1e20, 1e20), Vector3::new(-1e20, -1e20, -1e20)));
-    let strings = match g.name {
+    let mut strings = match g.name {
         Some(name) => vec![name.to_string(), g.description.to_string(), "AeccImpPG".into()],
         None => vec![String::new(), "AeccImpAllPointsPG".into()],
     };
+    let st = &g.settings;
+    strings.extend(st.raw.iter().map(|r| r.1.clone()));
+    strings.extend(st.classification.1.iter().cloned());
     let mut refs: Vec<Ref> = g.refs.iter().map(|h| hard_pointer(*h)).collect();
     refs.extend([hard_pointer(0), hard_pointer(0)]);
     put_object(
@@ -650,8 +813,11 @@ pub(super) fn write_group(doc: &mut CadDocument, handle: Handle, owner: Handle, 
             w.write_bit_long(g.id);
             w.write_bit_long(0);
             w.write_bit_long(0);
-            bl_byte(w, 0);
-            bits(w, "00000100000");
+            bl_byte(w, st.flags);
+            for i in (0..5).rev() {
+                w.write_bit(st.run >> i & 1 == 1);
+            }
+            bits(w, "100000");
             w.write_bit_long(g.serial);
             w.write_bit_long(g.numbers.len() as i32);
             for n in &g.numbers {
@@ -662,7 +828,10 @@ pub(super) fn write_group(doc: &mut CadDocument, handle: Handle, owner: Handle, 
             for v in [min.x, min.y, min.z, max.x, max.y, max.z] {
                 w.write_bit_double(v);
             }
-            bits(w, GROUP_TAIL);
+            w.write_bit_double(st.elevation);
+            w.write_bit_long(st.raw.as_ref().map_or(0, |r| r.0));
+            w.write_bit_long(st.classification.0);
+            bits(w, &st.rest);
         },
         Body { refs, strings },
     )
@@ -731,7 +900,8 @@ pub(super) fn refresh_groups(doc: &mut CadDocument, s: &Support, points: &[CogoP
         let (numbers, extents) = members(points, &query);
         let refs = [0, 1, 2, 3, 4, 5].map(|j| d.handles.get(j).copied().unwrap_or(0));
         let description = d.strings.get(1).cloned().unwrap_or_default();
-        let g = Group { id: e.id, serial, name: Some(&e.name), description: &description, numbers, extents, refs };
+        let settings = group_settings(doc, e.handle).unwrap_or_default();
+        let g = Group { id: e.id, serial, name: Some(&e.name), description: &description, numbers, extents, refs, settings };
         write_group(doc, e.handle, s.group_node, &g)?;
     }
     Ok(())
@@ -798,5 +968,316 @@ fn write_point_group(doc: &mut CadDocument, s: &Support, handle: Handle, id: i32
     let query = set_query(doc, &format!("Point Group Query - {name}"), id.wrapping_add(1), criteria)?;
     let d = s.defaults;
     let refs = [d.label_style, d.point_style, query.value(), s.database.value(), s.group_node.value(), d.create_settings];
-    write_group(doc, handle, s.group_node, &Group { id, serial, name: Some(name), description, numbers, extents, refs })
+    write_group(doc, handle, s.group_node, &Group { id, serial, name: Some(name), description, numbers, extents, refs, settings: GroupSettings::default() })
+}
+
+/// The attribute's record header, and the attribute a header names.
+fn attribute(a: PointAttribute) -> &'static Attribute {
+    match a {
+        PointAttribute::Number => &POINT_NUMBER,
+        PointAttribute::Elevation => &ELEVATION,
+        PointAttribute::RawDescription => &RAW_DESCRIPTION,
+        PointAttribute::FullDescription => &FULL_DESCRIPTION,
+        PointAttribute::Name => &NAME,
+    }
+}
+
+const ATTRIBUTES: [PointAttribute; 5] = [PointAttribute::Number, PointAttribute::Elevation, PointAttribute::RawDescription, PointAttribute::FullDescription, PointAttribute::Name];
+
+impl QueryExpression {
+    fn selects(&self, p: &CogoPoint) -> bool {
+        match self {
+            QueryExpression::Compare(a, c, v) => match (a, v) {
+                (PointAttribute::Number, QueryConstant::Number(n)) => c.holds(f64::from(p.number), f64::from(*n)),
+                (PointAttribute::Elevation, QueryConstant::Elevation(z)) => c.holds(p.position.z, *z),
+                (PointAttribute::Name, QueryConstant::Pattern(t)) => p.name.as_deref().is_some_and(|n| wildcard(t, n)),
+                (_, QueryConstant::Pattern(t)) => wildcard(t, p.description.as_deref().unwrap_or("")),
+                _ => false,
+            },
+            QueryExpression::And(a, b) => a.selects(p) && b.selects(p),
+            QueryExpression::Or(a, b) => a.selects(p) || b.selects(p),
+            QueryExpression::Not(e) => !e.selects(p),
+            QueryExpression::Parens(e) => e.selects(p),
+        }
+    }
+}
+
+/// One comparison of a custom query as its records store it, in the
+/// order of the query text: what joins it to the one before (0 none, 1
+/// AND, 3 OR; 2 a NOT opening the query) and whether it opens or closes
+/// parentheses.
+#[derive(Clone, Debug, PartialEq)]
+struct Term {
+    attribute: PointAttribute,
+    comparison: Comparison,
+    constant: QueryConstant,
+    joint: u8,
+    open: bool,
+    close: bool,
+}
+
+/// The comparisons of a custom query (an OR under an AND or NOT and an
+/// AND under a NOT are put in parentheses).
+fn custom_terms(e: &QueryExpression) -> Result<Vec<Term>, DxfError> {
+    fn walk(e: &QueryExpression, joint: &mut Option<u8>, open: &mut bool, out: &mut Vec<Term>) -> Result<(), DxfError> {
+        let parens = |e: &QueryExpression| QueryExpression::Parens(Box::new(e.clone()));
+        match e {
+            QueryExpression::Compare(a, c, v) => {
+                let ok = match (a, v) {
+                    (PointAttribute::Number, QueryConstant::Number(n)) => *n <= i32::MAX as u32,
+                    (PointAttribute::Elevation, QueryConstant::Elevation(z)) => z.is_finite(),
+                    (PointAttribute::RawDescription | PointAttribute::FullDescription | PointAttribute::Name, QueryConstant::Pattern(t)) => *c == Comparison::Equal && !t.is_empty() && !t.contains(UNSUPPORTED_PATTERN) && !t.contains('\''),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(invalid("a custom query compares numbers and elevations with numbers, descriptions and names (equal) with patterns"));
+                }
+                let constant = match (a, v) {
+                    (PointAttribute::Name, QueryConstant::Pattern(t)) => QueryConstant::Pattern(t.to_lowercase()),
+                    _ => v.clone(),
+                };
+                out.push(Term { attribute: *a, comparison: *c, constant, joint: joint.take().unwrap_or(0), open: std::mem::take(open), close: false });
+            }
+            QueryExpression::And(a, b) | QueryExpression::Or(a, b) => {
+                let and = matches!(e, QueryExpression::And(..));
+                for (i, x) in [a, b].into_iter().enumerate() {
+                    if i == 1 {
+                        *joint = Some(if and { 1 } else { 3 });
+                    }
+                    match &**x {
+                        QueryExpression::Or(..) if and => walk(&parens(x), joint, open, out)?,
+                        QueryExpression::Not(_) if i == 1 => return Err(invalid("a NOT may only open a custom query")),
+                        _ => walk(x, joint, open, out)?,
+                    }
+                }
+            }
+            QueryExpression::Not(x) => {
+                if !out.is_empty() || joint.is_some() {
+                    return Err(invalid("a NOT may only open a custom query"));
+                }
+                *joint = Some(2);
+                match &**x {
+                    QueryExpression::And(..) | QueryExpression::Or(..) => walk(&parens(x), joint, open, out)?,
+                    _ => walk(x, joint, open, out)?,
+                }
+            }
+            QueryExpression::Parens(x) => {
+                if *open {
+                    return Err(invalid("a custom query comparison opens two parentheses"));
+                }
+                *open = true;
+                let first = out.len();
+                walk(x, joint, open, out)?;
+                let grew = out.len() > first;
+                let last = out.last_mut().filter(|_| grew).ok_or_else(|| invalid("empty parentheses"))?;
+                if last.close {
+                    return Err(invalid("a custom query comparison closes two parentheses"));
+                }
+                last.close = true;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(e, &mut None, &mut false, &mut out)?;
+    if out.iter().filter(|t| t.open).count() != out.iter().filter(|t| t.close).count() {
+        return Err(invalid("custom query parentheses do not pair"));
+    }
+    Ok(out)
+}
+
+/// The expression the comparisons read as: NOT before AND before OR,
+/// left to right (the tree whose nodes the query's texts list).
+fn parse_terms(terms: &[Term]) -> Option<QueryExpression> {
+    fn or(t: &[Term], at: &mut usize) -> Option<QueryExpression> {
+        let mut e = and(t, at)?;
+        while t.get(*at).is_some_and(|x| x.joint == 3) {
+            e = QueryExpression::Or(Box::new(e), Box::new(and(t, at)?));
+        }
+        Some(e)
+    }
+    fn and(t: &[Term], at: &mut usize) -> Option<QueryExpression> {
+        let mut e = unary(t, at)?;
+        while t.get(*at).is_some_and(|x| x.joint == 1) {
+            e = QueryExpression::And(Box::new(e), Box::new(unary(t, at)?));
+        }
+        Some(e)
+    }
+    fn unary(t: &[Term], at: &mut usize) -> Option<QueryExpression> {
+        let x = t.get(*at)?;
+        let e = if x.open {
+            // Parse the group as if it opened the query, then close it.
+            let mut inner: Vec<Term> = t.to_vec();
+            inner[*at].open = false;
+            inner[*at].joint = 0;
+            let mut depth = 0;
+            let depth_end = (*at..t.len()).find(|j| {
+                depth += i32::from(t[*j].open) - i32::from(t[*j].close);
+                depth == 0
+            })?;
+            inner[depth_end].close = false;
+            let mut i = *at;
+            let e = or(&inner[..=depth_end], &mut i)?;
+            (i == depth_end + 1).then_some(())?;
+            *at = i;
+            QueryExpression::Parens(Box::new(e))
+        } else {
+            *at += 1;
+            QueryExpression::Compare(x.attribute, x.comparison, x.constant.clone())
+        };
+        Some(if x.joint == 2 { QueryExpression::Not(Box::new(e)) } else { e })
+    }
+    let mut at = 0;
+    let e = or(terms, &mut at)?;
+    (at == terms.len()).then_some(e)
+}
+
+fn constant_text(c: &QueryConstant) -> String {
+    match c {
+        QueryConstant::Number(n) => n.to_string(),
+        QueryConstant::Elevation(z) => z.to_string(),
+        QueryConstant::Pattern(t) => t.clone(),
+    }
+}
+
+/// Query statement of a custom query (PQ01 to PQ03): after the tag `BL 0,
+/// BL 0`, the bits 01010, `BL` the number of comparisons (byte form) and
+/// seven zero bits; then a record per comparison in the order of the
+/// query text: the attribute's header, its number bit, opens and closes
+/// parentheses, the comparison code byte, the joint byte (0 first, 1 AND,
+/// 3 OR, 2 a NOT opening the query) and seven zero bits; then the leaves
+/// in the same order: header, number bit, attribute id, the constant
+/// (`BL` number, `BD` elevation, none for a pattern) and seven zero bits
+/// but after the last. The texts list the constants, then the expression's
+/// nodes in pre-order (AND, OR; NOT and PARENS each with an empty text;
+/// a comparison as in the standard queries, a pattern after its leaf).
+fn write_custom_query(doc: &mut CadDocument, handle: Handle, outer: Handle, tag: i32, title: &str, e: &QueryExpression) -> Result<(), DxfError> {
+    let terms = custom_terms(e)?;
+    let tree = parse_terms(&terms).ok_or_else(|| invalid("custom query cannot be written"))?;
+    let mut strings = vec![title.to_string(), String::new()];
+    strings.extend(terms.iter().map(|t| constant_text(&t.constant)));
+    fn nodes(e: &QueryExpression, s: &mut Vec<String>) {
+        match e {
+            QueryExpression::Compare(_, c, v) => {
+                s.extend([c.code().1, "AeccQueryNodeATTRID", "", "", "AeccQueryNodeCONST", "", ""].map(String::from));
+                if let QueryConstant::Pattern(t) = v {
+                    s.push(t.clone());
+                }
+            }
+            QueryExpression::And(a, b) | QueryExpression::Or(a, b) => {
+                s.push(if matches!(e, QueryExpression::And(..)) { "AeccQueryNodeAND" } else { "AeccQueryNodeOR" }.into());
+                nodes(a, s);
+                nodes(b, s);
+            }
+            QueryExpression::Not(x) | QueryExpression::Parens(x) => {
+                s.extend([if matches!(e, QueryExpression::Not(_)) { "AeccQueryNodeNOT" } else { "AeccQueryNodePARENS" }.to_string(), String::new()]);
+                nodes(x, s);
+            }
+        }
+    }
+    nodes(&tree, &mut strings);
+    let head = |w: &mut DwgMergedWriter, a: &Attribute| bits(w, &format!("{:03b}{:08b}{}{:03b}", a.value_type, a.flags, "0".repeat(12), a.class));
+    put_object(
+        doc,
+        "AECC_QUERY_STATEMENT",
+        handle,
+        outer,
+        Vec::new(),
+        |w| {
+            w.write_bit_long(tag);
+            w.write_bit_long(0);
+            w.write_bit_long(0);
+            bits(w, "01010");
+            bl_byte(w, terms.len() as u8);
+            bits(w, "0000000");
+            for t in &terms {
+                let a = attribute(t.attribute);
+                head(w, a);
+                w.write_bit(a.number);
+                w.write_bit(t.open);
+                w.write_bit(t.close);
+                bits(w, &format!("{:08b}{:08b}0000000", t.comparison.code().0, t.joint));
+            }
+            for (i, t) in terms.iter().enumerate() {
+                let a = attribute(t.attribute);
+                head(w, a);
+                w.write_bit(a.number);
+                w.write_bit_long(a.id);
+                match &t.constant {
+                    QueryConstant::Number(n) => w.write_bit_long(*n as i32),
+                    QueryConstant::Elevation(z) => w.write_bit_double(*z),
+                    QueryConstant::Pattern(_) => {}
+                }
+                if i + 1 < terms.len() {
+                    bits(w, "0000000");
+                }
+            }
+        },
+        Body { refs: Vec::new(), strings },
+    )
+}
+
+/// A custom query's expression from its records (after the head) and its
+/// constant texts.
+fn read_custom_query(b: &mut Bits, texts: &[String], k: usize) -> Option<QueryExpression> {
+    let header = |b: &mut Bits| -> Option<PointAttribute> {
+        let (value_type, flags) = (b.bits_value(3)?, b.bits_value(8)?);
+        (b.bits_value(8)? == 0 && b.bits_value(4)? == 0).then_some(())?;
+        let class = b.bits_value(3)?;
+        ATTRIBUTES.into_iter().find(|a| {
+            let x = attribute(*a);
+            (x.value_type, x.flags, x.class) == (value_type, flags, class)
+        })
+    };
+    let mut terms = Vec::with_capacity(k);
+    for _ in 0..k {
+        let a = header(b)?;
+        (b.bit()? == attribute(a).number).then_some(())?;
+        let (open, close) = (b.bit()?, b.bit()?);
+        let code = b.bits_value(8)?;
+        let joint = b.bits_value(8)?;
+        (b.bits_value(7)? == 0 && [0, 1, 2, 3].contains(&joint)).then_some(())?;
+        let comparison = Comparison::ALL.into_iter().find(|c| c.code().0 == code)?;
+        terms.push(Term { attribute: a, comparison, constant: QueryConstant::Number(0), joint, open, close });
+    }
+    for (i, t) in terms.iter_mut().enumerate() {
+        (header(b)? == t.attribute && b.bit()? == attribute(t.attribute).number && b.bit_long()? == attribute(t.attribute).id).then_some(())?;
+        t.constant = match t.attribute {
+            PointAttribute::Number => QueryConstant::Number(u32::try_from(b.bit_long()?).ok()?),
+            PointAttribute::Elevation => QueryConstant::Elevation(b.bit_double()?),
+            _ => QueryConstant::Pattern(texts.get(i)?.clone()),
+        };
+        if i + 1 < k {
+            (b.bits_value(7)? == 0).then_some(())?;
+        }
+    }
+    parse_terms(&terms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A custom query's comparisons in text order with their joints and
+    /// parentheses, and the tree its texts list (PQ01 C8, PQ02 D2).
+    #[test]
+    fn custom_queries_read_as_the_application_parses_them() {
+        let cmp = |a, c, v| QueryExpression::Compare(a, c, v);
+        let n = |c, v| cmp(PointAttribute::Number, c, QueryConstant::Number(v));
+        let z = |c, v| cmp(PointAttribute::Elevation, c, QueryConstant::Elevation(v));
+        // n <= 3 OR (n >= 8 AND z < 100): the AND is put in parentheses.
+        let e = QueryExpression::Or(Box::new(n(Comparison::LessOrEqual, 3)), Box::new(QueryExpression::Parens(Box::new(QueryExpression::And(Box::new(n(Comparison::GreaterOrEqual, 8)), Box::new(z(Comparison::Less, 100.0)))))));
+        let t = custom_terms(&e).unwrap();
+        assert_eq!(t.iter().map(|t| (t.joint, t.open, t.close)).collect::<Vec<_>>(), vec![(0, false, false), (3, true, false), (1, false, true)]);
+        assert_eq!(parse_terms(&t).unwrap(), e);
+        // NOT n = 3 AND z > 23 reads (NOT n = 3) AND z > 23.
+        let e = QueryExpression::And(Box::new(QueryExpression::Not(Box::new(n(Comparison::Equal, 3)))), Box::new(z(Comparison::Greater, 23.0)));
+        let t = custom_terms(&e).unwrap();
+        assert_eq!(t.iter().map(|t| t.joint).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(parse_terms(&t).unwrap(), e);
+        // An OR under an AND gets parentheses; AND NOT is refused.
+        let e = QueryExpression::And(Box::new(n(Comparison::Equal, 1)), Box::new(QueryExpression::Or(Box::new(n(Comparison::Equal, 2)), Box::new(n(Comparison::Equal, 3)))));
+        assert_eq!(custom_terms(&e).unwrap().iter().map(|t| (t.open, t.close)).collect::<Vec<_>>(), vec![(false, false), (true, false), (false, true)]);
+        assert!(custom_terms(&QueryExpression::And(Box::new(n(Comparison::Equal, 1)), Box::new(QueryExpression::Not(Box::new(n(Comparison::Equal, 2)))))).is_err());
+    }
 }

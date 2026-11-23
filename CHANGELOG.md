@@ -2,6 +2,32 @@
 
 ### Unreleased
 
+- **Extended dimensions keep AcDbDimension base groups** - The
+  ARC_DIMENSION and LARGE_RADIAL_DIMENSION reader had no arms for the
+  AcDbDimension insertion point (12), horizontal direction (51) and
+  flip-arrow (74/75) groups, so a DXF read dropped them — including on
+  files the library itself writes.
+- **IMAGE clip mode in DXF** - The DXF writer never emitted group 290,
+  so an image clipped to the inside of its boundary reverted to clipping
+  the outside on every save. `290` (0 = outside, 1 = inside) is now
+  written after the clip boundary vertices for R2010 (AC1024) and later,
+  matching the version gate on the DWG stream's clip-inverted bit.
+- **MULTILEADER text attachment point** - The field (DXF group 179 on the
+  entity, group 171 in the context data) holds the MTEXT attachment point,
+  values 1 to 9. It was modeled as left/center/right only, so a legitimate
+  value such as 5 (middle center, which AutoCAD writes) read with an
+  `unknown-leader-enum` warning and round-tripped as 2.
+  `TextAttachmentPointType` now covers `TopLeft` to `BottomRight`; the former
+  `Left`/`Center`/`Right` variants are `TopLeft`/`TopCenter`/`TopRight`.
+
+- **DXF-format proxy entities** - An `ACAD_PROXY_ENTITY` whose original
+  data format is DXF (`70 1`) carries the entity's own DXF groups after
+  the header. The reader kept only binary data and let those groups' own
+  `70`/`90` overwrite the header; the writer then emitted `70 0` with
+  binary `93`/`161`/`310` data, so a DXF round trip lost the data. The
+  groups are now kept verbatim (`ProxyEntityData::dxf_data`) and written
+  back as they are, as `ACAD_PROXY_OBJECT` already does.
+
 - **AutoCAD 2010 view-rep standard** - `ACDBVIEWREPSTANDARD` stores five
   values before R2013 and six from R2013; the DWG reader and writer now
   use the count the drawing's version stores.

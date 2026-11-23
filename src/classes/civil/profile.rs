@@ -18,6 +18,7 @@
 //!              the tangent before)
 //!          34: BD 0, 2RD end, BL 1, BD grade % there
 //! circular 0 / 9: BD length / radius     7: 2RD through point
+//!         11: 3 × 2RD (start, on it, end)
 //! asymmetric 10: BD length before, BD length after the PVI
 //! ```
 //!
@@ -34,9 +35,14 @@ use crate::types::Vector2;
 enum CurveDef {
     ParabolaLength(f64),
     ParabolaK(f64),
+    ParabolaRadius(f64),
+    /// A symmetric parabola through this point.
+    ParabolaThrough(Vector2),
     CircularLength(f64),
     CircularRadius(f64),
     CircularThrough(Vector2),
+    /// Start, on it, end: the circle through three points.
+    CircularThreePoints([Vector2; 3]),
     Asymmetric(f64, f64),
     ParabolaThreePoints([Vector2; 3]),
     /// Start, end, sag, `a` of the parabola.
@@ -134,6 +140,15 @@ fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
             let v = positive(bits.bit_double()?)?;
             Entity::Curve(if constraint == 0 { CurveDef::ParabolaLength(v) } else { CurveDef::ParabolaK(v) })
         }
+        (6, 9) => {
+            zero(&mut bits)?;
+            Entity::Curve(CurveDef::ParabolaRadius(positive(bits.bit_double()?)?))
+        }
+        // `BL 0, 2RD point, BL 0, 3 bits 010, 3 x BD -1` (WV03).
+        (6, 7) => {
+            zero(&mut bits)?;
+            Entity::Curve(CurveDef::ParabolaThrough(point(&mut bits)?))
+        }
         (6, 11) => {
             zero(&mut bits)?;
             Entity::Curve(CurveDef::ParabolaThreePoints([point(&mut bits)?, point(&mut bits)?, point(&mut bits)?]))
@@ -175,6 +190,11 @@ fn record_at(data: &[u8], pos: usize, end: usize) -> Option<Record> {
             Entity::Curve(if constraint == 0 { CurveDef::CircularLength(v) } else { CurveDef::CircularRadius(v) })
         }
         (4, 7) => Entity::Curve(CurveDef::CircularThrough(point(&mut bits)?)),
+        (4, 11) => Entity::Curve(CurveDef::CircularThreePoints([
+            point(&mut bits)?,
+            point(&mut bits)?,
+            point(&mut bits)?,
+        ])),
         (8, 10) => Entity::Curve(CurveDef::Asymmetric(positive(bits.bit_double()?)?, positive(bits.bit_double()?)?)),
         _ => return None,
     };
@@ -274,6 +294,27 @@ impl Placed {
     }
 }
 
+/// The radius of the circular curve at `pvi` between the grades `g1` and
+/// `g2` that passes through `p`.
+pub(super) fn circle_through(pvi: Vector2, g1: f64, g2: f64, p: Vector2) -> Option<f64> {
+    placed_circle(pvi, g1, g2, CurveDef::CircularThrough(p)).map(|c| c.1)
+}
+
+/// The length of the symmetric parabola at `pvi` between the grades `g1`
+/// and `g2` that passes through `p`: with `u` the station from the PVI and
+/// `d` the height above the first grade, `(g2 - g1) (u + L/2)^2 = 2 d L`,
+/// the root whose curve spans `u`.
+pub(super) fn parabola_length_through(pvi: Vector2, g1: f64, g2: f64, p: Vector2) -> Option<f64> {
+    let (u, d, a) = (p.x - pvi.x, p.y - pvi.y - g1 * (p.x - pvi.x), g2 - g1);
+    let (qa, qb, qc) = (a / 4.0, a * u - 2.0 * d, a * u * u);
+    let disc = qb * qb - 4.0 * qa * qc;
+    (qa != 0.0 && disc >= 0.0).then_some(())?;
+    [(-qb + disc.sqrt()) / (2.0 * qa), (-qb - disc.sqrt()) / (2.0 * qa)]
+        .into_iter()
+        .filter(|l| l.is_finite() && *l > 0.0 && u.abs() <= l / 2.0 + 1e-9)
+        .fold(None, |best: Option<f64>, l| Some(best.map_or(l, |b| b.min(l))))
+}
+
 /// The circle tangent to both grades at the PVI that `def` gives; the
 /// length given is the horizontal one.
 fn placed_circle(pvi: Vector2, g1: f64, g2: f64, def: CurveDef) -> Option<(Vector2, f64)> {
@@ -304,6 +345,44 @@ fn placed_circle(pvi: Vector2, g1: f64, g2: f64, def: CurveDef) -> Option<(Vecto
         _ => return None,
     };
     (radius.is_finite() && radius > 0.0).then(|| (pvi + w * radius, radius))
+}
+
+/// The circular curve through three points of its arc, placed at the PVI
+/// of the grades it meets the tangents with.
+fn circle_on_three_points(p: [Vector2; 3]) -> Option<Placed> {
+    let [a, b, c] = p;
+    // The arc's center: the circumcenter of the three points.
+    let det = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    let (aa, bb, cc) = (a.length_squared(), b.length_squared(), c.length_squared());
+    let center = Vector2::new(
+        (aa * (b.y - c.y) + bb * (c.y - a.y) + cc * (a.y - b.y)) / det,
+        (aa * (c.x - b.x) + bb * (a.x - c.x) + cc * (b.x - a.x)) / det,
+    );
+    let radius = a.distance(&center);
+    (det.abs() > 1e-12 && radius.is_finite() && radius > 1e-9).then_some(())?;
+    // The curve is the arc on the side away from the center (a sag's
+    // center is above it).
+    let s = if center.y > b.y { 1.0 } else { -1.0 };
+    let grade = |q: Vector2| -> Option<f64> {
+        let dx = q.x - center.x;
+        let h = (radius * radius - dx * dx).max(0.0).sqrt();
+        (h > 1e-9).then_some(s * dx / h)
+    };
+    let (g1, g2) = (grade(a)?, grade(c)?);
+    // The PVI where the end grades meet.
+    let dv = g1 - g2;
+    let x = if dv.abs() > 1e-12 {
+        (c.y - a.y + g1 * a.x - g2 * c.x) / dv
+    } else {
+        (a.x + c.x) / 2.0
+    };
+    x.is_finite().then_some(())?;
+    Some(Placed {
+        pvi: Vector2::new(x, a.y + g1 * (x - a.x)),
+        g1,
+        g2,
+        form: Form::Circle { center, radius },
+    })
 }
 
 /// A resolved profile entity's shape.
@@ -432,7 +511,7 @@ struct Segment {
 /// 11-bit kind prefix, the record, and the fields after it: 4 bits after a
 /// tangent, the parabola tail below after a parabola), IDs distinct and
 /// links inside the list.
-fn record_list_at(data: &[u8], pos: usize, end: usize) -> Option<Vec<Record>> {
+fn record_list_at(data: &[u8], pos: usize, end: usize) -> Option<(Vec<Record>, usize)> {
     let mut bits = Bits::new(data, pos, end);
     let n = usize::try_from(bits.bit_long()?).ok().filter(|n| (1..100_000).contains(n))?;
     let mut at = bits.pos;
@@ -462,7 +541,7 @@ fn record_list_at(data: &[u8], pos: usize, end: usize) -> Option<Vec<Record>> {
         let mut record = record_at(data, at + 11, end)?;
         let next = match record.code {
             (2, _) => record.end + 4,
-            (6, c) => parabola_tail(&mut record, matches!(c, 0 | 2))?,
+            (6, c) => parabola_tail(&mut record, matches!(c, 0 | 2 | 9))?,
             // Circular and asymmetric curves end with their values
             // (WR10 to WR13).
             _ => record.end,
@@ -473,24 +552,37 @@ fn record_list_at(data: &[u8], pos: usize, end: usize) -> Option<Vec<Record>> {
     let ids: Vec<i32> = out.iter().map(|r| r.id).collect();
     let known = |id: i32| id == 0 || ids.contains(&id);
     let distinct = ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id));
-    (distinct && out.iter().all(|r| known(r.previous) && known(r.next))).then_some(out)
+    (distinct && out.iter().all(|r| known(r.previous) && known(r.next))).then_some((out, at))
 }
 
 /// Where a profile's criteria bits and entity list sit: after the class
-/// keys (see [`super::alignment::read_keys`]), `BL, BD, BD, BD, 5 x BS`,
-/// 10 bits (criteria in the last three), then the entity list.
+/// keys (see [`super::alignment::read_keys`]), `BL kind, 5 x BD, 3 x BS`,
+/// 10 bits (criteria in the last three), then the entity list. The fifth
+/// BD is an offset profile's offset (0 otherwise, written like `BS 0`).
+/// A kind 0x102 record whose last BS is 256 carries three more `BL`
+/// fields (0 in the sample) and a second 10-bit run before the list (the
+/// 2027 generator's profiles, DE_Busbucht_2023 202BC3D); the offset
+/// profiles of kind 0x102 with that BS 0 have the list right after the
+/// criteria (OP01, OP02, OB01).
 fn section(data: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
     let mut bits = Bits::new(data, start, end);
     super::alignment::read_keys(&mut bits)?;
-    bits.bit_long()?;
-    for _ in 0..3 {
+    let kind = bits.bit_long()?;
+    for _ in 0..5 {
         bits.bit_double()?;
     }
-    for _ in 0..5 {
-        bits.bit_short()?;
+    let mut last = 0;
+    for _ in 0..3 {
+        last = bits.bit_short()?;
     }
     let criteria_at = bits.pos;
     bits.pos += 10;
+    if kind == 0x102 && last == 0x100 {
+        for _ in 0..3 {
+            bits.bit_long()?;
+        }
+        bits.pos += 10;
+    }
     (bits.pos < end).then_some((criteria_at, bits.pos))
 }
 
@@ -501,7 +593,7 @@ fn runs(data: &[u8], start: usize, end: usize) -> Vec<Vec<Record>> {
     let records: Vec<Record> = section(data, start, end)
         .and_then(|(_, list)| match Bits::new(data, list, end).bit_long()? {
             0 => Some(Vec::new()),
-            _ => record_list_at(data, list, end),
+            _ => record_list_at(data, list, end).map(|(records, _)| records),
         })
         .unwrap_or_default();
     let mut runs: Vec<Vec<usize>> = Vec::new();
@@ -518,6 +610,130 @@ fn runs(data: &[u8], start: usize, end: usize) -> Vec<Vec<Record>> {
     }
     let mut records: Vec<Option<Record>> = records.into_iter().map(Some).collect();
     runs.into_iter().map(|run| run.into_iter().filter_map(|i| records[i].take()).collect()).collect()
+}
+
+/// An offset profile: the profile it copies, the vertical slope it adds
+/// across the offset and the offset, with how its entities follow the
+/// source's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffsetProfile {
+    /// The source profile (on the offset alignment's parent).
+    pub source: u64,
+    /// Rise per unit of offset; the profile is the source raised by
+    /// `slope * |offset|`.
+    pub slope: f64,
+    /// The offset alignment's offset (negative to the left).
+    pub offset: f64,
+    /// The parent's length (the slope's station range ends there).
+    pub parent_length: f64,
+    /// For each source entity (by id) the entities copied from it.
+    pub entity_map: Vec<(i32, Vec<i32>)>,
+    /// The parent's stations where the source starts and ends, each with
+    /// the GUID of the parent's anchor there.
+    pub anchors: Vec<(f64, [u8; 16])>,
+}
+
+/// After a design profile's entity list: `2 bits 10`, its identifier (16
+/// bytes), then (`OFFSET_PRE`, `BD slope`, `OFFSET_MID`)
+///
+/// ```text
+/// BL regions, each: BD slope, BD 0, BD parent length, BD 0, BD 0, BL 2,
+///   BL 0, BL 0
+/// BL 0
+/// BL n, each: BL source entity id, BL -1, BL m, m x BL entity id
+/// BL n, each: BD parent station, the parent anchor's GUID (16 bytes)
+/// OFFSET_END
+/// ```
+///
+/// (a layout profile: slope 0 and every list empty). Returns the
+/// identifier and the offset data (`None` without regions).
+pub(super) fn after_entities(data: &[u8], start: usize, end: usize) -> Option<([u8; 16], Option<(f64, Vec<(i32, Vec<i32>)>, Vec<(f64, [u8; 16])>)>)> {
+    let (_, list) = section(data, start, end)?;
+    let (_, at) = record_list_at(data, list, end)?;
+    let mut bits = Bits::new(data, at, end);
+    (bits.bits_value(2)? == 0b10).then_some(())?;
+    let mut id = [0u8; 16];
+    for b in &mut id {
+        *b = bits.bits_value(8)?;
+    }
+    bits.pos += OFFSET_PRE;
+    bits.bit_double()?;
+    bits.pos += OFFSET_MID;
+    let count = |bits: &mut Bits| usize::try_from(bits.bit_long()?).ok().filter(|n| *n <= bits.remaining() / 2);
+    let regions = count(&mut bits)?;
+    let mut length = None;
+    for _ in 0..regions {
+        let v = [bits.bit_double()?, bits.bit_double()?, bits.bit_double()?, bits.bit_double()?, bits.bit_double()?];
+        let tail = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+        (tail == [2, 0, 0]).then_some(())?;
+        length.get_or_insert(v[2]);
+    }
+    (bits.bit_long()? == 0).then_some(())?;
+    let map = (0..count(&mut bits)?)
+        .map(|_| {
+            let source = bits.bit_long()?;
+            (bits.bit_long()? == -1).then_some(())?;
+            let n = count(&mut bits)?;
+            Some((source, (0..n).map(|_| bits.bit_long()).collect::<Option<Vec<_>>>()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let anchors = (0..count(&mut bits)?)
+        .map(|_| {
+            let station = bits.bit_double()?;
+            let mut g = [0u8; 16];
+            for b in &mut g {
+                *b = bits.bits_value(8)?;
+            }
+            Some((station, g))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (bits.pos + OFFSET_END == end).then_some(())?;
+    Some((id, length.map(|l| (l, map, anchors))))
+}
+
+/// The constant runs of [`after_entities`] (the same in every sample:
+/// OP01, OP02, OB01, and in every layout profile).
+pub(super) const OFFSET_PRE: usize = 38;
+pub(super) const OFFSET_MID: usize = 22;
+pub(super) const OFFSET_END: usize = 37;
+
+/// An offset profile's data (see [`OffsetProfile`]; `source` is the
+/// record's 16th reference, filled in by the caller).
+pub(super) fn offset_profile(data: &[u8], start: usize, end: usize) -> Option<OffsetProfile> {
+    let (_, offset) = after_entities(data, start, end)?;
+    let (parent_length, entity_map, anchors) = offset?;
+    let mut bits = Bits::new(data, start, end);
+    let mut slope = None;
+    super::alignment::class_header(&mut bits)?;
+    for _ in 0..bits.bits_value(8)? {
+        if let (0x0200_FF40, super::alignment::KeyValue::Double(v)) = super::alignment::read_key(&mut bits)? {
+            slope = Some(v);
+        }
+    }
+    (bits.bit_long()? == 0).then_some(())?;
+    bits.pos += 65;
+    bits.bit_double()?;
+    bits.pos += 7;
+    bits.bit_long()?;
+    let mut own = [0.0; 5];
+    for v in &mut own {
+        *v = bits.bit_double()?;
+    }
+    Some(OffsetProfile { source: 0, slope: slope?, offset: own[4], parent_length, entity_map, anchors })
+}
+
+/// A design profile's entities in link order, run after run: id, kind and
+/// the points at its start, middle station and end.
+pub(super) fn entity_points(data: &[u8], start: usize, end: usize) -> Option<Vec<(i32, ProfilePiece, [Vector2; 3])>> {
+    let mut out = Vec::new();
+    for run in runs(data, start, end) {
+        let segments = solve(&run)?;
+        (segments.len() == run.len()).then_some(())?;
+        for (r, s) in run.iter().zip(&segments) {
+            out.push((r.id, s.shape.piece(), [s.start, s.shape.at((s.start.x + s.end.x) / 2.0), s.end]));
+        }
+    }
+    Some(out)
 }
 
 /// Every entity record in link order, run after run.
@@ -576,6 +792,10 @@ fn solve(owned: &[Record]) -> Option<Vec<Segment>> {
                 shape[i] = Some(parabola_through(p)?);
                 (from[i], to[i]) = (Some(p[0]), Some(p[2]));
             }
+            Entity::Curve(CurveDef::CircularThreePoints(p)) => {
+                shape[i] = Some(Shape::Placed(circle_on_three_points(p)?));
+                (from[i], to[i]) = (Some(p[0]), Some(p[2]));
+            }
             Entity::Curve(CurveDef::ParabolaTwoPoints(p, q, a)) => {
                 let l = q.x - p.x;
                 // The chord's grade is the grade at the middle.
@@ -620,6 +840,8 @@ fn solve(owned: &[Record]) -> Option<Vec<Segment>> {
             Entity::Curve(
                 def @ (CurveDef::ParabolaLength(_)
                 | CurveDef::ParabolaK(_)
+                | CurveDef::ParabolaRadius(_)
+                | CurveDef::ParabolaThrough(_)
                 | CurveDef::CircularLength(_)
                 | CurveDef::CircularRadius(_)
                 | CurveDef::CircularThrough(_)
@@ -635,6 +857,8 @@ fn solve(owned: &[Record]) -> Option<Vec<Segment>> {
                 let form = match def {
                     CurveDef::ParabolaLength(l) => Form::Parabola(l),
                     CurveDef::ParabolaK(k) => Form::Parabola(k * 100.0 * (g2 - g1).abs()),
+                    CurveDef::ParabolaRadius(r) => Form::Parabola(r * (g2 - g1).abs()),
+                    CurveDef::ParabolaThrough(p) => Form::Parabola(parabola_length_through(a1, g1, g2, p)?),
                     CurveDef::Asymmetric(l1, l2) => Form::Asymmetric(l1, l2),
                     def => {
                         let (center, radius) = placed_circle(a1, g1, g2, def)?;
@@ -877,8 +1101,10 @@ fn view_frame_fields(data: &[u8], start: usize, end: usize) -> Option<ProfileVie
     }
     let items = usize::from(bits.bits_value(8)?);
     bits.pos += 5 * items;
+    // The band items, each opening with its gap to the view (a `BD`; 0 in
+    // most samples, where it reads like `BL 0`).
     for _ in 0..bits.bit_long()? {
-        (bits.bit_long()? == 0).then_some(())?;
+        bits.bit_double()?;
         bits.bit_long()?;
         bits.bit_double()?;
         bits.bit_long()?;
@@ -1019,4 +1245,173 @@ pub(super) fn curve_minimum_k(data: &[u8], start: usize, end: usize) -> Vec<Curv
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bit writer matching the reads of [`Bits`].
+    struct W {
+        bits: Vec<bool>,
+    }
+
+    impl W {
+        fn new() -> Self {
+            Self { bits: Vec::new() }
+        }
+        fn raw(&mut self, count: usize, value: u64) -> &mut Self {
+            for i in (0..count).rev() {
+                self.bits.push(i < 64 && (value >> i) & 1 == 1);
+            }
+            self
+        }
+        /// BL.
+        fn bl(&mut self, value: i32) -> &mut Self {
+            match value {
+                0 => self.raw(2, 0b10),
+                -1..=255 => self.raw(2, 0b01).raw(8, value as u64),
+                other => {
+                    let le = u32::from_be_bytes(other.to_le_bytes());
+                    self.raw(2, 0b00).raw(32, le as u64)
+                }
+            }
+        }
+        /// BD.
+        fn bd(&mut self, value: f64) -> &mut Self {
+            match value {
+                0.0 => self.raw(2, 0b10),
+                1.0 => self.raw(2, 0b01),
+                other => {
+                    for byte in other.to_le_bytes() {
+                        self.raw(8, byte as u64);
+                    }
+                    self
+                }
+            }
+        }
+        /// RD.
+        fn rd(&mut self, value: f64) -> &mut Self {
+            for byte in value.to_le_bytes() {
+                self.raw(8, byte as u64);
+            }
+            self
+        }
+        fn point(&mut self, x: f64, y: f64) -> &mut Self {
+            self.rd(x).rd(y)
+        }
+        /// The class head and keys prologue every design profile opens with.
+        fn keyed_head(&mut self) -> &mut Self {
+            for value in [80, 0, 80, 80, 0] {
+                self.bl(value);
+            }
+            self.bl(1); // schema word
+            self.raw(6, 0b010101); // KEYED
+            self.raw(8, 0); // no keys
+            self.bl(0); // keys close
+            self.raw(65, 0);
+            self.bd(0.0);
+            self.raw(7, 0)
+        }
+        /// One tangent record.
+        fn tangent(&mut self, id: i32, previous: i32, next: i32, a: (f64, f64), b: (f64, f64)) -> &mut Self {
+            self.raw(11, 2).raw(23, 0x08 << 13);
+            self.bl(0).bl(id).bl(previous).bl(next);
+            self.point(a.0, a.1).point(b.0, b.1);
+            self.raw(4, 0)
+        }
+        /// One circular curve record through three points (constraint 11).
+        fn circle(&mut self, id: i32, previous: i32, next: i32, p: [(f64, f64); 3]) -> &mut Self {
+            self.raw(11, 4).raw(23, 0x08 << 13);
+            self.bl(11).bl(id).bl(previous).bl(next);
+            for (x, y) in p {
+                self.point(x, y);
+            }
+            self
+        }
+        fn pack(self) -> (Vec<u8>, usize) {
+            let len = self.bits.len();
+            let mut data = Vec::with_capacity(len.div_ceil(8));
+            for chunk in self.bits.chunks(8) {
+                let mut byte = 0u8;
+                for (i, bit) in chunk.iter().enumerate() {
+                    byte |= (*bit as u8) << (7 - i);
+                }
+                data.push(byte);
+            }
+            (data, len)
+        }
+    }
+
+    /// Kind 0x102 sections carry three more `BL` fields and a second
+    /// 10-bit run before the entity list.
+    #[test]
+    fn reads_a_kind_0x102_section() {
+        let mut w = W::new();
+        w.keyed_head();
+        w.bl(0x102);
+        for _ in 0..3 {
+            w.bd(0.0);
+        }
+        for _ in 0..4 {
+            w.bl(0); // five BS 0 read as two bits each
+        }
+        w.raw(2, 0b11); // BS 256
+        w.raw(10, 0); // criteria
+        w.bl(0).bl(0).bl(0); // the extra fields
+        w.raw(10, 0); // second run
+        w.bl(1); // entity count
+        w.tangent(1, 0, 0, (0.0, 0.0), (10.0, 0.0));
+        let (data, len) = w.pack();
+        let (_, list) = section(&data, 0, len).unwrap();
+        let (records, _) = record_list_at(&data, list, len).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].code, (2, 0));
+    }
+
+    /// The 2027 generator's circular curves stand on three points.
+    #[test]
+    fn places_circles_through_three_points_and_joins_them() {
+        let mut w = W::new();
+        w.keyed_head();
+        w.bl(0);
+        for _ in 0..3 {
+            w.bd(0.0);
+        }
+        for _ in 0..5 {
+            w.bl(0);
+        }
+        w.raw(10, 0);
+        w.bl(4);
+        w.tangent(1, 0, 2, (0.0, 10.0), (100.0, 10.0));
+        w.circle(2, 1, 3, [(100.0, 10.0), (150.0, 0.0), (200.0, 10.0)]);
+        w.circle(3, 2, 4, [(200.0, 10.0), (250.0, 0.0), (300.0, 10.0)]);
+        w.tangent(4, 3, 0, (300.0, 10.0), (400.0, 10.0));
+        let (data, len) = w.pack();
+        let pvis = pvis(&data, 0, len);
+        assert_eq!(pvis.len(), 4);
+        // Each circle's PVI where the grades of the tangents beside it meet.
+        assert!((pvis[1].point.x - 150.0).abs() < 1e-9);
+        assert!((pvis[1].point.y + 130.0 / 12.0).abs() < 1e-9);
+        assert_eq!(pvis[1].curve_length, 100.0);
+        assert!((pvis[2].point.x - 250.0).abs() < 1e-9);
+        assert!((pvis[2].point.y + 130.0 / 12.0).abs() < 1e-9);
+        assert_eq!(pvis[2].curve_length, 100.0);
+        // Both circles sit on their three points.
+        let pieces = pieces(&data, 0, len);
+        assert_eq!(
+            pieces.iter().map(|(piece, _)| *piece).collect::<Vec<_>>(),
+            [ProfilePiece::Tangent, ProfilePiece::Circular, ProfilePiece::Circular, ProfilePiece::Tangent]
+        );
+        let on = |piece: &(ProfilePiece, Vec<Vector2>), x: f64, y: f64| {
+            piece.1.iter().any(|p| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9)
+        };
+        assert!(pieces[1].1.iter().all(|p| match p.x {
+            x if (x - 100.0).abs() < 1e-9 => (p.y - 10.0).abs() < 1e-9,
+            x if (x - 150.0).abs() < 1e-9 => p.y.abs() < 1e-9,
+            x if (x - 200.0).abs() < 1e-9 => (p.y - 10.0).abs() < 1e-9,
+            _ => true,
+        }));
+        assert!(on(&pieces[1], 150.0, 0.0) && on(&pieces[2], 250.0, 0.0));
+    }
 }
