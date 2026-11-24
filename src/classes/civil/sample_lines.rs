@@ -38,8 +38,9 @@
 //!
 //! The tail has no field grammar common to the four records (the 0-line
 //! group's tail is as long as the 19-line group's; the 132-line group's
-//! is about 130 times the 32-line group's), and nothing on record states
-//! what it holds. The member lines are not in the body: the record's
+//! is about 130 times the 32-line group's): it is the application's
+//! save-state cache, byte-identical across saves of the same record, and
+//! stays unmapped. The member lines are not in the body: the record's
 //! handle stream lists them after its fourth reference, in station
 //! order, and each line names itself and gives its station (see
 //! [`sample_line_station`]); the group's name is its text stream's third
@@ -62,16 +63,19 @@ pub struct SampleLines {
 /// A section view group plot of a sample line group (records of the
 /// `0x10025F04` schema whose lines are listed in the record, as acadrust
 /// and the application write them): its index (1 up), the point it was
-/// placed at and its number of views, with the values the record holds
-/// besides (the same in every sample).
+/// placed at and a count (3 in every sample, from 2 to 10 views and one to
+/// three section sources; not the number of views), with the values the
+/// record holds besides (the same in every sample).
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SectionViewGroupPlot {
     pub index: i32,
     pub origin: crate::types::Vector3,
-    pub views: i32,
+    /// The count after the values: 3 in every sample, not the number of
+    /// views.
+    pub count: i32,
     /// The eight BDs after the point (0), the three values (-30, 30, 40),
-    /// the 16 bytes after the view count (0) and the 52 bits after them.
+    /// the 16 bytes after the count (0) and the 52 bits after them.
     pub extra: [f64; 8],
     pub values: [f64; 3],
     pub flags: [bool; 2],
@@ -84,7 +88,7 @@ pub struct SectionViewGroupPlot {
 /// ```text
 /// (after the keys) 155 bits, BL lines, BL n sources {BL 1, BL 0,
 /// 128 bits, BL, 2 bits}, BL 0, BL p plots {BL index, 3BD point, 8 BD,
-/// B, BD, BD, B, BD, BL views, 16 bytes, 52 bits}
+/// B, BD, BD, B, BD, BL count, 16 bytes, 52 bits}
 /// ```
 pub(super) fn group_plots(data: &[u8], start: usize, end: usize) -> Option<Vec<SectionViewGroupPlot>> {
     let mut bits = Bits::new(data, start, end);
@@ -119,7 +123,7 @@ pub(super) fn group_plots(data: &[u8], start: usize, end: usize) -> Option<Vec<S
             let (v0, v1) = (bits.bit_double()?, bits.bit_double()?);
             let b = bits.bit()?;
             let values = [v0, v1, bits.bit_double()?];
-            let views = bits.bit_long()?;
+            let count = bits.bit_long()?;
             let mut id = [0u8; 16];
             for x in &mut id {
                 *x = bits.bits_value(8)?;
@@ -128,7 +132,7 @@ pub(super) fn group_plots(data: &[u8], start: usize, end: usize) -> Option<Vec<S
             for _ in 0..52 {
                 tail = tail << 1 | u64::from(bits.bits_value(1)?);
             }
-            Some(SectionViewGroupPlot { index, origin, views, extra, values, flags: [a, b], id, tail })
+            Some(SectionViewGroupPlot { index, origin, count, extra, values, flags: [a, b], id, tail })
         })
         .collect()
 }

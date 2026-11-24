@@ -476,9 +476,9 @@ pub enum CurbReturnCurve {
     /// length, the middle one by radius (its length takes the rest of the
     /// turn).
     ThreeCentered { first: (f64, f64), middle: f64, last: (f64, f64) },
-    /// A clothoid of `spiral_in` into an arc of `radius`, then a clothoid
-    /// of `spiral_out` out of it.
-    SpiralCurveSpiral { spiral_in: f64, radius: f64, spiral_out: f64 },
+    /// A spiral of `spiral_in` into an arc of `radius`, then a spiral of
+    /// `spiral_out` out of it, both of `shape`.
+    SpiralCurveSpiral { spiral_in: f64, radius: f64, spiral_out: f64, shape: crate::classes::civil::SpiralShape },
 }
 
 /// A curb return's curve from its start at the origin heading along +x and
@@ -502,41 +502,21 @@ fn curb_curve(curve: CurbReturnCurve, sweep: f64) -> Option<(Vec<Vector2>, Vec<f
             }
             Some((points, turns.to_vec(), first.1 + middle * turns[1] + last.1))
         }
-        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out } => {
-            let (t1, t3) = (spiral_in / (2.0 * radius), spiral_out / (2.0 * radius));
+        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out, shape } => {
+            let ((p1, t1), (q, t3)) = (shape.end(spiral_in, radius), shape.end(spiral_out, radius));
             let t2 = sweep - t1 - t3;
             (t2 > 1e-9).then_some(())?;
-            let p1 = clothoid(spiral_in, radius);
             let p2 = arc(p1, t1, radius, t2);
-            // The spiral out seen backwards from its end is a clothoid too.
+            // The spiral out seen backwards from its end is the same spiral.
             let (u, n) = (Vector2::new(sweep.cos(), sweep.sin()), Vector2::new(-sweep.sin(), sweep.cos()));
-            let q = clothoid(spiral_out, radius);
             Some((vec![origin, p1, p2, p2 + u * q.x - n * q.y], vec![t1, t2, t3], spiral_in + radius * t2 + spiral_out))
         }
     }
 }
 
-/// The end of a clothoid of `length` from zero curvature to `1/radius`,
-/// started at the origin along +x turning left (its series in the end
-/// heading `t`: x = L sum (-1)^n t^2n / ((4n+1)(2n)!), y alike).
-fn clothoid(length: f64, radius: f64) -> Vector2 {
-    let t = length / (2.0 * radius);
-    let (mut x, mut y, mut term) = (0.0, 0.0, 1.0);
-    for n in 0..30 {
-        // term = t^n / n!
-        let sign = if n % 4 < 2 { 1.0 } else { -1.0 };
-        if n % 2 == 0 {
-            x += sign * term / (2 * n + 1) as f64;
-        } else {
-            y += sign * term / (2 * n + 1) as f64;
-        }
-        term *= t / (n + 1) as f64;
-    }
-    Vector2::new(x * length, y * length)
-}
-
 /// [`add_curb_return`] with any curve group: an arc, three arcs (CG01,
-/// CG07) or a spiral-curve-spiral (CG02, CG06, CG08). The three arcs are
+/// CG07) or a spiral-curve-spiral of any spiral shape (CG02, CG06, CG08; CG09,
+/// CS01, CS02). The three arcs are
 /// one element; the spiral-curve-spiral is a spiral in, a fixed arc and a
 /// spiral out between the lines (ids 4 to 6, the lines keeping 1 and 3)
 /// and keeps its parameters in a text of the record's second key.
@@ -546,10 +526,10 @@ pub fn add_curb_return_with(doc: &mut CadDocument, name: &str, incoming: Handle,
     let curve_ok = match curve {
         CurbReturnCurve::Arc(r) => positive(r),
         CurbReturnCurve::ThreeCentered { first, middle, last } => [first.0, first.1, middle, last.0, last.1].into_iter().all(positive),
-        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out } => [spiral_in, radius, spiral_out].into_iter().all(positive),
+        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out, shape } => [spiral_in, radius, spiral_out].into_iter().all(positive) && shape.length_ok(spiral_in, radius) && shape.length_ok(spiral_out, radius),
     };
     if name.is_empty() || !curve_ok || !positive(overlaps.0) || !positive(overlaps.1) || !offset_in.is_finite() || !offset_out.is_finite() || incoming == outgoing {
-        return Err(invalid("a curb return needs a name, two roads, finite offsets and a positive curve and overlaps"));
+        return Err(invalid("a curb return needs a name, two roads, finite offsets, a positive curve whose spirals have their shape's geometry and positive overlaps"));
     }
     let lines = |h| super::intersection::lines(doc, h).ok_or_else(|| invalid("a road is not an alignment this crate solves"));
     let (la, lb) = (lines(incoming)?, lines(outgoing)?);
@@ -659,8 +639,7 @@ pub fn add_curb_return_with(doc: &mut CadDocument, name: &str, incoming: Handle,
             let arcs = [first, (middle, 0.0), last];
             (vec![line(1, 0, 2, start, t_in), AlignmentElement { id: 2, previous: 1, next: 3, kind: AlignmentElementKind::ThreeCenteredArc { arcs } }, line(3, 2, 0, t_out, end)], path, None, None)
         }
-        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out } => {
-            let shape = crate::classes::civil::SpiralShape::Clothoid;
+        CurbReturnCurve::SpiralCurveSpiral { spiral_in, radius, spiral_out, shape } => {
             let (sc, cs) = (world(joins[1]), world(joins[2]));
             // The arc's middle, and the direction where the spiral out starts.
             let h = turns[0] + turns[1] / 2.0;
@@ -676,11 +655,11 @@ pub fn add_curb_return_with(doc: &mut CadDocument, name: &str, incoming: Handle,
             ];
             let mut path = path_of(&elements);
             path.push((end, None));
-            let text = format!("{{\r\n\t\"CurveType\": 4,\r\n\t\"CurveParameters\": {{\r\n\t\t\"CurveRadius\": {radius},\r\n\t\t\"SpiralInLength\": {spiral_in},\r\n\t\t\"SpiralOutLength\": {spiral_out},\r\n\t\t\"Greater180\": false,\r\n\t\t\"SpiralType\": 256\r\n\t}}\r\n}}");
+            let text = format!("{{\r\n\t\"CurveType\": 4,\r\n\t\"CurveParameters\": {{\r\n\t\t\"CurveRadius\": {radius},\r\n\t\t\"SpiralInLength\": {spiral_in},\r\n\t\t\"SpiralOutLength\": {spiral_out},\r\n\t\t\"Greater180\": false,\r\n\t\t\"SpiralType\": {}\r\n\t}}\r\n}}", shape.code());
             (elements, path, Some((cs, out_dir)), Some(text))
         }
     };
-    let connected = Connected { values, right, forward, outside_in: values[0] < 0.0, roads: [incoming.value(), outgoing.value()], curve, spiral_out, text };
+    let connected = Connected { values, right, forward, outside_in: values[0] < 0.0, roads: [incoming.value(), outgoing.value()], curve, spiral_out, text, intersection: None };
     let layer = layer.unwrap_or("0");
     let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
     if default_style(doc).is_none() || companion_node(doc).is_none() {
@@ -733,6 +712,23 @@ pub(super) struct Connected {
     /// The text of the record's second key (a spiral-curve-spiral's
     /// parameters).
     pub text: Option<String>,
+    /// A curb return an intersection's command makes (see
+    /// [`IntersectionCurbReturn`]).
+    pub intersection: Option<IntersectionCurbReturn>,
+}
+
+/// What a curb return of an intersection's region keeps besides a curb
+/// return's block: the region's index (1 up, in the intersection's region
+/// order), the corner where the two offset lines meet, whether it runs
+/// against the incoming road's stationing, the offset alignments it joins
+/// (incoming, outgoing) and the intersection.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IntersectionCurbReturn {
+    pub region: i32,
+    pub corner: Vector2,
+    pub in_backward: bool,
+    pub offsets: [u64; 2],
+    pub intersection: u64,
 }
 
 /// The constant runs around the connection block's 31 values (the
@@ -791,6 +787,9 @@ const CONNECTED_BACKWARD: (usize, usize) = (29, 11);
 /// ends run 24 after its code and writes neither the overlap, the curve's
 /// end station nor the radius (CG02, CG06, CG08).
 fn write_connected(w: &mut DwgMergedWriter, c: &Connected) {
+    if let Some(x) = &c.intersection {
+        return write_intersection_connected(w, c, x);
+    }
     let flags = [(CONNECTED_RIGHT, c.right), (CONNECTED_FORWARD, c.forward), (CONNECTED_OUTSIDE_IN, c.outside_in), (CONNECTED_BACKWARD, !c.forward)];
     let code = format!("01{:08b}", match c.curve {
         CurbReturnCurve::Arc(_) => 2,
@@ -832,6 +831,155 @@ fn write_connected(w: &mut DwgMergedWriter, c: &Connected) {
             (None, _) => {}
         }
     }
+}
+
+/// The connection block of an intersection's curb return (WC40: the four
+/// regions of a crossing): the runs and values of a curb return's block up
+/// to the radius, with these bits set apart from the samples' runs: run 0
+/// bits 39 and 40 `10`, runs 1 and 13 `0`, run 12 bit 50 the incoming run
+/// against its road, bit 51 the right turn unless it is, bits 61 and 62
+/// `10`, run 24 bits 50 and 51 the outgoing run along its road; then
+/// `B 1, BL region, 2 x BD corner` and the last run (`BL 0, BL 3`) in place
+/// of the roads' meeting point and stations.
+fn write_intersection_connected(w: &mut DwgMergedWriter, c: &Connected, x: &IntersectionCurbReturn) {
+    let set: [((usize, usize), bool); 11] = [
+        ((0, 39), true),
+        ((0, 40), false),
+        ((1, 0), false),
+        ((13, 0), false),
+        ((12, 50), x.in_backward),
+        ((12, 51), c.right != x.in_backward),
+        ((12, 61), true),
+        ((12, 62), false),
+        ((24, 50), c.forward),
+        ((24, 51), c.forward),
+        ((27, 0), true),
+    ];
+    for (i, (len, hex)) in CONNECTED_RUNS.iter().enumerate().take(28) {
+        for bit in 0..*len {
+            let digit = hex.as_bytes()[bit / 4] as char;
+            let mut v = digit.to_digit(16).unwrap_or(0) >> (3 - bit % 4) & 1 == 1;
+            for ((run, at), on) in set {
+                if run == i && at == bit {
+                    v = on;
+                }
+            }
+            if i == 24 && (53..63).contains(&bit) {
+                v = format!("01{:08b}", 2).as_bytes()[bit - 53] == b'1';
+            }
+            w.write_bit(v);
+        }
+        if i < 27 {
+            w.write_bit_double(c.values[i]);
+        }
+    }
+    w.write_bit_long(x.region);
+    w.write_bit_double(x.corner.x);
+    w.write_bit_double(x.corner.y);
+    let (len, hex) = CONNECTED_RUNS[31];
+    for bit in 0..len {
+        let digit = hex.as_bytes()[bit / 4] as char;
+        w.write_bit(digit.to_digit(16).unwrap_or(0) >> (3 - bit % 4) & 1 == 1);
+    }
+}
+
+/// Adds the curb return of an intersection's region `region` (1 up):
+/// along the incoming road's offset line `offsets[0]` (run against the
+/// road's stationing when `in_backward`) into the outgoing road's offset
+/// line `offsets[1]` (run along its stationing when `forward`), a line of
+/// `lines[0]` units before the free arc of `radius` and `lines[1]` after
+/// it; with `profile` (handle and identifier) it lists that curb return
+/// profile. `corner` is
+/// where the offset lines meet, `arms` the in and out arms' directions
+/// (away from the crossing), `stations` maps a point to its station on
+/// each road. Offsets and overlaps in the block are 0 (the lines are the
+/// offset alignments themselves); its region lists name the roads'
+/// stations.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn add_intersection_curb_return(
+    doc: &mut CadDocument,
+    handle: Handle,
+    name: &str,
+    roads: [Handle; 2],
+    offsets: [Handle; 2],
+    intersection: Handle,
+    region: i32,
+    corner: Vector2,
+    arms: [Vector2; 2],
+    stations: &dyn Fn(usize, Vector2) -> f64,
+    in_backward: bool,
+    forward: bool,
+    radius: f64,
+    lines: [f64; 2],
+    profile: Option<(Handle, [u8; 16])>,
+    layer: Option<&str>,
+) -> Result<Handle, DxfError> {
+    let unit = |v: Vector2| v * (1.0 / v.length());
+    let (a_in, a_out) = (unit(arms[0]), unit(arms[1]));
+    let (d1, travel) = (a_in * -1.0, a_out);
+    let sweep = travel.dot(&d1).clamp(-1.0, 1.0).acos();
+    let turn = d1.cross(&travel);
+    if !(radius.is_finite() && radius > 0.0) || turn.abs() < 1e-12 {
+        return Err(invalid("a curb return needs a positive radius between roads that are not parallel"));
+    }
+    let right = turn < 0.0;
+    let tangent = radius * (sweep / 2.0).tan();
+    let (t_in, t_out) = (corner + a_in * tangent, corner + a_out * tangent);
+    let (start, end) = (corner + a_in * (tangent + lines[0]), corner + a_out * (tangent + lines[1]));
+    let arc_end = lines[0] + radius * sweep;
+    let total = arc_end + lines[1];
+    // A side's region: the roads' stations of its line, and the own
+    // stations there kept a thousandth of the line in from its ends.
+    let side = |road: usize, (p, own_p): (Vector2, f64), (q, own_q): (Vector2, f64)| {
+        let (sp, sq) = (stations(road, p), stations(road, q));
+        if sp <= sq { [0.0, sp, sq, own_p, own_q] } else { [0.0, sq, sp, own_q, own_p] }
+    };
+    let region_in = side(0, (start, 0.001), (t_in, lines[0] - 0.001));
+    let region_out = side(1, (t_out, arc_end + 0.001), (end, total - 0.001));
+    let mut values = [0.0; 31];
+    values[2..7].copy_from_slice(&region_in);
+    values[7..12].copy_from_slice(&region_in);
+    values[14..19].copy_from_slice(&region_out);
+    values[19..24].copy_from_slice(&region_out);
+    values[24] = 1.0;
+    values[25] = arc_end;
+    values[26] = radius;
+    let turn_sign = if right { -1.0 } else { 1.0 };
+    let line = |id, previous, next, start, end| AlignmentElement { id, previous, next, kind: AlignmentElementKind::FixedLine { start, end } };
+    let elements = vec![line(1, 0, 2, start, t_in), AlignmentElement { id: 2, previous: 1, next: 3, kind: AlignmentElementKind::FreeArc { radius } }, line(3, 2, 0, t_out, end)];
+    let path = vec![(start, None), (t_in, Some(turn_sign * (sweep / 4.0).tan())), (t_out, None), (end, None)];
+    let connected = Connected {
+        values,
+        right,
+        forward,
+        outside_in: false,
+        roads: [roads[0].value(), roads[1].value()],
+        curve: CurbReturnCurve::Arc(radius),
+        spiral_out: None,
+        text: None,
+        intersection: Some(IntersectionCurbReturn { region, corner, in_backward, offsets: [offsets[0].value(), offsets[1].value()], intersection: intersection.value() }),
+    };
+    let layer = layer.unwrap_or("0");
+    let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
+    if default_style(doc).is_none() || companion_node(doc).is_none() {
+        ensure_alignment_tree(doc)?;
+    }
+    let style = default_style(doc).ok_or_else(|| invalid("drawing has no alignment styles"))?;
+    let node = companion_node(doc).ok_or_else(|| invalid("drawing has no node for siteless alignments"))?;
+    let used = read_node(doc, node).ok_or_else(|| invalid("feature style node cannot be read"))?;
+    let tag = (FIRST_COMPANION_TAG..).find(|t| used.children.iter().all(|c| c.0 as u32 != *t)).unwrap_or(FIRST_COMPANION_TAG);
+    let common = EntityCommon { handle, owner_handle: doc.header.model_space_block_handle, layer: layer.into(), layer_handle: Some(layer_handle), ..EntityCommon::default() };
+    let companion = doc.allocate_handle();
+    let label = new_name(handle.value());
+    write_companion(doc, companion, node, tag, handle, &path, &label, false)?;
+    add_node_child(doc, node, tag as i32, companion, &label)?;
+    let timing = Timing { connected: Some(connected), ..Timing::default() };
+    // Its curb return profile, tied to its start by its identifier.
+    let (profiles, anchors) = match profile {
+        Some((h, id)) => (vec![h.value()], vec![anchor_at(&elements, 0.0, PROFILE_ANCHOR, id, 0.0).ok_or_else(|| invalid("the curb return's start cannot be placed"))?]),
+        None => (Vec::new(), Vec::new()),
+    };
+    write_alignment_of(doc, common, name, &elements, style, companion.value(), 1, None, &profiles, &anchors, &[], &[], None, AlignmentKind::Centerline, &timing)
 }
 
 /// The class key of the superelevation type (2 superelevation).
@@ -1095,10 +1243,15 @@ pub(super) fn write_alignment_of(doc: &mut CadDocument, common: EntityCommon, na
     // (see `add_superelevation`).
     refs.extend(superelevation_refs(&timing.superelevation, common.handle.value()));
     refs.extend(offset.map(|o| soft_pointer(o.parent)));
-    // A curb return names its roads last: in, in, out, out, in, out.
+    // A curb return names its roads last: in, in, out, out, in, out; an
+    // intersection's: in road, in offset, out road, out offset, the
+    // intersection (WC40).
     if let Some(c) = &timing.connected {
         let [a, b] = c.roads;
-        refs.extend([a, a, b, b, a, b].map(soft_pointer));
+        match &c.intersection {
+            Some(x) => refs.extend([a, x.offsets[0], b, x.offsets[1], x.intersection].map(soft_pointer)),
+            None => refs.extend([a, a, b, b, a, b].map(soft_pointer)),
+        }
     }
     let mut strings = vec!["AeccImpAlignment".to_string(), String::new(), String::new()];
     strings.extend(timing.connected.as_ref().and_then(|c| c.text.clone()));
@@ -1227,10 +1380,10 @@ pub(super) fn write_alignment_of(doc: &mut CadDocument, common: EntityCommon, na
                     // start and direction, the spiral out from the start and
                     // direction its connection block keeps; both end with
                     // BD 0, BD 0, BD 1.
-                    AlignmentElementKind::SpiralIn { start, direction, length, radius, clockwise, .. } => {
+                    AlignmentElementKind::SpiralIn { start, direction, length, radius, clockwise, shape } => {
                         curve(w, SPIRAL, 2, 0);
                         ids(w);
-                        w.write_bit_long(SPIRAL_DEFINITION);
+                        w.write_bit_long(shape.code());
                         w.write_bit(clockwise);
                         point(w, start);
                         point(w, direction);
@@ -1238,11 +1391,11 @@ pub(super) fn write_alignment_of(doc: &mut CadDocument, common: EntityCommon, na
                             w.write_bit_double(v);
                         }
                     }
-                    AlignmentElementKind::SpiralOut { radius, length, clockwise, .. } => {
+                    AlignmentElementKind::SpiralOut { radius, length, clockwise, shape } => {
                         let (from, along) = timing.connected.as_ref().and_then(|c| c.spiral_out).unwrap_or_default();
                         curve(w, SPIRAL, 2, 1);
                         ids(w);
-                        w.write_bit_long(SPIRAL_DEFINITION);
+                        w.write_bit_long(shape.code());
                         w.write_bit(clockwise);
                         w.write_bit_double(radius);
                         w.write_bit_double(length);
@@ -1712,11 +1865,11 @@ pub fn add_offset_alignment_with_widenings(doc: &mut CadDocument, parent: Handle
     write_offset_alignment(doc, parent, name, offset, range, widenings, layer, (0.0, false))
 }
 
-/// [`add_offset_alignment`] over the parent's whole length with its own
-/// design speed `speed`, kept by an associative action (an intersection's
+/// [`add_offset_alignment`] over the parent's whole length (or `range`)
+/// with its own design speed `speed`, kept by an associative action (an intersection's
 /// offset alignments; the caller adds the action).
-pub(super) fn add_kept_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, offset: f64, speed: f64, layer: Option<&str>) -> Result<Handle, DxfError> {
-    write_offset_alignment(doc, parent, name, offset, None, &[], layer, (speed, true))
+pub(super) fn add_kept_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, offset: f64, range: Option<(f64, f64)>, speed: f64, layer: Option<&str>) -> Result<Handle, DxfError> {
+    write_offset_alignment(doc, parent, name, offset, range, &[], layer, (speed, true))
 }
 
 /// [`add_offset_alignment_with_widenings`]; `kept` is the own design speed
@@ -1739,7 +1892,9 @@ fn write_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, off
     }
     let spans = spans(&written.elements).ok_or_else(|| invalid("the parent cannot be solved"))?;
     let total: f64 = spans.iter().map(|(e, _, p)| piece_lengths(e, p).iter().sum::<f64>()).sum();
-    let (s0, s1) = range.unwrap_or((0.0, total));
+    // An intersection's offsets are cut to the parent's ends (a tee
+    // junction's road ending or starting at the intersection, WC50).
+    let (s0, s1) = range.map_or((0.0, total), |(a, b)| if kept.1 { (a.max(0.0), b.min(total)) } else { (a, b) });
     let tol = 1e-9 * total.max(1.0);
     if !(s0.is_finite() && s1.is_finite() && s0 >= -tol && s1 <= total + tol && s1 - s0 > tol) {
         return Err(invalid("the range must run forward within the parent's stations"));
@@ -1864,8 +2019,10 @@ fn write_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, off
     };
     let mut path: Vec<PathPoint> = pieces.iter().map(|p| (starts_of(&p.2).0, p.3)).collect();
     path.push((starts_of(&pieces.last().ok_or_else(|| invalid("the range holds no element"))?.2).1, None));
-    // Own stations of the pieces' ends.
-    let mut own = vec![s0];
+    // Own stations of the pieces' ends. An intersection's clipped offset
+    // alignment starts at 0 (WC40), any other at its parent's station.
+    let clipped = kept.1 && range.is_some();
+    let mut own = vec![if clipped { 0.0 } else { s0 }];
     for p in &pieces {
         own.push(own[own.len() - 1] + p.4);
     }
@@ -1918,16 +2075,35 @@ fn write_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, off
         .iter()
         .map(|(s, g)| anchor_at(&written.elements, 0.0, OFFSET_END_ANCHOR, *g, *s).ok_or_else(|| invalid("an anchor cannot be placed on the parent")))
         .collect::<Result<Vec<_>, _>>()?;
-    // Its own anchor lies at the start of its first element.
-    let (first_start, first_end) = starts_of(&pieces[0].2);
+    // Its own anchor lies at the start of its first element; a clipped
+    // intersection offset's anchor names the whole parent element's offset
+    // (WC40: station 0 at the start of the uncut line, 200 remaining).
+    let (mut first_start, mut first_end) = starts_of(&pieces[0].2);
+    let mut remaining = pieces[0].4;
+    if clipped {
+        if let Some((e, from, ps)) = spans.iter().find(|(e, ..)| Some(i32::from(e.id)) == pieces[0].1) {
+            let piece = &ps[0];
+            let length = piece_length(piece);
+            let at = |s: f64| {
+                let (p, u) = piece_point(piece, s);
+                p + right(u) * offset
+            };
+            let _ = from;
+            (first_start, first_end) = (at(0.0), at(length));
+            remaining = match e.kind {
+                AlignmentElementKind::FreeArc { .. } => (1.0 / piece.1.abs() + if piece.1 > 0.0 { offset } else { -offset }) * (length * piece.1).abs(),
+                _ => length,
+            };
+        }
+    }
     let own_anchor = AlignmentAnchor {
         id: own_id,
         flag: true,
         kind: OWN_START_ANCHOR,
         value: 0.0,
-        station: s0,
+        station: own[0],
         along: 0.0,
-        remaining: pieces[0].4,
+        remaining,
         element: ids[0],
         previous: 0,
         next: ids.get(1).copied().unwrap_or(0),
@@ -1935,7 +2111,7 @@ fn write_offset_alignment(doc: &mut CadDocument, parent: Handle, name: &str, off
         element_end: first_end,
         point: first_start,
     };
-    let record = OffsetRecord { parent: parent.value(), offset, range: (s0, own[count]), regions, transitions, map, anchors, own: own_id, speed: kept.0, associative: kept.1 };
+    let record = OffsetRecord { parent: parent.value(), offset, range: (own[0], own[count]), regions, transitions, map, anchors, own: own_id, speed: kept.0, associative: kept.1 };
     let groups = written.groups.clone();
     rewrite_adding(doc, parent, written, &profiles, &profiles, None, &groups, &extra, &Timing::default())?;
     let style = default_style(doc).ok_or_else(|| invalid("drawing has no alignment styles"))?;
@@ -2191,12 +2367,23 @@ fn offset_record(a: &crate::classes::arch::ArchEntityData, o: crate::classes::ci
     })
 }
 
-/// How an offset alignment's stations follow its parent's: for each parent
-/// element it follows (single region, no transitions), the parent's
-/// station range in the region and its own stations there, in station
-/// order (each maps linearly: a line to its parallel, an arc to the
-/// concentric arc). Returns the parent too.
-pub(super) fn offset_station_map(doc: &CadDocument, alignment: Handle) -> Option<(u64, Vec<[f64; 4]>)> {
+/// How a stretch of an offset alignment follows its parent: the parent's
+/// stations, its own, its offset at both ends, whether it is at the
+/// nominal offset and whether it is a widening's transition.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StationRow {
+    pub parent: (f64, f64),
+    pub own: (f64, f64),
+    pub offset: (f64, f64),
+    pub nominal: bool,
+    pub transition: bool,
+}
+
+/// The rows of an offset alignment's stations along its parent: one per
+/// parent element and region, and one per transition between regions that
+/// runs along the parent (a transition of length 0 follows no parent
+/// stations, OW01), in parent station order; and the parent.
+pub(super) fn offset_station_map(doc: &CadDocument, alignment: Handle) -> Option<(u64, Vec<StationRow>)> {
     let arch = |h: Handle| match doc.get_entity(h)? {
         crate::entities::EntityType::Extended(x) => match &x.data {
             crate::entities::ExtendedEntityData::Arch(a) if a.dxf_name == "AECC_ALIGNMENT" => Some(a),
@@ -2206,23 +2393,41 @@ pub(super) fn offset_station_map(doc: &CadDocument, alignment: Handle) -> Option
     };
     let a = arch(alignment)?;
     let o = a.alignment_offset_parameters()?;
-    let [region] = o.regions.as_slice() else { return None };
-    o.transitions.is_empty().then_some(())?;
+    (!o.regions.is_empty()).then_some(())?;
     let parent = a.alignment_offset_parent()?;
     let (parent_elements, own_elements) = (arch(Handle::new(parent))?.alignment_elements()?, a.alignment_elements()?);
     let (parent_spans, own_spans) = (spans(&parent_elements)?, spans(&own_elements)?);
     let length = |pieces: &[Piece]| pieces.iter().map(piece_length).sum::<f64>();
     let start = a.alignment_start_station()?;
+    let several = o.regions.len() > 1;
     let mut out = Vec::new();
-    for (pid, ids) in &o.element_map {
-        let (_, from, pieces) = parent_spans.iter().find(|(e, ..)| i32::from(e.id) == *pid)?;
-        let own: Vec<_> = ids.iter().map(|id| own_spans.iter().find(|(e, ..)| i32::from(e.id) == *id)).collect::<Option<_>>()?;
-        let (first, last) = (own.first()?, own.last()?);
-        let (s0, s1) = (from.max(region.parent_start), (from + length(pieces)).min(region.parent_end));
-        (s1 > s0).then_some(())?;
-        out.push([s0, s1, start + first.1, start + last.1 + length(&last.2)]);
+    for region in &o.regions {
+        let tol = 1e-9 * region.end.abs().max(1.0);
+        for (pid, ids) in &o.element_map {
+            let (_, from, pieces) = parent_spans.iter().find(|(e, ..)| i32::from(e.id) == *pid)?;
+            let (s0, s1) = (from.max(region.parent_start), (from + length(pieces)).min(region.parent_end));
+            if s1 <= s0 + tol {
+                continue;
+            }
+            let own: Vec<(f64, f64)> = ids
+                .iter()
+                .map(|id| own_spans.iter().find(|(e, ..)| i32::from(e.id) == *id).map(|(_, f, p)| (start + f, start + f + length(p))))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                // With widenings each region keeps the elements on its own
+                // stations.
+                .filter(|(a, b)| !several || (*b > region.start + tol && *a < region.end - tol))
+                .collect();
+            let (first, last) = (own.first()?, own.last()?);
+            out.push(StationRow { parent: (s0, s1), own: (first.0, last.1), offset: (region.offset, region.offset), nominal: region.kind != 1, transition: false });
+        }
     }
-    out.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    for w in o.regions.windows(2) {
+        if w[1].parent_start > w[0].parent_end + 1e-9 * w[0].parent_end.abs().max(1.0) {
+            out.push(StationRow { parent: (w[0].parent_end, w[1].parent_start), own: (w[0].end, w[1].start), offset: (w[0].offset, w[1].offset), nominal: false, transition: true });
+        }
+    }
+    out.sort_by(|a, b| a.parent.0.total_cmp(&b.parent.0));
     Some((parent, out))
 }
 
@@ -2292,6 +2497,7 @@ mod tests {
     use super::*;
     use crate::io::dwg::{DwgReader, DwgWriter};
     use crate::types::DxfVersion;
+    use crate::classes::civil::SpiralShape;
 
     /// A drawing with stand-in nodes (only the keys and references the
     /// alignment writer looks up): a style tree whose alignment styles
@@ -2660,9 +2866,20 @@ mod tests {
         let a = add_alignment(&mut doc, "AL1", &[v(0.0, 0.0), v(200.0, 0.0)], None).unwrap();
         let b = add_alignment(&mut doc, "AL2", &[v(100.0, -100.0), v(100.0, 100.0)], None).unwrap();
         let ccc = CurbReturnCurve::ThreeCentered { first: (30.0, 5.0), middle: 10.0, last: (30.0, 5.0) };
-        let scs = CurbReturnCurve::SpiralCurveSpiral { spiral_in: 6.0, radius: 10.0, spiral_out: 6.0 };
+        let scs = |shape| CurbReturnCurve::SpiralCurveSpiral { spiral_in: 6.0, radius: 10.0, spiral_out: 6.0, shape };
         let h1 = add_curb_return_with(&mut doc, "CR1", a, -10.0, b, -10.0, true, ccc, (5.0, 5.0), None).unwrap();
-        let h2 = add_curb_return_with(&mut doc, "CR2", a, -10.0, b, -10.0, true, scs, (5.0, 5.0), None).unwrap();
+        let h2 = add_curb_return_with(&mut doc, "CR2", a, -10.0, b, -10.0, true, scs(SpiralShape::Clothoid), (5.0, 5.0), None).unwrap();
+        // The other shapes start their spiral in where the samples' do
+        // (CG09, CS01).
+        let shapes = [
+            (SpiralShape::Bloss, 76.9144711223893),
+            (SpiralShape::SineHalfWave, 76.78966791895277),
+            (SpiralShape::JapaneseCubic, 76.72821309623592),
+            (SpiralShape::CubicParabola, 76.7033871330615),
+            (SpiralShape::Sinusoidal, 76.94358128539841),
+            (SpiralShape::Biquadratic, 76.92846040778008),
+        ];
+        let others: Vec<_> = shapes.iter().enumerate().map(|(i, (shape, _))| add_curb_return_with(&mut doc, &format!("S{i}"), a, -10.0, b, -10.0, true, scs(*shape), (5.0, 5.0), None).unwrap()).collect();
         let path = std::env::temp_dir().join(format!("civil-curb-groups-{}.dwg", std::process::id()));
         DwgWriter::write_to_file(&path, &doc).unwrap();
         let back = DwgReader::from_file(&path).unwrap().read().unwrap();
@@ -2684,5 +2901,19 @@ mod tests {
         assert_eq!(e.iter().map(|e| e.id).collect::<Vec<_>>(), [1, 3, 4, 5, 6]);
         let AlignmentElementKind::FixedLine { end, .. } = e[0].kind else { panic!() };
         assert!(end.distance(&v(76.85945875683416, 10.0)) < 1e-9);
+        // A sine half-wave spiral past the length where its X stops growing
+        // (about 3.83 R) is refused.
+        assert!(add_curb_return_with(&mut doc, "SW", a, -10.0, b, -10.0, true, CurbReturnCurve::SpiralCurveSpiral { spiral_in: 40.0, radius: 10.0, spiral_out: 6.0, shape: SpiralShape::SineHalfWave }, (5.0, 5.0), None).is_err());
+        for (h, (shape, x)) in others.into_iter().zip(shapes) {
+            let r = read(h);
+            assert!(r.decode().strings[3].contains(&format!("\"SpiralType\": {}", shape.code())));
+            let e = r.alignment_elements().unwrap();
+            let AlignmentElementKind::SpiralIn { start, shape: read_shape, .. } = e[2].kind else { panic!() };
+            assert_eq!(read_shape, shape);
+            // The samples' Japanese cubic X solves its equation only to
+            // 1e-4; the writer solves it exactly.
+            let tolerance = if shape == SpiralShape::JapaneseCubic { 1e-4 } else { 1e-6 };
+            assert!((start.x - x).abs() < tolerance, "{shape:?} {}", start.x - x);
+        }
     }
 }

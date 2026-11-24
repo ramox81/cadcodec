@@ -39,15 +39,18 @@
 //!
 //! Records the codec writes itself (`create::add_lot_line`) carry the
 //! same head and schema word but no graphic-image section; they decode
-//! to `None` here.
+//! to `None` here. A shorter form (same head and schema word, no
+//! graphic-image section) is a segment stored without a base curve and
+//! also decodes to `None`.
 
 use super::bits::Bits;
 use crate::classes::arch::polyline_from_type6;
 use crate::entities::{ProxyGraphicRecord, ProxyGraphics};
 use crate::types::Vector2;
 
-/// Schema word of the parcel segment records.
-const SCHEMA: u32 = 0x1002_5F04;
+/// Schema word of the parcel segment records, shared with the grading
+/// entities' head ([`super::grading`]).
+pub(super) const SCHEMA: u32 = 0x1002_5F04;
 
 /// Geometry a parcel segment record holds.
 #[derive(Debug, Clone, PartialEq)]

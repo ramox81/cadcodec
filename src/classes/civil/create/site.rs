@@ -519,6 +519,11 @@ pub(super) fn write_container(doc: &mut CadDocument, handle: Handle, site: Handl
                     w.write_bit_long(k);
                 }
             }
+            // The parcels: one over several faces counts once (PD01).
+            let mut distinct: Vec<u64> = parcels.iter().copied().filter(|h| *h != 0).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let p = if distinct.len() < parcels.len() { distinct.len() as i32 } else { p };
             let tail = [1, 1, p + 1].into_iter().chain([1; 10]).chain([p]).chain(1..=p);
             for v in tail.chain([0; 5]) {
                 w.write_bit_long(v);
@@ -590,7 +595,39 @@ fn members_of(doc: &mut CadDocument, site: Handle) -> Result<(Handle, Vec<Member
             let read = ReadEdge { flags, points: own.iter().map(|v| v.flags).collect(), inserted: run.iter().filter(|v| !is_own(v)).map(|v| (v.point, v.node, v.flags)).collect(), shape };
             Some(Member {
                 handle: *h,
-                path: own.iter().map(|v| (v.point, (v.bulge != 0.0).then_some(v.bulge))).collect(),
+                path: {
+                    // An arc other members' crossings split is one arc of
+                    // the member: its pieces' sweeps add up.
+                    // An unsplit arc keeps its bulge as stored.
+                    let bulge = |pieces: &[f64]| -> Option<f64> {
+                        match pieces {
+                            [] => None,
+                            [g] => (*g != 0.0).then_some(*g),
+                            _ => {
+                                let sweep: f64 = pieces.iter().map(|g| 4.0 * g.atan()).sum();
+                                (sweep != 0.0).then(|| (sweep / 4.0).tan())
+                            }
+                        }
+                    };
+                    let mut path: Vec<PathPoint> = Vec::new();
+                    let mut pieces: Vec<f64> = Vec::new();
+                    for (i, v) in run.iter().enumerate() {
+                        if is_own(&v) {
+                            if let Some(last) = path.last_mut() {
+                                last.1 = bulge(&pieces);
+                            }
+                            path.push((v.point, None));
+                            pieces.clear();
+                        }
+                        if i + 1 < run.len() || closed {
+                            pieces.push(v.bulge);
+                        }
+                    }
+                    if let Some(last) = path.last_mut() {
+                        last.1 = if closed { bulge(&pieces) } else { None };
+                    }
+                    path
+                },
                 elevations: own.iter().map(|v| v.z).collect(),
                 elevation_points: own.iter().map(|v| v.is_elevation_point()).collect(),
                 kind,
@@ -670,39 +707,15 @@ fn alignment_path(doc: &CadDocument, alignment: u64) -> Vec<PathPoint> {
 /// Whether two solved paths cross or touch (arcs taken by their chords
 /// and their middle points).
 fn paths_meet(a: &[PathPoint], b: &[PathPoint]) -> bool {
-    let points = |p: &[PathPoint]| -> Vec<Vector2> {
-        let mut out = Vec::new();
-        for w in p.windows(2) {
-            out.push(w[0].0);
-            if let Some(bulge) = w[0].1 {
-                // The arc's middle point: off the chord by its sagitta.
-                let (c, d) = (w[0].0, w[1].0);
-                let chord = d - c;
-                let normal = Vector2::new(-chord.y, chord.x) * (1.0 / chord.length().max(1e-300));
-                out.push((c + d) * 0.5 - normal * (bulge * chord.length() / 2.0));
-            }
-        }
-        out.extend(p.last().map(|q| q.0));
-        out
-    };
-    let (pa, pb) = (points(a), points(b));
-    let cross = |o: Vector2, p: Vector2, q: Vector2| (p - o).cross(&(q - o));
-    let on = |p: Vector2, s: &[Vector2]| p.x >= s[0].x.min(s[1].x) - 1e-9 && p.x <= s[0].x.max(s[1].x) + 1e-9 && p.y >= s[0].y.min(s[1].y) - 1e-9 && p.y <= s[0].y.max(s[1].y) + 1e-9;
-    pa.windows(2).any(|s| {
-        pb.windows(2).any(|t| {
-            let (d1, d2) = (cross(t[0], t[1], s[0]), cross(t[0], t[1], s[1]));
-            let (d3, d4) = (cross(s[0], s[1], t[0]), cross(s[0], s[1], t[1]));
-            let zero = |d: f64| d.abs() < 1e-9;
-            (d1 * d2 < 0.0 && d3 * d4 < 0.0) || (zero(d1) && on(s[0], t)) || (zero(d2) && on(s[1], t)) || (zero(d3) && on(t[0], s)) || (zero(d4) && on(t[1], s))
-        })
-    })
+    super::arrangement::paths_meet(a, b)
 }
 
 /// Adds an alignment like [`super::add_alignment_with_curves`] on `site`
-/// instead of siteless: its edge joins the site's container. The
-/// alignment must not cross or touch the site's other members (the site's
-/// parcels and the splits at crossings are not written), and the site must
-/// be one this crate writes.
+/// instead of siteless: its edge joins the site's container. Like a lot
+/// line it may cross and touch the site's lot lines and alignments (not
+/// its feature lines; arcs included): they are split
+/// where they meet and every face it closes or cuts off becomes a parcel
+/// (see [`add_lot_line`]). The site must be one this crate writes.
 pub fn add_alignment_on_site(doc: &mut CadDocument, site: Handle, name: &str, vertices: &[Vector2], curves: &[VertexCurve], layer: Option<&str>) -> Result<Handle, DxfError> {
     if vertices.len() < 2 || vertices.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) || vertices.windows(2).any(|w| w[0] == w[1]) {
         return Err(invalid("an alignment needs two or more distinct finite vertices"));
@@ -712,26 +725,13 @@ pub fn add_alignment_on_site(doc: &mut CadDocument, site: Handle, name: &str, ve
     }
     let elements = elements(vertices, curves);
     let path = solve(vertices, curves, &elements).ok_or_else(|| invalid("a curve has no turn or is not positive, or the curves do not fit on the lines"))?;
-    let layer = layer.unwrap_or("0");
-    let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
-    let (container, mut members, parcels, line_style, next) = members_of(doc, site)?;
-    if members.iter().any(|m| paths_meet(&m.outline(), &path)) {
-        return Err(invalid("the alignment crosses or touches another member of the site"));
-    }
     if alignment_style(doc).is_none() {
         ensure_alignment_tree(doc)?;
     }
     let style = alignment_style(doc).ok_or_else(|| invalid("drawing has no alignment styles"))?;
-    let common = EntityCommon {
-        handle: doc.allocate_handle(),
-        owner_handle: doc.header.model_space_block_handle,
-        layer: layer.into(),
-        layer_handle: Some(layer_handle),
-        ..EntityCommon::default()
-    };
-    members.push(Member { handle: common.handle.value(), elevations: vec![0.0; path.len()], elevation_points: vec![false; path.len()], path, kind: MemberKind::Alignment, ids: Vec::new(), read: None });
-    write_container(doc, container, site, &members, &parcels, line_style, next)?;
-    write_alignment(doc, common, name, &elements, style, container.value(), members.len() as i32, None, &[], &[], &[], &[], None)
+    let elevations = vec![0.0; path.len()];
+    let (alignment, _) = join_site(doc, site, path, &elevations, MemberKind::Alignment, true, layer, |doc, common, edge, container| write_alignment(doc, common, name, &elements, style, container.value(), edge, None, &[], &[], &[], &[], None))?;
+    Ok(alignment)
 }
 
 /// The feature line record (`AECC_FEATURE_LINE`; its points are its edge
@@ -807,11 +807,11 @@ pub fn add_feature_line_vertices(doc: &mut CadDocument, site: Handle, name: &str
     let layer = layer.unwrap_or("0");
     let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
     let (container, mut members, parcels, line_style, next) = members_of(doc, site)?;
-    let faces = |members: &[Member]| {
+    let arrange = |members: &[Member]| {
         let inputs: Vec<Input> = members.iter().filter(|m| !m.path.is_empty()).map(|m| Input { path: &m.path, elevations: &m.elevations, closed: m.closed() }).collect();
-        if inputs.is_empty() { Ok(0) } else { build(&inputs).map(|a| a.faces.len()).map_err(invalid) }
+        if inputs.is_empty() { Ok(None) } else { build(&inputs).map(Some).map_err(invalid) }
     };
-    let before = faces(&members)?;
+    let before = arrange(&members)?;
     let common = EntityCommon {
         handle: doc.allocate_handle(),
         owner_handle: doc.header.model_space_block_handle,
@@ -828,14 +828,64 @@ pub fn add_feature_line_vertices(doc: &mut CadDocument, site: Handle, name: &str
         ids: Vec::new(),
         read: None,
     });
-    // A feature line that closes a region or splits one makes the
-    // application add a grading of that face (FX04, FX07), which is not
-    // written.
-    if before != 0 && faces(&members)? != before {
-        return Err(invalid("the feature line closes or splits a region of the site"));
+    // A feature line that splits a parcel's face leaves the parcel over
+    // the parts (PD01, PD05, PD06, PD09: one parcel over two faces; PD08:
+    // over four). One that closes or splits a region no parcel covers
+    // makes the application add a grading of that face (FX04, FX07),
+    // which is not written.
+    let after = arrange(&members)?;
+    let (Some(old), Some(new)) = (&before, &after) else {
+        write_container(doc, container, site, &members, &parcels, line_style, next)?;
+        return write_feature_line(doc, common, name, members.len() as i32, container, line_style);
+    };
+    if old.faces.len() == new.faces.len() {
+        write_container(doc, container, site, &members, &parcels, line_style, next)?;
+        return write_feature_line(doc, common, name, members.len() as i32, container, line_style);
     }
-    write_container(doc, container, site, &members, &parcels, line_style, next)?;
-    write_feature_line(doc, common, name, members.len() as i32, container, line_style)
+    let owners: Vec<u64> = (1..new.faces.len())
+        .map(|i| old.face_at(new.faces[i].label, 0).and_then(|f| parcels.get(f as usize - 2).copied()).filter(|h| *h != 0))
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid("the feature line closes or splits a region of the site no parcel covers"))?;
+    let mut distinct = parcels.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let earlier: Vec<(u64, i32, Vector2, u64, u64, EntityCommon)> = distinct
+        .iter()
+        .filter(|h| **h != 0)
+        .map(|h| match doc.get_entity(Handle::new(*h)) {
+            Some(EntityType::Extended(x)) => match &x.data {
+                ExtendedEntityData::Arch(a) => {
+                    let refs = a.typed_handles();
+                    a.parcel_face().zip(a.parcel_label()).map(|((n, _), l)| (*h, n, l, refs.get(3).map_or(0, |r| r.0), refs.get(4).map_or(0, |r| r.0), x.common.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid("a parcel of the site cannot be read"))?;
+    write_container(doc, container, site, &members, &owners, line_style, next)?;
+    let line = write_feature_line(doc, common, name, members.len() as i32, container, line_style)?;
+    for (h, number, label, style, label_style, common) in earlier {
+        let faces: Vec<i32> = owners.iter().enumerate().filter(|(_, o)| **o == h).map(|(i, _)| i as i32 + 2).collect();
+        // The label's elevation: the mean of the nodes on the parcel's
+        // outline, the segments with its faces on one side only (PD01:
+        // 11 / 6; PD08: 22 / 8).
+        let mut outline: Vec<i32> = Vec::new();
+        for e in &new.edges {
+            for (k, v) in e.vertices.iter().enumerate() {
+                let Some(next) = e.vertices.get(k + 1) else { continue };
+                if faces.contains(&v.faces.0) != faces.contains(&v.faces.1) {
+                    outline.extend([v.node, next.node]);
+                }
+            }
+        }
+        outline.sort_unstable();
+        outline.dedup();
+        let z = outline.iter().map(|n| new.nodes[*n as usize - 1].1).sum::<f64>() / outline.len().max(1) as f64;
+        write_parcel_over(doc, common, site, number, &faces, label, z, style, label_style)?;
+    }
+    Ok(line)
 }
 
 /// Replaces the vertices of `feature_line` (a feature line on a site this
@@ -934,7 +984,7 @@ fn write_lot_line(doc: &mut CadDocument, common: EntityCommon, edge: i32, contai
 /// RC 3 keys: 0x0D00800A BL 0, 0x02008022 BD 0.1, 0x0200800B BD 1/24
 /// BL 0 (one-byte form), 121 zero bits
 /// BL number, BL 0, BL 0, BD 0, 3BD label location, BL 80, BL 1,
-/// 3BD label location, BL 2, BL 1, BL face, BL 0, B 0, BS 0x04BE
+/// 3BD label location, BL 2, BL n, n x BL face, BL 0, B 0, BS 0x04BE
 /// references: soft pointer 0, the site (hard), hard ownership 0, the
 ///   parcel style (hard), the area label style (hard)
 /// texts: "AeccImpFace", "", "" (the application names the parcel from
@@ -946,6 +996,14 @@ fn write_lot_line(doc: &mut CadDocument, common: EntityCommon, edge: i32, contai
 /// boundary come from its face in the site's container (WP03 to WP14:
 /// parcels of other areas have the same record).
 fn write_parcel(doc: &mut CadDocument, common: EntityCommon, site: Handle, number: i32, face: i32, label: Vector2, style: u64, label_style: u64) -> Result<Handle, DxfError> {
+    write_parcel_over(doc, common, site, number, &[face], label, 0.0, style, label_style)
+}
+
+/// [`write_parcel`] over the faces `faces` (`BL 2, BL n, n x BL face`; a
+/// feature line splitting a parcel's face leaves the parcel over the
+/// parts, PD01) with the label at elevation `z`.
+#[allow(clippy::too_many_arguments)]
+fn write_parcel_over(doc: &mut CadDocument, common: EntityCommon, site: Handle, number: i32, faces: &[i32], label: Vector2, z: f64, style: u64, label_style: u64) -> Result<Handle, DxfError> {
     let byte = |w: &mut crate::io::dwg::dwg_stream_writers::DwgMergedWriter, v: u8| bits(w, &format!("{v:08b}"));
     let refs = vec![soft_pointer(0), hard_pointer(site.value()), Ref(DwgReferenceType::HardOwnership, 0), hard_pointer(style), hard_pointer(label_style)];
     let strings = vec!["AeccImpFace".to_string(), String::new(), String::new()];
@@ -974,14 +1032,16 @@ fn write_parcel(doc: &mut CadDocument, common: EntityCommon, site: Handle, numbe
             }
             w.write_bit_double(0.0);
             for round in 0..2 {
-                for v in [label.x, label.y, 0.0] {
+                for v in [label.x, label.y, z] {
                     w.write_bit_double(v);
                 }
-                for v in if round == 0 { [80, 1] } else { [2, 1] } {
+                for v in if round == 0 { [80, 1] } else { [2, faces.len() as i32] } {
                     w.write_bit_long(v);
                 }
             }
-            w.write_bit_long(face);
+            for face in faces {
+                w.write_bit_long(*face);
+            }
             w.write_bit_long(0);
             w.write_bit(false);
             w.write_bit_short(VERSION);
@@ -1019,14 +1079,26 @@ fn add_lot_line_on(doc: &mut CadDocument, site: Handle, points: &[(Vector2, f64)
     if crossing || edges.iter().any(|e| e[0] == e[1]) {
         return Err(invalid("a lot line crosses or touches itself"));
     }
+    let elevations = vec![0.0; n];
+    join_site(doc, site, path, &elevations, MemberKind::LotLine { closed }, meet, layer, |doc, common, edge, container| write_lot_line(doc, common, edge, container))
+}
+
+/// Joins a new member through `path` to `site`'s container and writes the
+/// parcels of the faces it makes: with `meet`, it may cross or touch the
+/// site's lot lines and alignments (arcs included): each is split
+/// where they meet, the faces they cut are split and the parcels of the
+/// parts are written (every parcel's label moves into what is left of its
+/// face). `record` writes the member's own record (its entity, edge id and
+/// the container). Returns the record and the new parcels.
+fn join_site(doc: &mut CadDocument, site: Handle, path: Vec<PathPoint>, elevations: &[f64], kind: MemberKind, meet: bool, layer: Option<&str>, record: impl FnOnce(&mut CadDocument, EntityCommon, i32, Handle) -> Result<Handle, DxfError>) -> Result<(Handle, Vec<Handle>), DxfError> {
     let layer = layer.unwrap_or("0");
     let layer_handle = doc.layers.get(layer).map(|l| l.handle).ok_or_else(|| invalid("layer does not exist"))?;
     let (container, mut members, parcels, line_style, next) = members_of(doc, site)?;
+    let probe = Member { handle: 0, path: path.clone(), elevations: Vec::new(), elevation_points: Vec::new(), kind, ids: Vec::new(), read: None };
+    let outline = probe.outline();
     let met = members.iter().filter(|m| paths_meet(&m.outline(), &outline)).map(|m| m.kind).collect::<Vec<_>>();
-    let arcs = |p: &[PathPoint]| p.iter().any(|q| q.1.is_some());
-    let met_arcs = members.iter().any(|m| arcs(&m.path) && paths_meet(&m.outline(), &outline));
-    if met.iter().any(|k| !meet || !matches!(k, MemberKind::LotLine { .. })) || (!met.is_empty() && (arcs(&path) || met_arcs)) {
-        return Err(invalid("the lot line crosses or touches a member it may not meet (or meets with an arc)"));
+    if met.iter().any(|k| !meet || (matches!(k, MemberKind::FeatureLine) && !matches!(kind, MemberKind::LotLine { .. }))) {
+        return Err(invalid("the line crosses or touches a member it may not meet"));
     }
     let style = match doc.get_entity(site) {
         Some(EntityType::Extended(x)) => match &x.data {
@@ -1044,10 +1116,23 @@ fn add_lot_line_on(doc: &mut CadDocument, site: Handle, points: &[(Vector2, f64)
         ..EntityCommon::default()
     };
     let line = common(doc);
-    members.push(Member { handle: line.handle.value(), path, elevations: vec![0.0; n], elevation_points: vec![false; n], kind: MemberKind::LotLine { closed }, ids: Vec::new(), read: None });
+    // A lot line crossing a feature line takes the feature line's
+    // elevation there, and its stretches between such points and its own
+    // points run straight between their elevations (PD20: (50, 25) at
+    // 5.5, (50, 0) and (50, 50) at 2.444).
+    let (path, elevations) = if matches!(kind, MemberKind::LotLine { .. }) { raised_by_feature_lines(&members, path, elevations) } else { (path, elevations.to_vec()) };
+    let n = path.len();
+    members.push(Member { handle: line.handle.value(), path, elevations, elevation_points: vec![false; n], kind, ids: Vec::new(), read: None });
     let inputs: Vec<Input> = members.iter().map(|m| Input { path: &m.path, elevations: &m.elevations, closed: m.closed() }).collect();
     let arrangement = build(&inputs).map_err(invalid)?;
     let faces = arrangement.faces.len();
+    // A parcel lies over the faces feature lines split (PD01); a lot line
+    // or alignment across such a parcel splits it along its own segments
+    // only (PD20).
+    let group = face_groups(&arrangement, &members);
+    if (1..faces).any(|i| group[i] != i) {
+        return join_groups(doc, site, container, &members, &parcels, line_style, next, &arrangement, &group, &met, line, record, style, label_style, common);
+    }
     // The earlier parcels: (record, number, face, label).
     let earlier: Vec<(u64, i32, i32, Vector2)> = parcels
         .iter()
@@ -1081,7 +1166,7 @@ fn add_lot_line_on(doc: &mut CadDocument, site: Handle, points: &[(Vector2, f64)
     }
     let parcels: Vec<u64> = owner[1.min(faces)..].iter().map(|o| o.map_or(0, |o| o.0)).collect();
     let arrangement = write_container(doc, container, site, &members, &parcels, line_style, next)?;
-    let segment = write_lot_line(doc, line, members.len() as i32, container)?;
+    let segment = record(doc, line, members.len() as i32, container)?;
     // The earlier parcels keep their records and numbers; their faces and
     // labels follow the split.
     if !met.is_empty() {
@@ -1105,6 +1190,180 @@ fn add_lot_line_on(doc: &mut CadDocument, site: Handle, points: &[(Vector2, f64)
     Ok((segment, out))
 }
 
+/// `path` (straight segments) with a point added where it crosses a
+/// feature line of `members`, at the feature line's elevation there.
+// ponytail: arcs on either line are left as they are.
+fn raised_by_feature_lines(members: &[Member], path: Vec<PathPoint>, elevations: &[f64]) -> (Vec<PathPoint>, Vec<f64>) {
+    let straight = |p: &[PathPoint]| p.iter().all(|q| q.1.is_none_or(|b| b == 0.0));
+    if !straight(&path) || elevations.len() != path.len() {
+        return (path, elevations.to_vec());
+    }
+    let cross = |a: Vector2, b: Vector2, c: Vector2, d: Vector2| {
+        let (r, s) = (b - a, d - c);
+        let den = r.cross(&s);
+        if den.abs() < 1e-12 {
+            return None;
+        }
+        let (t, u) = ((c - a).cross(&s) / den, (c - a).cross(&r) / den);
+        (t > 1e-9 && t < 1.0 - 1e-9 && (-1e-9..=1.0 + 1e-9).contains(&u)).then_some((t, u))
+    };
+    let mut out_path = Vec::new();
+    let mut out_z = Vec::new();
+    for k in 0..path.len() {
+        out_path.push(path[k]);
+        out_z.push(elevations[k]);
+        let Some(next) = path.get(k + 1) else { break };
+        let (a, b) = (path[k].0, next.0);
+        let mut hits: Vec<(f64, f64)> = Vec::new();
+        for m in members.iter().filter(|m| matches!(m.kind, MemberKind::FeatureLine) && straight(&m.path) && m.elevations.len() == m.path.len()) {
+            for j in 0..m.path.len().saturating_sub(1) {
+                if let Some((t, u)) = cross(a, b, m.path[j].0, m.path[j + 1].0) {
+                    hits.push((t, m.elevations[j] + u * (m.elevations[j + 1] - m.elevations[j])));
+                }
+            }
+        }
+        hits.sort_by(|x, y| x.0.total_cmp(&y.0));
+        for (t, z) in hits {
+            out_path.push((a + (b - a) * t, None));
+            out_z.push(z);
+        }
+    }
+    (out_path, out_z)
+}
+
+/// The faces of `arrangement` joined across feature lines: the root face
+/// index of each face's group (feature lines do not bound parcels).
+fn face_groups(arrangement: &Arrangement, members: &[Member]) -> Vec<usize> {
+    let mut root: Vec<usize> = (0..arrangement.faces.len()).collect();
+    fn find(root: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while root[r] != r {
+            r = root[r];
+        }
+        root[i] = r;
+        r
+    }
+    for (e, m) in arrangement.edges.iter().zip(members) {
+        if !matches!(m.kind, MemberKind::FeatureLine) {
+            continue;
+        }
+        for v in &e.vertices {
+            let (a, b) = (v.faces.0 as usize, v.faces.1 as usize);
+            // Face 1 (the outside) joins nothing.
+            if a < 2 || b < 2 || a > root.len() || b > root.len() {
+                continue;
+            }
+            let (ra, rb) = (find(&mut root, a - 1), find(&mut root, b - 1));
+            if ra != rb {
+                root[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+    (0..root.len()).map(|i| find(&mut root, i)).collect()
+}
+
+/// [`join_site`] where feature lines join faces into groups: each group is
+/// one parcel over its faces (`BL 2, BL n, faces`). An earlier parcel keeps
+/// the group its label lies in, the groups left over get new parcels; a
+/// parcel's label goes to the middle of its outline's extents (inside it;
+/// else its first face's label), at the mean elevation of the outline's
+/// nodes (PD20: lot line x = 50 across PD01's parcel: two parcels of 2500,
+/// labels (25, 25) and (75, 25)).
+// ponytail: the application also raises the lot line's nodes to the
+// feature line's elevation where they cross and interpolates its other
+// nodes along it (PD20: (50, 0) and (50, 50) at 2.444); the writer keeps
+// the arrangement's elevations.
+#[allow(clippy::too_many_arguments)]
+fn join_groups(
+    doc: &mut CadDocument,
+    site: Handle,
+    container: Handle,
+    members: &[Member],
+    parcels: &[u64],
+    line_style: u64,
+    next: NextIds,
+    arrangement: &Arrangement,
+    group: &[usize],
+    met: &[MemberKind],
+    line: EntityCommon,
+    record: impl FnOnce(&mut CadDocument, EntityCommon, i32, Handle) -> Result<Handle, DxfError>,
+    style: u64,
+    label_style: u64,
+    common: impl Fn(&mut CadDocument) -> EntityCommon,
+) -> Result<(Handle, Vec<Handle>), DxfError> {
+    let faces = arrangement.faces.len();
+    let mut distinct: Vec<u64> = parcels.iter().copied().filter(|h| *h != 0).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let earlier: Vec<(u64, i32, i32, Vector2)> = distinct
+        .iter()
+        .map(|h| match doc.get_entity(Handle::new(*h)) {
+            Some(EntityType::Extended(x)) => match &x.data {
+                ExtendedEntityData::Arch(a) => a.parcel_face().zip(a.parcel_label()).map(|((n, f), l)| (*h, n, f, l)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid("a parcel of the site cannot be read"))?;
+    let mut owner: Vec<Option<(u64, i32)>> = vec![None; faces];
+    for &(h, number, face, label) in &earlier {
+        let f = if met.is_empty() { Some(face) } else { arrangement.face_at(label, face) };
+        let slot = f.and_then(|f| owner.get_mut(group[f as usize - 1])).filter(|s| s.is_none()).ok_or_else(|| invalid("a parcel's label is in no face of its own"))?;
+        *slot = Some((h, number));
+    }
+    let mut number = earlier.iter().map(|e| e.1).max().unwrap_or(0);
+    let mut made: Vec<EntityCommon> = Vec::new();
+    for i in 1..faces {
+        if group[i] == i && owner[i].is_none() {
+            let c = common(doc);
+            number += 1;
+            owner[i] = Some((c.handle.value(), number));
+            made.push(c);
+        }
+    }
+    let per_face: Vec<u64> = (1..faces).map(|i| owner[group[i]].map_or(0, |o| o.0)).collect();
+    let arrangement = write_container(doc, container, site, members, &per_face, line_style, next)?;
+    let segment = record(doc, line, members.len() as i32, container)?;
+    let mut out = Vec::new();
+    for root in (1..faces).filter(|i| group[*i] == *i) {
+        let Some((h, number)) = owner[root] else { continue };
+        let face_ids: Vec<i32> = (1..faces).filter(|i| group[*i] == root).map(|i| i as i32 + 1).collect();
+        let inside = |f: i32| f >= 2 && group.get(f as usize - 1) == Some(&root);
+        let mut outline: Vec<i32> = Vec::new();
+        for e in &arrangement.edges {
+            for (k, v) in e.vertices.iter().enumerate() {
+                let Some(next) = e.vertices.get(k + 1) else { continue };
+                if inside(v.faces.0) != inside(v.faces.1) {
+                    outline.extend([v.node, next.node]);
+                }
+            }
+        }
+        outline.sort_unstable();
+        outline.dedup();
+        let nodes: Vec<(Vector2, f64)> = outline.iter().map(|n| arrangement.nodes[*n as usize - 1]).collect();
+        let z = nodes.iter().map(|n| n.1).sum::<f64>() / nodes.len().max(1) as f64;
+        let (lo, hi) = nodes.iter().fold((Vector2::new(f64::INFINITY, f64::INFINITY), Vector2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(lo, hi), (p, _)| (Vector2::new(lo.x.min(p.x), lo.y.min(p.y)), Vector2::new(hi.x.max(p.x), hi.y.max(p.y))));
+        let middle = Vector2::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+        let label = match arrangement.face_at(middle, face_ids[0]) {
+            Some(f) if inside(f) => middle,
+            _ => arrangement.faces[root].label,
+        };
+        match made.iter().position(|c| c.handle.value() == h) {
+            Some(k) => out.push(write_parcel_over(doc, made[k].clone(), site, number, &face_ids, label, z, style, label_style)?),
+            None => {
+                let Some(EntityType::Extended(x)) = doc.get_entity(Handle::new(h)) else { continue };
+                let ExtendedEntityData::Arch(a) = &x.data else { continue };
+                let refs = a.typed_handles();
+                let (style, label_style) = (refs.get(3).map_or(style, |r| r.0), refs.get(4).map_or(label_style, |r| r.0));
+                let common = x.common.clone();
+                write_parcel_over(doc, common, site, number, &face_ids, label, z, style, label_style)?;
+            }
+        }
+    }
+    Ok((segment, out))
+}
+
 /// Adds a parcel on `site` bounded by a closed lot line (a parcel segment)
 /// through `vertices` (straight segments; the line closes back to the
 /// first vertex), and returns the parcel. The segment joins the site's
@@ -1124,9 +1383,9 @@ pub fn add_parcel(doc: &mut CadDocument, site: Handle, vertices: &[Vector2], lay
 /// positive counterclockwise, the tangent of a quarter of the arc's angle;
 /// a closed line's last bulge is the closing segment's), closed back to
 /// the first vertex when `closed`, and returns it with the parcels it
-/// makes. It may cross and touch the site's other lot lines (not its
-/// alignments or feature lines, and not where either has an arc): the lines are
-/// split where they meet, as the application splits them, every face the
+/// makes. It may cross and touch the site's other lot lines and its
+/// alignments (not its feature lines; arcs included):
+/// the lines are split where they meet, as the application splits them, every face the
 /// line closes or cuts off becomes a parcel (numbered in the order the
 /// faces are made) and the parcel of a face it cuts keeps the part the
 /// application gives it. Parcels take the site's parcel style and the
@@ -1194,8 +1453,9 @@ mod tests {
         assert!(add_site(&mut doc, "site 1", "").is_err());
         let a1 = add_alignment_on_site(&mut doc, s1, "AL1", &[v(0.0, 0.0), v(100.0, 0.0), v(200.0, 50.0)], &[VertexCurve::Arc(80.0)], None).unwrap();
         let a2 = add_alignment_on_site(&mut doc, s1, "AL2", &[v(0.0, 50.0), v(100.0, 80.0)], &[], None).unwrap();
-        // Crossing AL2 is refused.
-        assert!(add_alignment_on_site(&mut doc, s1, "AL3", &[v(50.0, 40.0), v(50.0, 100.0)], &[], None).is_err());
+        // Crossing AL1's arc is accepted (in a copy, so the drawing below
+        // keeps two alignments).
+        assert!(add_alignment_on_site(&mut doc.clone(), s1, "AL3", &[v(100.0, -20.0), v(100.0, 40.0)], &[], None).is_ok());
         let path = std::env::temp_dir().join(format!("civil-site-{}.dwg", std::process::id()));
         DwgWriter::write_to_file(&path, &doc).unwrap();
         let back = DwgReader::from_file(&path).unwrap().read().unwrap();
@@ -1401,6 +1661,49 @@ mod tests {
         assert_eq!(&refs[10..14], &[p1.value(), 0, p2.value(), 0]);
     }
     #[test]
+    fn feature_lines_split_a_parcel_into_faces() {
+        let v = Vector2::new;
+        let p = crate::types::Vector3::new;
+        let mut doc = drawing();
+        let s = add_site(&mut doc, "Site 1", "").unwrap();
+        let parcel = add_parcel(&mut doc, s, &[v(0.0, 0.0), v(100.0, 0.0), v(100.0, 50.0), v(0.0, 50.0)], None).unwrap();
+        add_feature_line(&mut doc, s, "FL1", &[p(-20.0, 25.0, 5.0), p(120.0, 25.0, 6.0)], None).unwrap();
+        add_feature_line(&mut doc, s, "FL2", &[p(50.0, -20.0, 5.0), p(50.0, 70.0, 6.0)], None).unwrap();
+        let path = std::env::temp_dir().join(format!("civil-parcel-faces-{}.dwg", std::process::id()));
+        DwgWriter::write_to_file(&path, &doc).unwrap();
+        let back = DwgReader::from_file(&path).unwrap().read().unwrap();
+        let _ = std::fs::remove_file(&path);
+        // One parcel over the four parts, listed once per face in the
+        // container; its label sits at the mean elevation of its outline
+        // (corners at 0, crossings 5.143 to 5.857: 22 / 8).
+        let (number, faces) = arch(&back, parcel).parcel_faces().unwrap();
+        assert_eq!((number, faces.len()), (1, 4));
+        let container = arch(&back, s).typed_handles()[5].0;
+        let refs: Vec<u64> = object(&back, Handle::new(container)).unwrap().typed_handles().iter().map(|r| r.0).collect();
+        assert_eq!(refs.iter().filter(|r| **r == parcel.value()).count(), 4);
+        let record = arch(&back, parcel);
+        let (data, start, end) = record.main_stream().unwrap();
+        let mut b = crate::classes::civil::bits::Bits::new(data, start, end);
+        crate::classes::civil::alignment::class_keys(&mut b).unwrap();
+        b.pos += 121;
+        for _ in 0..3 {
+            b.bit_long().unwrap();
+        }
+        b.bit_double().unwrap();
+        let label = [b.bit_double().unwrap(), b.bit_double().unwrap(), b.bit_double().unwrap()];
+        assert_eq!(label[..2], [50.0, 25.0]);
+        assert!((label[2] - 2.75).abs() < 1e-9);
+        // A lot line across it splits it along the line only; the line
+        // takes the feature lines' elevations where it crosses them.
+        let mut back = back;
+        let (_, made) = add_lot_line(&mut back, s, &[(v(75.0, -10.0), 0.0), (v(75.0, 60.0), 0.0)], false, None).unwrap();
+        assert_eq!(made.len(), 1);
+        let (_, left) = arch(&back, parcel).parcel_faces().unwrap();
+        let (_, right) = arch(&back, made[0]).parcel_faces().unwrap();
+        assert_eq!((left.len(), right.len()), (4, 2));
+        assert_eq!(arch(&back, made[0]).parcel_label().map(|l| (l.x, l.y)), Some((87.5, 25.0)));
+    }
+    #[test]
     fn crossing_lot_lines_split_the_parcels() {
         let v = Vector2::new;
         let w = |x: f64, y: f64| (Vector2::new(x, y), 0.0);
@@ -1412,8 +1715,7 @@ mod tests {
         let (_, second) = add_lot_line(&mut doc, s, &[w(50.0, 0.0), w(50.0, 50.0)], false, None).unwrap();
         let (_, third) = add_lot_line(&mut doc, s, &[w(0.0, 25.0), w(100.0, 25.0)], false, None).unwrap();
         assert_eq!((first.len(), second.len(), third.len()), (1, 1, 2));
-        // Neither the alignment nor a plain parcel may be met.
-        assert!(add_lot_line(&mut doc, s, &[w(10.0, -60.0), w(10.0, -40.0)], false, None).is_err());
+        // A plain parcel may not meet another line.
         assert!(add_parcel(&mut doc, s, &[v(90.0, 40.0), v(110.0, 40.0), v(110.0, 60.0)], None).is_err());
         let path = std::env::temp_dir().join(format!("civil-lot-lines-{}.dwg", std::process::id()));
         DwgWriter::write_to_file(&path, &doc).unwrap();
@@ -1444,5 +1746,57 @@ mod tests {
         // The site still takes members; the alignment keeps its edge.
         assert!(add_lot_line(&mut back, s, &[w(200.0, 0.0), w(300.0, 0.0), w(300.0, 50.0)], true, None).is_ok());
         assert_eq!(object(&back, Handle::new(container)).unwrap().site_members()[0], a.value());
+    }
+
+    #[test]
+    fn alignments_and_lot_lines_split_each_other() {
+        let v = Vector2::new;
+        let w = |x: f64, y: f64| (Vector2::new(x, y), 0.0);
+        let mut doc = drawing();
+        let s = add_site(&mut doc, "Site 1", "").unwrap();
+        add_alignment_on_site(&mut doc, s, "AL1", &[v(-20.0, 25.0), v(120.0, 25.0)], &[], None).unwrap();
+        // A rectangle across the alignment: two parcels, the lower half
+        // first (its first segment's side).
+        let (_, first) = add_lot_line(&mut doc, s, &[w(0.0, 0.0), w(100.0, 0.0), w(100.0, 50.0), w(0.0, 50.0)], true, None).unwrap();
+        assert_eq!(first.len(), 2);
+        // An alignment across both: two more parcels, numbered on.
+        add_alignment_on_site(&mut doc, s, "AL2", &[v(50.0, -20.0), v(50.0, 70.0)], &[], None).unwrap();
+        // Two alignments closing a loop make a parcel of it.
+        add_alignment_on_site(&mut doc, s, "AL3", &[v(200.0, 0.0), v(300.0, 0.0), v(300.0, 50.0)], &[VertexCurve::None], None).unwrap();
+        add_alignment_on_site(&mut doc, s, "AL4", &[v(300.0, 50.0), v(200.0, 50.0), v(200.0, 0.0)], &[VertexCurve::None], None).unwrap();
+        let mut labels: Vec<(i32, i32, Vector2)> = doc
+            .entities()
+            .filter_map(|e| match e {
+                EntityType::Extended(x) => match &x.data {
+                    ExtendedEntityData::Arch(a) if a.parcel_site().is_some() => a.parcel_face().zip(a.parcel_label()).map(|((n, f), l)| (n, f, l)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        labels.sort_by_key(|l| l.0);
+        assert_eq!(labels, vec![(1, 2, v(25.0, 37.5)), (2, 3, v(25.0, 12.5)), (3, 4, v(75.0, 12.5)), (4, 5, v(75.0, 37.5)), (5, 6, v(250.0, 25.0))]);
+    }
+
+    #[test]
+    fn arcs_split_where_lines_meet() {
+        let v = Vector2::new;
+        let w = |x: f64, y: f64| (Vector2::new(x, y), 0.0);
+        let mut doc = drawing();
+        let s = add_site(&mut doc, "Site 1", "").unwrap();
+        // A rectangle whose first side is an arc of bulge 0.5 (down to -25).
+        let (_, first) = add_lot_line(&mut doc, s, &[(v(0.0, 0.0), 0.5), w(100.0, 0.0), w(100.0, 50.0), w(0.0, 50.0)], true, None).unwrap();
+        let (_, more) = add_lot_line(&mut doc, s, &[w(50.0, -40.0), w(50.0, 70.0)], false, None).unwrap();
+        assert_eq!((first.len(), more.len()), (1, 1));
+        let container = arch(&doc, s).typed_handles()[5].0;
+        let edge = &object(&doc, Handle::new(container)).unwrap().topology().unwrap().edges[0];
+        // The arc's two halves: each a quarter of the sweep.
+        let half = (0.5_f64.atan() / 2.0).tan();
+        assert!((edge[0].bulge - half).abs() < 1e-12 && (edge[1].bulge - half).abs() < 1e-12);
+        assert!((edge[1].point - v(50.0, -25.0)).length() < 1e-9);
+        // A line crossing both halves; the site still takes members (its
+        // arcs read whole).
+        assert!(add_lot_line(&mut doc, s, &[w(-10.0, -10.0), w(110.0, -10.0)], false, None).is_ok());
+        assert!(add_lot_line(&mut doc, s, &[w(0.0, 25.0), w(100.0, 25.0)], false, None).is_ok());
     }
 }

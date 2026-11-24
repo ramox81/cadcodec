@@ -34,9 +34,9 @@ pub use alignment::{
     display_station, AlignmentAnchor, AlignmentCriteria, AlignmentElement, AlignmentType, OffsetParameters, OffsetRegion, WideningTransition, AlignmentElementKind, AlignmentPiece, DesignSpeed, GeometryPoint, SpiralShape,
     StationEquation, CriticalStationData, SuperelevationCurveData, SuperelevationView};
 pub use cogo::{CogoPoint, PointGroupClassification, PointGroupOverrides, PropertyValue, UserProperty};
-pub use create::{add_tin_surface_with, add_assembly, add_pkt_subassembly, add_pkt_subassembly_on, PktSource, add_alignment, add_alignment_with_curves, add_offset_alignment, add_offset_alignment_with_widenings, Widening, add_alignment_of_kind, add_design_speeds, add_station_equations, add_superelevation, CriticalStation, CriticalStationKind, SuperelevationCurve, AlignmentKind, VertexCurve, add_corridor, add_corridor_with, add_cogo_point, add_intersection, add_point_group, add_point_group_query, add_profile, add_profile_entities, add_profile_with_curves, add_surface_profile, ProfileEntity, VerticalCurve, add_profile_view, add_profile_view_with_bands, add_profile_view_with_range, BandKind, BandStagger, ProfileViewBand, add_sample_line, add_sample_line_through, add_sample_line_group, add_sections, add_section_view, add_site, add_alignment_on_site, add_feature_line, add_parcel, add_feature_line_vertices, FeatureLineVertex, add_tin_surface, cogo_points, ensure_civil, remove_cogo_point, set_cogo_point, set_cogo_point_name, set_point_group, set_point_group_overrides, set_point_group_query, Comparison, PointAttribute, PointQuery, QueryConstant, QueryExpression, add_lot_line, add_pipe, add_pipe_network, add_pipe_of_family, add_structure, add_structure_of_family, connect_pipe, network_part_families, add_pressure_appurtenance, add_pressure_arc_pipe, add_pressure_cross, add_pressure_fitting, add_pressure_network, add_pressure_part, add_pressure_pipe, add_pressure_pipe_of_size, add_pressure_tee, connect_pressure_parts, pressure_part_descriptions, add_profile_view_style, add_profile_view_with_style, add_offset_profile, add_section_view_group, add_profile_view_style_with, set_feature_line_vertices, set_cogo_point_label_style, add_label_style, add_point_label_style, label_style, LabelStyle, add_intersection_with, IntersectionOffsets, add_curb_return, add_curb_return_with, CurbReturnCurve, add_point_choice_property, add_point_property, add_point_property_classification, point_properties, set_cogo_point_property};
+pub use create::{add_tin_surface_with, add_assembly, add_pkt_subassembly, add_pkt_subassembly_on, PktSource, add_alignment, add_alignment_with_curves, add_offset_alignment, add_offset_alignment_with_widenings, Widening, add_alignment_of_kind, add_design_speeds, add_station_equations, add_superelevation, CriticalStation, CriticalStationKind, SuperelevationCurve, AlignmentKind, VertexCurve, add_corridor, add_corridor_with, add_cogo_point, add_intersection, add_point_group, add_point_group_query, add_profile, add_profile_entities, add_profile_with_curves, add_static_profile, add_surface_profile, ProfileEntity, VerticalCurve, add_profile_view, add_profile_view_with_bands, add_profile_view_with_range, BandKind, BandStagger, ProfileViewBand, add_sample_line, add_sample_line_through, add_sample_line_group, add_sections, add_section_view, add_site, add_alignment_on_site, add_feature_line, add_parcel, add_feature_line_vertices, FeatureLineVertex, add_tin_surface, cogo_points, ensure_civil, remove_cogo_point, set_cogo_point, set_cogo_point_name, set_point_group, set_point_group_overrides, set_point_group_query, Comparison, PointAttribute, PointQuery, QueryConstant, QueryExpression, add_lot_line, add_pipe, add_pipe_network, add_pipe_of_family, add_structure, add_structure_of_family, connect_pipe, network_part_families, add_pressure_appurtenance, add_pressure_arc_pipe, add_pressure_cross, add_pressure_fitting, add_pressure_network, add_pressure_part, add_pressure_pipe, add_pressure_pipe_of_size, add_pressure_tee, connect_pressure_parts, pressure_part_descriptions, add_profile_view_style, add_profile_view_with_style, add_offset_profile, add_section_view_group, add_profile_view_style_with, set_feature_line_vertices, set_cogo_point_label_style, add_label_style, add_point_label_style, label_style, LabelStyle, add_intersection_with, add_intersection_with_curb_returns, IntersectionOffsets, CURB_RETURN_MARGIN, add_curb_return, add_curb_return_with, CurbReturnCurve, add_point_choice_property, add_point_property, add_point_property_classification, point_properties, set_cogo_point_property, add_pipe_of_size, network_pipe_sizes, add_structure_of_size, network_structure_size_fields, StructureSizeChoice, add_intersection_with_curb_return_profiles, CurbReturnProfiles};
 pub use corridor::{CorridorBaseline, CorridorBoundary, CorridorDefinition, CorridorRegion, CorridorSurfaceDefinition, CurveStations, RegionFrequency, RegionTarget, TargetCurveStations, TargetKind};
-pub use grading::{CriteriaValue, GradingCriteria};
+pub use grading::{CriteriaValue, GradingCriteria, GradingEntity, GradingGroup, GradingGroupRecord, GradingGroupTree};
 pub use intersection::IntersectionLayout;
 pub use labels::{parse_format, property, LabelPart, LabelText};
 pub use label_style::{LabelArrowComponent, LabelBlockComponent, LabelBorder, LabelDraggedState, LabelIteratorComponent, LabelLeader, LabelLineComponent, LabelStyleSettings, LabelTextComponent, LabelTickComponent};
@@ -49,7 +49,7 @@ pub use section::{MassHaulViewFrame, SectionGeometry, SectionViewFrame};
 pub use style::{DisplayComponent, Marker, ProfileViewAxisStyle, ProfileViewAxisTitle, ProfileViewGrid, ProfileViewGridLines, ProfileViewStyleSettings, ProfileViewTicks, ProfileViewTitle, ViewAxes, ViewAxis};
 pub use subassembly::{AssemblyLayout, Attachment, SubassemblyShape};
 pub use survey::SurveyFigure;
-pub use view_frames::{MatchLine, SheetGeometry, ViewFrame, ViewFrameGeometry};
+pub use view_frames::{MatchLine, MatchLineGeometry, SheetGeometry, ViewFrame, ViewFrameGeometry};
 pub use topology::{Topology, TopologyVertex};
 pub use tin::{TinBoundaryType, TinBreaklineType, TinDefinition, TinLines, TinOperation, TinSurface, TinTriangle, TinVertex};
 
@@ -441,14 +441,30 @@ impl ArchEntityData {
     }
 
     /// The two alignments a curb return connects: its last six references
-    /// name them as A, A, B, B, A, B.
+    /// name them as A, A, B, B, A, B; an intersection's curb return names
+    /// A, A's offset alignment, B, B's offset alignment and the
+    /// intersection last (see [`Self::alignment_intersection_curb_return`]).
     pub fn alignment_connected_inputs(&self) -> Option<[u64; 2]> {
         if self.alignment_type()? != AlignmentType::CurbReturn {
             return None;
         }
         let handles = self.decode().handles;
         let tail = handles.get(handles.len().checked_sub(6)?..)?;
-        (tail[0] == tail[1] && tail[2] == tail[3] && tail[4] == tail[0] && tail[5] == tail[2]).then(|| [tail[0], tail[2]])
+        if tail[0] == tail[1] && tail[2] == tail[3] && tail[4] == tail[0] && tail[5] == tail[2] {
+            return Some([tail[0], tail[2]]);
+        }
+        self.alignment_intersection_curb_return().map(|(roads, _, _)| roads)
+    }
+
+    /// An intersection's curb return: its two roads, the offset alignments
+    /// it runs along and the intersection (its last five references).
+    pub fn alignment_intersection_curb_return(&self) -> Option<([u64; 2], [u64; 2], u64)> {
+        if self.alignment_type()? != AlignmentType::CurbReturn {
+            return None;
+        }
+        let handles = self.decode().handles;
+        let tail = handles.get(handles.len().checked_sub(5)?..)?;
+        (tail[0] != tail[1] && tail[2] != tail[3] && tail[4] != tail[0] && tail[4] != tail[2] && tail.iter().all(|h| *h != 0)).then(|| ([tail[0], tail[2]], [tail[1], tail[3]], tail[4]))
     }
 
     /// The JSON string a connected alignment keeps its curve settings in
@@ -879,9 +895,19 @@ impl ArchEntityData {
     /// class head with keys 0x0D00800A BL 0, 0x02008022 BD 0.1,
     ///   0x0200800B BD 1/24, BL 0, 121 zero bits
     /// BL number, BL 0, BL 0, BD 0, 3BD label location, BL 80, BL 1,
-    /// 3BD label location, BL 2, BL 1, BL face, BL 0, B 0, BS 0x04BE
+    /// 3BD label location, BL 2, BL n, n x BL face, BL 0, B 0, BS 0x04BE
     /// ```
+    ///
+    /// A parcel a feature line split lies over several faces (PD01); this
+    /// gives the first, [`Self::parcel_faces`] all.
     pub fn parcel_face(&self) -> Option<(i32, i32)> {
+        let (number, faces) = self.parcel_faces()?;
+        Some((number, *faces.first()?))
+    }
+
+    /// A parcel's number and every face of its site's topology it covers
+    /// (see [`Self::parcel_face`]).
+    pub fn parcel_faces(&self) -> Option<(i32, Vec<i32>)> {
         self.parcel_site()?;
         let (data, start, end) = self.main_stream()?;
         let mut b = bits::Bits::new(data, start, end);
@@ -897,8 +923,10 @@ impl ArchEntityData {
         for _ in 0..3 {
             b.bit_double()?;
         }
-        (b.bit_long()? == 2 && b.bit_long()? == 1).then_some(())?;
-        Some((number, b.bit_long()?))
+        (b.bit_long()? == 2).then_some(())?;
+        let n = b.bit_long()?;
+        (1..=64).contains(&n).then_some(())?;
+        Some((number, (0..n).map(|_| b.bit_long()).collect::<Option<_>>()?))
     }
 
     /// Where a parcel's area label sits (the label location after its
@@ -1157,6 +1185,19 @@ impl ArchEntityData {
         view_frames::match_line(&strings, &self.typed_handles())
     }
 
+    /// The rectangle a match line (`AECC_MATCHLINE`) record keeps in its
+    /// graphic-image section: the closed four-corner walk whose bounds are
+    /// the live API's `GeometricExtents`; see
+    /// [`view_frames::MatchLineGeometry`].
+    pub fn match_line_geometry(&self) -> Option<view_frames::MatchLineGeometry> {
+        if self.dxf_name != "AECC_MATCHLINE" {
+            return None;
+        }
+        let graphic = super::arch::decode::entity_graphic_data(self)?;
+        let (data, start, end) = self.main_stream()?;
+        view_frames::match_line_geometry(data, start, end, &graphic)
+    }
+
     /// Number fields of the part data a Civil 3D pipe (`AECC_PIPE`) keeps
     /// itself: flow coefficients, minimum curve radius and the like.
     pub fn pipe_part_fields(&self) -> Vec<PartField> {
@@ -1258,6 +1299,17 @@ impl ArchEntityData {
         let (data, start, end) = self.main_stream()?;
         parcel_segments::geometry(&data, start, end, &graphic)
     }
+
+    /// The references a grading entity (`AECC_GRADING`) record
+    /// carries; see [`grading::GradingEntity`].
+    pub fn grading(&self) -> Option<GradingEntity> {
+        if self.dxf_name != "AECC_GRADING" {
+            return None;
+        }
+        let handles = self.decode().handles;
+        let (data, start, end) = self.main_stream()?;
+        grading::entity(data, start, end, &handles)
+    }
 }
 
 impl ArchObject {
@@ -1343,6 +1395,18 @@ impl ArchObject {
         let handles = self.decode().handles;
         let (data, start, end) = self.main_stream()?;
         grading::criteria(data, start, end, &handles)
+    }
+
+    /// A grading group record (`AECC_GRADING_GROUP`): a site's
+    /// root group or a named group of gradings; see
+    /// [`grading::GradingGroupRecord`].
+    pub fn grading_group(&self) -> Option<GradingGroupRecord> {
+        if self.dxf_name != "AECC_GRADING_GROUP" {
+            return None;
+        }
+        let decoded = self.decode();
+        let (data, start, end) = self.main_stream()?;
+        grading::group_record(data, start, end, &decoded.strings, &decoded.handles)
     }
 
     /// Profile Locking settings kept in a profile's

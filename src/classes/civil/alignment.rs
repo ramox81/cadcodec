@@ -248,7 +248,10 @@ pub enum SpiralShape {
     /// Linear in arc length (type 256), and types not decoded.
     #[default]
     Clothoid,
-    /// `(1 - cos(pi x/X)) / 2` against the tangent offset (257).
+    /// `(1 - cos(pi x/X)) / 2` against the tangent offset, with
+    /// `X = L - (1/3 - 3/(2 pi^2)) / 8 L^3 / R^2` (257); `X` grows with `L`
+    /// only while `L^2 < R^2 / (3 a)`, `a` that coefficient (see
+    /// [`SpiralShape::length_ok`]).
     SineHalfWave,
     /// `y = x^3 / (6 R X)`, with `X + X^3 / (40 R^2) = L` (258).
     JapaneseCubic,
@@ -272,6 +275,119 @@ impl SpiralShape {
             261 => Self::Sinusoidal,
             262 => Self::Biquadratic,
             _ => Self::Clothoid,
+        }
+    }
+
+    /// The spiral definition code the records store.
+    pub(crate) fn code(self) -> i32 {
+        match self {
+            Self::Clothoid => 256,
+            Self::SineHalfWave => 257,
+            Self::JapaneseCubic => 258,
+            Self::Bloss => 259,
+            Self::CubicParabola => 260,
+            Self::Sinusoidal => 261,
+            Self::Biquadratic => 262,
+        }
+    }
+
+    /// Whether a spiral of `length` ending at `radius` has this shape's
+    /// geometry: the sine half-wave's `X` must grow with `L`.
+    pub(crate) fn length_ok(self, length: f64, radius: f64) -> bool {
+        match self {
+            Self::SineHalfWave => 3.0 * SINE_HALF_WAVE_X * length * length < radius * radius,
+            _ => true,
+        }
+    }
+
+    /// The integral over `[0, t]` of the curvature fraction, for the shapes
+    /// defined along the arc (`None` for those given as a tangent offset).
+    fn along(self) -> Option<fn(f64) -> f64> {
+        Some(match self {
+            Self::Clothoid => |t| t * t / 2.0,
+            Self::Bloss => |t| t.powi(3) - t.powi(4) / 2.0,
+            Self::Sinusoidal => |t| t * t / 2.0 + ((2.0 * PI * t).cos() - 1.0) / (4.0 * PI * PI),
+            Self::Biquadratic => |t| {
+                if t <= 0.5 {
+                    2.0 * t.powi(3) / 3.0
+                } else {
+                    1.0 / 12.0 + (t - 0.5) + 2.0 / 3.0 * ((1.0 - t).powi(3) - 0.125)
+                }
+            },
+            _ => return None,
+        })
+    }
+
+    /// Where a spiral of `length` ending at `radius` ends, started at the
+    /// origin along +x and turning left, and the heading it ends on.
+    pub(crate) fn end(self, length: f64, radius: f64) -> (Vector2, f64) {
+        if let Some(f) = self.along() {
+            let heading = |d: f64| length / radius * f(d / length);
+            let x = gauss(|d| heading(d).cos(), 0.0, length);
+            let y = gauss(|d| heading(d).sin(), 0.0, length);
+            return (Vector2::new(x, y), heading(length));
+        }
+        let (x, offset, slope) = offset_curve(self, length, radius);
+        (Vector2::new(x, offset(x)), slope(x).atan())
+    }
+}
+
+/// The coefficient `a` of the sine half-wave's `X = L - a L^3 / R^2`.
+const SINE_HALF_WAVE_X: f64 = (1.0 / 3.0 - 1.5 / (PI * PI)) / 8.0;
+
+/// The integral of `f` over `[a, b]`: five-point Gauss-Legendre on 32 panels.
+fn gauss(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 {
+    const X: [f64; 5] = [-0.906_179_845_938_664, -0.538_469_310_105_683_1, 0.0, 0.538_469_310_105_683_1, 0.906_179_845_938_664];
+    const W: [f64; 5] = [0.236_926_885_056_189_1, 0.478_628_670_499_366_5, 0.568_888_888_888_888_9, 0.478_628_670_499_366_5, 0.236_926_885_056_189_1];
+    let h = (b - a) / 32.0;
+    (0..32)
+        .map(|i| {
+            let c = a + (i as f64 + 0.5) * h;
+            X.iter().zip(W).map(|(x, w)| w * f(c + x * h / 2.0)).sum::<f64>() * h / 2.0
+        })
+        .sum()
+}
+
+/// A spiral given as a tangent offset `y(x)` from the tangent at its
+/// zero-curvature end: its `X`, `y` and the slope `y'`.
+#[allow(clippy::type_complexity)]
+fn offset_curve(shape: SpiralShape, length: f64, r: f64) -> (f64, Box<dyn Fn(f64) -> f64>, Box<dyn Fn(f64) -> f64>) {
+    // The value halving `[lo, hi]` finds where `f` rises through zero.
+    let halve = |f: &dyn Fn(f64) -> f64, mut lo: f64, mut hi: f64| {
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if f(mid) < 0.0 { lo = mid } else { hi = mid }
+        }
+        lo
+    };
+    match shape {
+        SpiralShape::JapaneseCubic => {
+            // X + X^3 / (40 R^2) = L: increasing in X, solved by Newton
+            // from L down to convergence.
+            let mut x = length;
+            for _ in 0..100 {
+                let step = (x + x.powi(3) / (40.0 * r * r) - length) / (1.0 + 3.0 * x * x / (40.0 * r * r));
+                x -= step;
+                if step.abs() <= f64::EPSILON * length {
+                    break;
+                }
+            }
+            (x, Box::new(move |t| t.powi(3) / (6.0 * r * x)), Box::new(move |t| t * t / (2.0 * r * x)))
+        }
+        SpiralShape::CubicParabola => {
+            let slope = move |t: f64| t * t / (2.0 * r * length);
+            let x = halve(&|m| gauss(|t| (1.0 + slope(t).powi(2)).sqrt(), 0.0, m) - length, 0.5 * length, length);
+            (x, Box::new(move |t| t.powi(3) / (6.0 * r * length)), Box::new(slope))
+        }
+        _ => {
+            // Sine half-wave: curvature (1 - cos(pi x/X)) / (2R) against x,
+            // X = L - (1/3 - 3/(2 pi^2)) / 8 L^3 / R^2 (CS01, K9, K10).
+            let x = length - SINE_HALF_WAVE_X * length.powi(3) / (r * r);
+            (
+                x,
+                Box::new(move |t| (t * t / 2.0 - x * x / (PI * PI) * (1.0 - (PI * t / x).cos())) / (2.0 * r)),
+                Box::new(move |t| (t - x / PI * (PI * t / x).sin()) / (2.0 * r)),
+            )
         }
     }
 }
@@ -1301,12 +1417,18 @@ pub enum AlignmentPiece {
 
 use AlignmentPiece as Piece;
 
+/// Whether two solved points are the same point, within `1e-9` of the
+/// coordinate magnitude.
+fn same_solved_point(a: Vector2, b: Vector2) -> bool {
+    a.distance(&b) <= 1e-9 * (1.0 + a.x.abs().max(a.y.abs()))
+}
+
 /// `(start, end, kind)` index ranges of the pieces of a solved run. Every
-/// solved piece repeats its first point at the join.
+/// solved piece repeats its first point at the join (see [`same_solved_point`]).
 fn split_points(raw: &[Vector2]) -> Vec<(usize, usize)> {
     let mut joins = vec![0];
     for i in 1..raw.len() {
-        if raw[i].distance(&raw[i - 1]) < 1e-9 {
+        if same_solved_point(raw[i - 1], raw[i]) {
             joins.push(i);
         }
     }
@@ -1337,7 +1459,7 @@ fn solved_pieces(elements: &[AlignmentElement]) -> (Vec<Vec<Vector2>>, Vec<Vec<(
     WALKED.with(|w| w.borrow_mut().clear());
     let raw = raw_polylines(elements);
     let walked = WALKED.with(|w| std::mem::take(&mut *w.borrow_mut()));
-    let same = |a: Vector2, b: Vector2| a.distance(&b) <= 1e-9 * (1.0 + a.x.abs().max(a.y.abs()));
+    let same = same_solved_point;
     let pieces = raw
         .iter()
         .map(|run| {
@@ -2200,27 +2322,12 @@ fn three_point_arc(a: Vector2, b: Vector2, c: Vector2) -> Option<(Vec<Vector2>, 
 /// A spiral of `shape` from `s`: curvature rising from zero to `k`
 /// (`inward`), or falling from `k` to zero.
 fn spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape) -> (Vec<Vector2>, State) {
-    use std::f64::consts::PI;
-    // Integral over [0, t] of the curvature fraction, for shapes defined
-    // along the arc.
-    let along: Option<fn(f64) -> f64> = match shape {
-        SpiralShape::Clothoid => None,
-        SpiralShape::Bloss => Some(|t| t.powi(3) - t.powi(4) / 2.0),
-        SpiralShape::Sinusoidal => Some(|t| t * t / 2.0 + ((2.0 * PI * t).cos() - 1.0) / (4.0 * PI * PI)),
-        SpiralShape::Biquadratic => Some(|t| {
-            if t <= 0.5 {
-                2.0 * t.powi(3) / 3.0
-            } else {
-                1.0 / 12.0 + (t - 0.5) + 2.0 / 3.0 * ((1.0 - t).powi(3) - 0.125)
-            }
-        }),
-        _ => {
-            return offset_spiral(s, k, inward, length, shape);
-        }
-    };
-    let Some(integral) = along else {
+    if shape == SpiralShape::Clothoid {
         let (k0, k1) = if inward { (s.curvature, k) } else { (k, 0.0) };
         return pieces(s, &[(k0, k1, length)]);
+    }
+    let Some(integral) = shape.along() else {
+        return offset_spiral(s, k, inward, length, shape);
     };
     // The shapes are symmetric about mid-length, so falling curvature is
     // `k (1 - f(t))`.
@@ -2256,57 +2363,7 @@ fn spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape) -> (V
 /// Spirals given as a tangent offset `y(x)` from the tangent at their
 /// zero-curvature end, out to `x = X`.
 fn offset_spiral(s: State, k: f64, inward: bool, length: f64, shape: SpiralShape) -> (Vec<Vector2>, State) {
-    use std::f64::consts::PI;
-    let r = 1.0 / k.abs();
-    let arc = |slope: &dyn Fn(f64) -> f64, x_end: f64| {
-        let n = 2000;
-        (0..n)
-            .map(|i| {
-                let x = (i as f64 + 0.5) * x_end / n as f64;
-                (1.0 + slope(x).powi(2)).sqrt() * x_end / n as f64
-            })
-            .sum::<f64>()
-    };
-    // `X` from the shape's rule; `y` and its slope.
-    let (x_end, offset, slope): (f64, Box<dyn Fn(f64) -> f64>, Box<dyn Fn(f64) -> f64>) = match shape {
-        SpiralShape::JapaneseCubic => {
-            // X + X^3 / (40 R^2) = L
-            let mut x = length;
-            for _ in 0..50 {
-                x -= (x + x.powi(3) / (40.0 * r * r) - length) / (1.0 + 3.0 * x * x / (40.0 * r * r));
-            }
-            (x, Box::new(move |t| t.powi(3) / (6.0 * r * x)), Box::new(move |t| t * t / (2.0 * r * x)))
-        }
-        SpiralShape::CubicParabola => {
-            let slope = move |t: f64| t * t / (2.0 * r * length);
-            let (mut lo, mut hi) = (0.5 * length, length);
-            for _ in 0..60 {
-                let mid = (lo + hi) / 2.0;
-                if arc(&slope, mid) < length { lo = mid } else { hi = mid }
-            }
-            (lo, Box::new(move |t| t.powi(3) / (6.0 * r * length)), Box::new(slope))
-        }
-        _ => {
-            // Sine half-wave: curvature (1 - cos(pi x/X)) / (2R) against x.
-            // ponytail: X is taken so the arc is `L` long; one sample puts
-            // Civil 3D's X 0.2% shorter, so its end can sit ~0.4 off on a
-            // 200-long spiral. Pin the rule down with more samples.
-            let curve = move |x_end: f64| {
-                move |t: f64| (t - x_end / PI * (PI * t / x_end).sin()) / (2.0 * r)
-            };
-            let (mut lo, mut hi) = (0.5 * length, length);
-            for _ in 0..60 {
-                let mid = (lo + hi) / 2.0;
-                if arc(&curve(mid), mid) < length { lo = mid } else { hi = mid }
-            }
-            let x = lo;
-            (
-                x,
-                Box::new(move |t| (t * t / 2.0 - x * x / (PI * PI) * (1.0 - (PI * t / x).cos())) / (2.0 * r)),
-                Box::new(curve(x)),
-            )
-        }
-    };
+    let (x_end, offset, slope) = offset_curve(shape, length, 1.0 / k.abs());
     let turn = k.signum();
     let n = ((length / STEP).ceil() as usize).clamp(2, 20000);
     // Local points from the zero-curvature end, turning `turn`.
@@ -3060,12 +3117,14 @@ pub(super) fn equations_and_speeds_with_ids(data: &[u8], start: usize, end: usiz
     Some((equations, speeds))
 }
 
-/// A critical station of a superelevation curve as stored: its kind (3
-/// begin full super, 4 end full super, 7 level crown, 8 low shoulder
-/// match, 9 reverse crown, 10 manual, ...), its station from the curve's
-/// start (from its end in the ending attainment region), the region and
-/// the cross slopes of the left outside lane, left inside lane, right
-/// outside lane, right inside lane, then the same four shoulders.
+/// A critical station of a superelevation curve as stored: its kind (1
+/// begin normal crown, 2 begin normal shoulder, 3 begin full super,
+/// 4 end full super, 5 end normal shoulder, 6 end normal crown, 7 level
+/// crown, 8 low shoulder match, 9 reverse crown, 10 manual), its station
+/// from the curve's start (from its end in the ending attainment region),
+/// the region and the cross slopes of the left outside lane, left inside
+/// lane, right outside lane, right inside lane, then the same four
+/// shoulders.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CriticalStationData {
@@ -3194,9 +3253,20 @@ fn plain_superelevation(bits: &mut Bits) -> Option<Vec<SuperelevationCurveData>>
     Some(curves)
 }
 
-/// The superelevation curves of an alignment record of the plain form
-/// (see [`plain_superelevation`]); an empty list when it has no block.
+/// The superelevation curves of an alignment record: the plain form this
+/// crate writes (see [`plain_superelevation`]) or, when that does not
+/// fit, the application's own form (see [`real_superelevation`]); an
+/// empty list when the record has no block.
 pub(super) fn superelevation_curves(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<Vec<SuperelevationCurveData>> {
+    if let Some(curves) = plain_superelevation_curves(data, start, end, first, last) {
+        return Some(curves);
+    }
+    real_superelevation_curves(data, start, end, first, last)
+}
+
+/// The superelevation curves of a record of the plain form: the type head
+/// the plain walker confirms (see [`typed_at`]) locates the block.
+fn plain_superelevation_curves(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<Vec<SuperelevationCurveData>> {
     let at = post_cache_starts(data, start, end)?.into_iter().find(|pos| typed_at(data, *pos, end, first, last, true).is_some())?;
     let (_, _, pos) = post_cache_at(data, at, end, first, last, true)?;
     let mut bits = Bits::new(data, pos, end);
@@ -3206,6 +3276,183 @@ pub(super) fn superelevation_curves(data: &[u8], start: usize, end: usize, first
         1 => plain_superelevation(&mut bits),
         _ => None,
     }
+}
+
+/// Bounds of the settings template run a curve of the application's form
+/// carries (`Align-Superelevation-4.dwg` shows 1413 and 1479 bits; the
+/// plain form's manual-station settings are 582). The run's internal
+/// layout is not mapped; its extent is resolved like the alignment
+/// reader's post-cache head ([`post_cache_starts`]): a candidate length
+/// is accepted only when the entire station list that follows — every
+/// field, node repetition and segment kind — parses under it, which pins
+/// it exactly.
+const REAL_SETTINGS_MIN_BITS: usize = 8;
+const REAL_SETTINGS_MAX_BITS: usize = 16384;
+
+/// The superelevation curves of a record of the application's own form
+/// (see [`real_superelevation`]): the block fills the record body to its
+/// end, so the plain walker's trailing type fields are absent and the
+/// block is located by its head alone (a finite `BD`, then `BL 1`).
+fn real_superelevation_curves(data: &[u8], start: usize, end: usize, first: f64, last: f64) -> Option<Vec<SuperelevationCurveData>> {
+    post_cache_starts(data, start, end)?.into_iter().find_map(|at| {
+        let (_, _, pos) = post_cache_at(data, at, end, first, last, true)?;
+        let mut bits = Bits::new(data, pos, end);
+        bits.bit_double()?.is_finite().then_some(())?;
+        (bits.bit_long()? == 1).then_some(())?;
+        real_superelevation(&mut bits, None)
+    })
+}
+
+/// A superelevation block of the application's own form, read after its
+/// `BL 1` (observed in `Align-Superelevation-4.dwg`; the reader's plain
+/// form is [`plain_superelevation`]):
+///
+/// ```text
+/// B, BL k curves, B, [k = 0: 1 bit],
+/// k x { node, BL 0, B, [last: BL k], B }
+/// k x { node, B; node, B settings,
+///       [settings: the application's attainment-settings template run,
+///        an opaque bit template of file-specific length (the plain
+///        form's 582-bit manual-station settings analogue; its extent is
+///        resolved as REAL_SETTINGS_* describe)],
+///       10 bits, [a `BL 0` in two of the sample's four curves: BL 0],
+///       BL v, then v stations, B 0, B }
+/// station:  BL 3, BL kind, BD station from the curve's start (from its
+///           end in the ending region), BD region (0 beginning, 1
+///           ending), B, node, BL segments, then per cross segment
+///           BL side, BL inside, BL lane, BL 3, BL kind, BD station,
+///           BD region, B, node, BD, BD slope
+/// The stations stand in kind order: 1 begin normal crown, 2 begin
+/// normal shoulder, 3 begin full super, 4 end full super, 5 end normal
+/// shoulder, 6 end normal crown, 7 level crown, 9 reverse crown — the
+/// attainment side each lies on comes from its region.
+/// ```
+/// The lane table that follows the last curve is not mapped and stays
+/// unread. `hint` carries the settings length of the previous curve,
+/// which the search tries first.
+fn real_superelevation(bits: &mut Bits, hint: Option<usize>) -> Option<Vec<SuperelevationCurveData>> {
+    let node = |bits: &mut Bits| -> Option<i16> {
+        let v = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+        (v[0] == v[2] && v[1] == -1 && v[3] == -1).then_some(())?;
+        i16::try_from(v[0]).ok()
+    };
+    (!bits.bit()?).then_some(())?;
+    let n = bits.bit_long()?;
+    (0..=1000).contains(&n).then_some(())?;
+    (!bits.bit()?).then_some(())?;
+    if n == 0 {
+        bits.bit()?;
+        return Some(Vec::new());
+    }
+    let mut elements = Vec::new();
+    for i in 0..n {
+        elements.push(node(bits)?);
+        (bits.bit_long()? == 0).then_some(())?;
+        (!bits.bit()?).then_some(())?;
+        if i + 1 == n {
+            (bits.bit_long()? == n).then_some(())?;
+        }
+        (!bits.bit()?).then_some(())?;
+    }
+    let mut curves = Vec::new();
+    let mut settings = hint;
+    for element in elements {
+        (node(bits)? == element && !bits.bit()?).then_some(())?;
+        (node(bits)? == element).then_some(())?;
+        let curve = real_curve(bits, element, settings)?;
+        settings = Some(curve.1);
+        curves.push(curve.0);
+        (bits.bit_long()? == 0 && !bits.bit()?).then_some(())?;
+    }
+    Some(curves)
+}
+
+/// One curve's stations of the application's form, after its body head;
+/// returns them with the settings length that validated. The settings
+/// extent is resolved over the candidates [`REAL_SETTINGS_MIN_BITS`] to
+/// [`REAL_SETTINGS_MAX_BITS`] bound (no settings at all and the previous
+/// curve's length first), the first that the entire station list parses
+/// under.
+fn real_curve(bits: &mut Bits, element: i16, hint: Option<usize>) -> Option<(SuperelevationCurveData, usize)> {
+    let at = bits.pos;
+    let candidates = hint.into_iter().chain([0]).chain((REAL_SETTINGS_MIN_BITS..=REAL_SETTINGS_MAX_BITS).filter(|candidate| Some(*candidate) != hint));
+    for settings in candidates {
+        bits.pos = at;
+        if let Some(curve) = real_curve_of_settings(bits, element, settings) {
+            return Some((curve, settings));
+        }
+    }
+    bits.pos = at;
+    None
+}
+
+/// The stations under one candidate settings length: the template run is
+/// skipped unread, then the 10-bit tail and the station list, whose `BL
+/// 0` the sample shows only in some curves (see [`real_superelevation`]).
+fn real_curve_of_settings(bits: &mut Bits, element: i16, settings: usize) -> Option<SuperelevationCurveData> {
+    bits.skip(settings)?;
+    bits.skip(10)?;
+    let at = bits.pos;
+    for with_zero in [true, false] {
+        bits.pos = at;
+        if let Some(curve) = real_stations(bits, element, with_zero) {
+            return Some(curve);
+        }
+    }
+    bits.pos = at;
+    None
+}
+
+/// The station list of one curve: `BL [0], BL v, v x station`.
+fn real_stations(bits: &mut Bits, element: i16, with_zero: bool) -> Option<SuperelevationCurveData> {
+    if with_zero {
+        (bits.bit_long()? == 0).then_some(())?;
+    }
+    let k = bits.bit_long()?;
+    (1..=1000).contains(&k).then_some(())?;
+    let mut stations = Vec::new();
+    for _ in 0..k {
+        stations.push(real_station(bits, element)?);
+    }
+    Some(SuperelevationCurveData { element, stations })
+}
+
+/// One critical station and its cross segments (see
+/// [`real_superelevation`]).
+fn real_station(bits: &mut Bits, element: i16) -> Option<CriticalStationData> {
+    (bits.bit_long()? == 3).then_some(())?;
+    let kind = bits.bit_long()?;
+    (1..=10).contains(&kind).then_some(())?;
+    let offset = bits.bit_double()?;
+    offset.is_finite().then_some(())?;
+    let region = bits.bit_double()?;
+    ((region == 0.0 || region == 1.0) && !bits.bit()?).then_some(())?;
+    let node = |bits: &mut Bits| -> Option<()> {
+        let v = [bits.bit_long()?, bits.bit_long()?, bits.bit_long()?, bits.bit_long()?];
+        (v[0] == v[2] && v[1] == -1 && v[3] == -1 && v[0] == i32::from(element)).then_some(())
+    };
+    node(bits)?;
+    let segments = bits.bit_long()?;
+    (1..=8).contains(&segments).then_some(())?;
+    let mut slopes = [0.0; 8];
+    for _ in 0..segments {
+        let side = bits.bit_long()?;
+        let inside = bits.bit_long()?;
+        let lane = bits.bit_long()?;
+        let at = SUPERELEVATION_SEGMENTS.iter().position(|s| *s == (side, inside, lane))?;
+        (bits.bit_long()? == 3).then_some(())?;
+        (bits.bit_long()? == kind).then_some(())?;
+        let station = bits.bit_double()?;
+        (station == offset).then_some(())?;
+        let segment_region = bits.bit_double()?;
+        ((segment_region == 0.0 || segment_region == 1.0) && !bits.bit()?).then_some(())?;
+        node(bits)?;
+        bits.bit_double()?.is_finite().then_some(())?;
+        let slope = bits.bit_double()?;
+        slope.is_finite().then_some(())?;
+        slopes[at] = slope;
+    }
+    Some(CriticalStationData { kind, offset, ending: region == 1.0, slopes })
 }
 
 /// What kind of alignment a record is.
@@ -4276,6 +4523,91 @@ mod tests {
         assert!(equations.is_empty());
         assert_eq!(speeds, vec![DesignSpeed { station: 0.0, speed: 0.0 }]);
         assert_eq!(pos, s.len());
+    }
+
+    #[test]
+    fn reads_the_applications_superelevation_form() {
+        // The application's own form (Align-Superelevation-4.dwg): after
+        // the body head each curve carries an opaque settings template
+        // run of file-specific length, then the stations in kind order.
+        // Two stations of the sample's Curve.1 (element 3) with the
+        // sample's stored offsets: the begin normal crown of the ending
+        // region (+40.17391304347825 from the curve's end) and the end
+        // full super (0 from the curve's end).
+        let bl = |v: i32| match v {
+            0 => "10".to_string(),
+            -1 => format!("00{}", "1".repeat(32)),
+            v => format!("01{:08b}", v),
+        };
+        let bd = |v: f64| format!("00{}", v.to_le_bytes().iter().map(|b| format!("{b:08b}")).collect::<String>());
+        let node = format!("{}{}{}{}", bl(3), bl(-1), bl(3), bl(-1));
+        let station = |kind: i32, offset: f64, region: f64, slopes: &[f64]| {
+            let mut s = format!("{}{}{}{}0{node}{}", bl(3), bl(kind), bd(offset), bd(region), bl(slopes.len() as i32));
+            for (side, inside, lane, slope) in [(1, 0, 1, slopes[0]), (2, 0, 1, slopes[1])] {
+                s += &format!("{}{}{}{}{}{}{}0{node}{}{}", bl(side), bl(inside), bl(lane), bl(3), bl(kind), bd(offset), bd(region), bd(0.0), bd(slope));
+            }
+            s
+        };
+        let s = [
+            // B, one curve, B; its head entry: node, BL 0, B, BL 1, B.
+            format!("0{}0", bl(1)),
+            format!("{node}{}0{}0", bl(0), bl(1)),
+            // The curve: node, B; node, B 1, a 40-bit settings template
+            // run, 10 bits, BL 0, BL 2 stations, then B 0, B.
+            format!("{node}0{node}1 {} {}{}{}", "0".repeat(40), "0".repeat(10), bl(0), bl(2)),
+            format!("{}{}{}", station(1, 40.17391304347825, 1.0, &[-0.02, -0.02]), station(4, 0.0, 1.0, &[0.046, 0.046]), "100"),
+            // An unmapped lane table tail.
+            "0".repeat(64),
+        ]
+        .concat();
+        let s: Vec<u8> = s.bytes().filter(|b| *b == b'0' || *b == b'1').collect();
+        let data: Vec<u8> = s.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, b)| a | ((b - b'0') << (7 - i)))).collect();
+        let mut bits = Bits::new(&data, 0, s.len());
+        let curves = real_superelevation(&mut bits, None).unwrap();
+        assert_eq!(curves.len(), 1);
+        let curve = &curves[0];
+        assert_eq!(curve.element, 3);
+        assert_eq!(curve.stations.len(), 2);
+        assert_eq!(curve.stations[0].kind, 1);
+        assert_eq!(curve.stations[0].offset, 40.17391304347825);
+        assert!(curve.stations[0].ending);
+        assert_eq!(curve.stations[0].slopes, [-0.02, 0.0, -0.02, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(curve.stations[1].kind, 4);
+        assert_eq!(curve.stations[1].offset, 0.0);
+        assert!(curve.stations[1].ending);
+    }
+
+    #[test]
+    fn rejects_a_drifted_real_superelevation_read() {
+        // The same block with one flipped bit inside the station's cross
+        // segment kind: no candidate settings length parses the block,
+        // and the reader gives up.
+        let bl = |v: i32| match v {
+            0 => "10".to_string(),
+            -1 => format!("00{}", "1".repeat(32)),
+            v => format!("01{:08b}", v),
+        };
+        let bd = |v: f64| format!("00{}", v.to_le_bytes().iter().map(|b| format!("{b:08b}")).collect::<String>());
+        let node = format!("{}{}{}{}", bl(3), bl(-1), bl(3), bl(-1));
+        let s = [
+            format!("0{}0", bl(1)),
+            format!("{node}{}0{}0", bl(0), bl(1)),
+            format!("{node}0{node}1{}{}{}{}", "0".repeat(40), "0".repeat(10), bl(0), bl(1)),
+            // One station (level crown, beginning region, 28 from the
+            // curve's start) with its one segment.
+            format!("{}{}{}{}0{node}{}", bl(3), bl(7), bd(28.0), bd(0.0), bl(1)),
+            format!("{}{}{}{}{}{}{}0{node}{}{}100", bl(1), bl(0), bl(1), bl(3), bl(7), bd(28.0), bd(0.0), bd(0.0), bd(0.046)),
+        ]
+        .concat();
+        let data: Vec<u8> = s.as_bytes().chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, b)| a | ((b - b'0') << (7 - i)))).collect();
+        let mut bits = Bits::new(&data, 0, s.len());
+        assert_eq!(real_superelevation(&mut bits, None).map(|c| c.len()), Some(1));
+        // The second `BL 7` is the cross segment's kind.
+        let flip = s.match_indices(&bl(7)).nth(1).unwrap().0 + 3;
+        let flipped = format!("{}{}{}", &s[..flip], if &s[flip..flip + 1] == "0" { "1" } else { "0" }, &s[flip + 1..]);
+        let data: Vec<u8> = flipped.as_bytes().chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, b)| a | ((b - b'0') << (7 - i)))).collect();
+        let mut bits = Bits::new(&data, 0, s.len());
+        assert_eq!(real_superelevation(&mut bits, None), None);
     }
 }
 
